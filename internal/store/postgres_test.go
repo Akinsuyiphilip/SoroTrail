@@ -1214,9 +1214,9 @@ func TestWatchedContracts(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, st.AddWatchedContract(ctx, contractA))
-	require.NoError(t, st.AddWatchedContract(ctx, contractA), "re-adding is a no-op")
-	require.NoError(t, st.AddWatchedContract(ctx, contractB))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}), "re-adding is a no-op")
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractB}))
 
 	got, err := st.ListWatchedContracts(ctx)
 	require.NoError(t, err)
@@ -1224,6 +1224,43 @@ func TestWatchedContracts(t *testing.T) {
 	assert.Equal(t, contractA, got[0].ContractID)
 	assert.Equal(t, contractB, got[1].ContractID)
 	assert.False(t, got[0].AddedAt.IsZero(), "added_at is set on insert")
+	for _, wc := range got {
+		assert.Equal(t, "default", wc.Network, "an empty add is recorded on the default network")
+	}
+}
+
+// TestWatchedContractsPerNetwork pins the (network, contract) keying the
+// schema adopted in 0027: the same contract watched on two networks is
+// two entries, removal on one network leaves the other intact, and the
+// union deduplicates to one row per pair.
+func TestWatchedContractsPerNetwork(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA, Network: "testnet"}))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA, Network: "mainnet"}))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA, Network: "testnet"}),
+		"re-adding the same (network, contract) pair is a no-op")
+
+	got, err := st.ListWatchedContracts(ctx)
+	require.NoError(t, err)
+	require.Len(t, got, 2, "one row per (network, contract) pair")
+	networks := map[string]bool{}
+	for _, wc := range got {
+		assert.Equal(t, contractA, wc.ContractID)
+		networks[wc.Network] = true
+	}
+	assert.Equal(t, map[string]bool{"testnet": true, "mainnet": true}, networks)
+
+	// Removal is scoped to one network.
+	require.NoError(t, st.RemoveWatchedContract(ctx, WatchedContract{ContractID: contractA, Network: "testnet"}))
+	require.ErrorIs(t, st.RemoveWatchedContract(ctx, WatchedContract{ContractID: contractA, Network: "testnet"}),
+		ErrNotFound, "the testnet entry is gone")
+
+	got, err = st.ListWatchedContracts(ctx)
+	require.NoError(t, err)
+	require.Len(t, got, 1, "the mainnet entry must survive the testnet removal")
+	assert.Equal(t, "mainnet", got[0].Network)
 }
 
 // RemoveWatchedContract drops the watch-list row but leaves stored events
@@ -1233,7 +1270,7 @@ func TestRemoveWatchedContract_PreservesEvents(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed the watch list and ingest two events for that contract.
-	require.NoError(t, st.AddWatchedContract(ctx, contractA))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}))
 	_, err := st.UpsertEvents(ctx, []Event{
 		testEvent(eventID(1), 100, contractA),
 		testEvent(eventID(2), 101, contractA),
@@ -1241,7 +1278,7 @@ func TestRemoveWatchedContract_PreservesEvents(t *testing.T) {
 	require.NoError(t, err)
 
 	// Remove it — the response semantics are "stop future ingestion".
-	require.NoError(t, st.RemoveWatchedContract(ctx, contractA))
+	require.NoError(t, st.RemoveWatchedContract(ctx, WatchedContract{ContractID: contractA}))
 
 	// The watch-list row is gone.
 	remaining, err := st.ListWatchedContracts(ctx)
@@ -1250,7 +1287,7 @@ func TestRemoveWatchedContract_PreservesEvents(t *testing.T) {
 
 	// Removing again with no row is a 404-style error: the API uses this
 	// to surface a typo as 404.
-	err = st.RemoveWatchedContract(ctx, contractA)
+	err = st.RemoveWatchedContract(ctx, WatchedContract{ContractID: contractA})
 	assert.ErrorIs(t, err, ErrNotFound)
 
 	// Stored events for the removed contract are intact and queryable.
@@ -1277,7 +1314,7 @@ func TestStats(t *testing.T) {
 		LastIngestedLedger: 101,
 		LastSuccessfulPoll: &now,
 	}))
-	require.NoError(t, st.AddWatchedContract(ctx, contractA))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}))
 
 	stats, err := st.Stats(ctx, SystemScope())
 	require.NoError(t, err)

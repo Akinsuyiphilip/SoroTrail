@@ -104,6 +104,8 @@ var handlerLocalParameters = map[string]parameterProvenance{
 		note: "passed to the store as a literal prefix; the shared builder only checks it does not collide with contract_id"},
 	"tx_hash": {parser: "none",
 		note: "passed through to the store unvalidated, unlike contract_id"},
+	"network": {parser: "none",
+		note: "watched-contract removal scope: an absent value means the default network, and an unknown name returns 404 from the store rather than a validator error"},
 }
 
 // queryParametersRead walks the package's non-test sources and returns every

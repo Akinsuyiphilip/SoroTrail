@@ -484,14 +484,17 @@ func testIngestionStateRoundTrip(t *testing.T, st Store) {
 func testWatchedContracts(t *testing.T, st Store) {
 	ctx := context.Background()
 
-	require.NoError(t, st.AddWatchedContract(ctx, contractA))
-	require.NoError(t, st.AddWatchedContract(ctx, contractA), "re-adding is a no-op")
-	require.NoError(t, st.AddWatchedContract(ctx, contractB))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}), "re-adding is a no-op")
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractB}))
 
 	got, err := st.ListWatchedContracts(ctx)
 	require.NoError(t, err)
 	ids := make([]string, 0, len(got))
 	for _, wc := range got {
+		// The backend is required to report the network each entry was
+		// added on, defaulting an empty add to "default".
+		assert.Equal(t, "default", wc.Network)
 		ids = append(ids, wc.ContractID)
 	}
 	assert.Equal(t, []string{contractA, contractB}, ids)
@@ -506,7 +509,7 @@ func testStats(t *testing.T, st Store) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 101}))
-	require.NoError(t, st.AddWatchedContract(ctx, contractA))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}))
 
 	stats, err := st.Stats(ctx, WildcardScope())
 	require.NoError(t, err)

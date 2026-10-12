@@ -245,20 +245,20 @@ func (s *guardedStore) ListWatchedContracts(ctx context.Context) ([]WatchedContr
 	return ids, err
 }
 
-func (s *guardedStore) AddWatchedContract(ctx context.Context, contractID string) error {
+func (s *guardedStore) AddWatchedContract(ctx context.Context, w WatchedContract) error {
 	ctx, cancel := s.wrapContext(ctx, "store.AddWatchedContract")
 	defer cancel()
 	start := time.Now()
-	err := s.Store.AddWatchedContract(ctx, contractID)
+	err := s.Store.AddWatchedContract(ctx, w)
 	s.logSlowQuery(ctx, "store.AddWatchedContract", start, err)
 	return err
 }
 
-func (s *guardedStore) RemoveWatchedContract(ctx context.Context, contractID string) error {
+func (s *guardedStore) RemoveWatchedContract(ctx context.Context, w WatchedContract) error {
 	ctx, cancel := s.wrapContext(ctx, "store.RemoveWatchedContract")
 	defer cancel()
 	start := time.Now()
-	err := s.Store.RemoveWatchedContract(ctx, contractID)
+	err := s.Store.RemoveWatchedContract(ctx, w)
 	s.logSlowQuery(ctx, "store.RemoveWatchedContract", start, err)
 	return err
 }

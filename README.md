@@ -259,6 +259,25 @@ the struct tags in `internal/config/config.go` to prevent drift.
 | `RPC_JITTER` | bool | `true` | Randomize each computed backoff to [0.5×, 1.5×) so concurrent retries don't thundering-herd the endpoint. Never applied to a provider's `Retry-After` hint. |
 | `RPC_HTTP_TIMEOUT` | duration | `30s` | Timeout on the underlying HTTP client's RPC requests. Raise for a slow private RPC endpoint. |
 
+#### Multi-network model (issue #537)
+
+SoroTrail is **multi-network**: every network-scoped table is keyed by a
+`network` column, and one database can hold events, ingestion state, audit
+state, audit findings and watch-list entries for several Stellar networks at
+once. A single process still ingests one network — the one named by
+`NETWORK` — but the schema no longer forces that to be the only one present.
+
+- `events`, `ingestion_state`, `audit_state`, `audit_findings`:
+  keyed by `network` (empty is normalized to `default`).
+- `watched_contracts` (and `tenant_watched_contracts`): one row per
+  `(network, contract_id)`. The same contract watched on testnet and mainnet
+  is two entries; the ingester only fetches the entries matching its own
+  `NETWORK`, and the API's watch-list endpoints accept an optional `network`
+  (body field on POST, query parameter on DELETE) that defaults to the
+  deployment's `NETWORK`.
+- The `all contract events` ↔ `specific list` ingestion-mode transition is
+  evaluated per network: only that network's entries count.
+
 ### Database
 
 | Variable | Type | Default | Description |

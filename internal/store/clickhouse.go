@@ -594,7 +594,7 @@ func (c *ClickHouse) SaveAuditStateIfGreater(ctx context.Context, network string
 // the presence list ingestion reads.
 func (c *ClickHouse) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
-		"SELECT contract_id, added_at FROM watched_contracts FINAL WHERE removed_at IS NULL ORDER BY contract_id")
+		"SELECT network, contract_id, added_at FROM watched_contracts FINAL WHERE removed_at IS NULL ORDER BY network, contract_id")
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
@@ -607,11 +607,12 @@ func (c *ClickHouse) ListWatchedContracts(ctx context.Context) ([]WatchedContrac
 
 // RemoveWatchedContract stops future ingestion for a contract without
 // touching stored events. ErrNotFound signals a typo so the API can 404.
-func (c *ClickHouse) RemoveWatchedContract(ctx context.Context, contractID string) error {
+func (c *ClickHouse) RemoveWatchedContract(ctx context.Context, w WatchedContract) error {
 	exec := newClickHouseExecutor(c.cfg)
 	database := c.cfg.databaseOrDefault()
+	network := defaultNetwork(w.Network)
 	rows, err := exec.queryRows(ctx, database,
-		"SELECT contract_id FROM watched_contracts FINAL WHERE contract_id = "+clickHouseQuoteString(contractID)+" AND removed_at IS NULL LIMIT 1")
+		"SELECT contract_id FROM watched_contracts FINAL WHERE network = "+clickHouseQuoteString(network)+" AND contract_id = "+clickHouseQuoteString(w.ContractID)+" AND removed_at IS NULL LIMIT 1")
 	if err != nil {
 		return fmt.Errorf("removing watched contract: %w", err)
 	}
@@ -619,9 +620,9 @@ func (c *ClickHouse) RemoveWatchedContract(ctx context.Context, contractID strin
 		return ErrNotFound
 	}
 	now := formatClickHouseTime(time.Now().UTC())
-	row := map[string]any{"contract_id": contractID, "added_at": now, "removed_at": now}
+	row := map[string]any{"network": network, "contract_id": w.ContractID, "added_at": now, "removed_at": now}
 	if err := exec.insertRows(ctx, database, "watched_contracts",
-		[]string{"contract_id", "added_at", "removed_at"}, []map[string]any{row}); err != nil {
+		[]string{"network", "contract_id", "added_at", "removed_at"}, []map[string]any{row}); err != nil {
 		return fmt.Errorf("removing watched contract: %w", err)
 	}
 	return nil
@@ -631,14 +632,15 @@ func (c *ClickHouse) RemoveWatchedContract(ctx context.Context, contractID strin
 // already-watched contract appends another version that FINAL still collapses
 // to one present row. Re-adding a previously-removed contract appends a
 // newer version with removed_at NULL, which is what brings it back.
-func (c *ClickHouse) AddWatchedContract(ctx context.Context, contractID string) error {
+func (c *ClickHouse) AddWatchedContract(ctx context.Context, w WatchedContract) error {
 	row := map[string]any{
-		"contract_id": contractID,
+		"network":     defaultNetwork(w.Network),
+		"contract_id": w.ContractID,
 		"added_at":    formatClickHouseTime(time.Now().UTC()),
 		"removed_at":  nil,
 	}
 	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "watched_contracts",
-		[]string{"contract_id", "added_at", "removed_at"}, []map[string]any{row}); err != nil {
+		[]string{"network", "contract_id", "added_at", "removed_at"}, []map[string]any{row}); err != nil {
 		return fmt.Errorf("adding watched contract: %w", err)
 	}
 	return nil
