@@ -323,6 +323,17 @@ func scopeFrom(ctx context.Context) store.Scope {
 	return p.Scope
 }
 
+// defaultNetworkLabel renders the network name a response should echo:
+// an empty request value reads as the store's "default" network, so the
+// caller sees the row's actual key rather than their omitted field's
+// empty string.
+func defaultNetworkLabel(network string) string {
+	if network == "" {
+		return "default"
+	}
+	return network
+}
+
 // publicPaths bypass authentication even in multi-tenant mode. These are
 // polled by orchestrators that hold no credential, and they report only
 // liveness/readiness of the process and its dependencies — no tenant data.

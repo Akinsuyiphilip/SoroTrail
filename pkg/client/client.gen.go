@@ -490,6 +490,8 @@ type WatchedContract struct {
 	// AddedAt When the contract was added to the watch list.
 	AddedAt    string `json:"added_at"`
 	ContractID string `json:"contract_id"`
+	// Network The network this entry is watched on. Always present in responses; entries written without a network are reported as "default".
+	Network string `json:"network,omitempty"`
 }
 
 // WatchedContractAdded Result of adding a contract to the global watch list.
@@ -498,6 +500,8 @@ type WatchedContractAdded struct {
 	ContractID        string `json:"contract_id"`
 	HistoryFromLedger int64  `json:"history_from_ledger"`
 	ModeTransition    string `json:"mode_transition,omitempty"`
+	// Network The network the entry was filed on (echoes the request's network or the deployment default).
+	Network string `json:"network"`
 }
 
 // WatchedContractRemoved Result of removing a contract from the global watch list.
@@ -505,13 +509,17 @@ type WatchedContractRemoved struct {
 	ContractID       string `json:"contract_id"`
 	HistoryPreserved bool   `json:"history_preserved"`
 	ModeTransition   string `json:"mode_transition,omitempty"`
-	RemovedAt        string `json:"removed_at"`
+	// Network The network the entry was removed from.
+	Network   string `json:"network"`
+	RemovedAt string `json:"removed_at"`
 }
 
 // WatchedContractRequest JSON body used to add a contract to a watch list.
 type WatchedContractRequest struct {
 	// ContractID Stellar contract ID to add to the watch list.
 	ContractID string `json:"contract_id"`
+	// Network The Stellar network this entry is watched on. Omit to file the contract on the deployment's configured NETWORK (falling back to "default" when that is unset). The same contract watched on two networks is two independent watch-list entries.
+	Network string `json:"network,omitempty"`
 }
 
 // WatchedContractsPage The complete global contract watch list.
@@ -1921,6 +1929,7 @@ func (c *Client) RemoveWatchedContract(ctx context.Context, id string, params Re
 // RemoveWatchedContractParams are the query parameters for RemoveWatchedContract.
 type RemoveWatchedContractParams struct {
 	Confirm string
+	Network string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -1929,6 +1938,9 @@ func (p RemoveWatchedContractParams) values() url.Values {
 	v := url.Values{}
 	if p.Confirm != "" {
 		v.Set("confirm", p.Confirm)
+	}
+	if p.Network != "" {
+		v.Set("network", p.Network)
 	}
 	return v
 }

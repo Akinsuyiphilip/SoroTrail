@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // TestSweepBatch_LimitsAndCoverage verifies that buildFilterBatches divides the
@@ -19,7 +20,7 @@ func TestSweepBatch_LimitsAndCoverage(t *testing.T) {
 		st := newMockStore()
 		contracts := []string{"C1", "C2", "C3", "C4", "C5"}
 		for _, c := range contracts {
-			require.NoError(t, st.AddWatchedContract(context.Background(), c))
+			require.NoError(t, st.AddWatchedContract(context.Background(), store.WatchedContract{ContractID: c}))
 		}
 		ing := newTestIngester(&mockRPC{}, st, Options{})
 
@@ -40,6 +41,43 @@ func TestSweepBatch_LimitsAndCoverage(t *testing.T) {
 		for _, c := range contracts {
 			assert.Equal(t, 1, seen[c], "contract %s must appear exactly once", c)
 		}
+	})
+
+	t.Run("only contracts watched on the ingester's network become filters", func(t *testing.T) {
+		st := newMockStore()
+		require.NoError(t, st.AddWatchedContract(context.Background(),
+			store.WatchedContract{ContractID: "C-TESTNET", Network: "testnet"}))
+		require.NoError(t, st.AddWatchedContract(context.Background(),
+			store.WatchedContract{ContractID: "C-MAINNET", Network: "mainnet"}))
+		ing := newTestIngester(&mockRPC{}, st, Options{Network: "testnet"})
+
+		batches, err := ing.BuildFilterBatches(context.Background())
+		require.NoError(t, err)
+		require.NotEmpty(t, batches)
+
+		var fetched []string
+		for _, b := range batches {
+			for _, f := range b {
+				fetched = append(fetched, f.ContractIDs...)
+			}
+		}
+		assert.Equal(t, []string{"C-TESTNET"}, fetched,
+			"the ingester must not fetch contracts watched only on another network")
+	})
+
+	t.Run("entries on another network count as no watch list here", func(t *testing.T) {
+		st := newMockStore()
+		require.NoError(t, st.AddWatchedContract(context.Background(),
+			store.WatchedContract{ContractID: "C-MAINNET", Network: "mainnet"}))
+		// This ingester serves the default network; a mainnet-only watch
+		// list is equivalent to an empty one for it: all-events mode.
+		ing := newTestIngester(&mockRPC{}, st, Options{})
+
+		batches, err := ing.BuildFilterBatches(context.Background())
+		require.NoError(t, err)
+		require.Len(t, batches, 1)
+		require.Len(t, batches[0], 1)
+		assert.Empty(t, batches[0][0].ContractIDs)
 	})
 
 	t.Run("empty watched list yields a single unfiltered batch", func(t *testing.T) {

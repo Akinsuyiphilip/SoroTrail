@@ -973,19 +973,20 @@ func (s *SQLite) SaveIngestionState(ctx context.Context, st IngestionState) erro
 	return nil
 }
 
-func (s *SQLite) GetAuditState(ctx context.Context, _ string) (AuditState, error) {
+func (s *SQLite) GetAuditState(ctx context.Context, network string) (AuditState, error) {
 	var (
 		st AuditState
 		ts string
 	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT verified_through_ledger, updated_at FROM audit_state WHERE id = 1`,
-	).Scan(&st.VerifiedThroughLedger, &ts)
+		`SELECT network, verified_through_ledger, updated_at FROM audit_state WHERE network = ?`,
+		defaultNetwork(network),
+	).Scan(&st.Network, &st.VerifiedThroughLedger, &ts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AuditState{}, ErrNotFound
 	}
 	if err != nil {
-		return AuditState{}, fmt.Errorf("loading audit state: %w", err)
+		return AuditState{}, fmt.Errorf("loading audit state for network %q: %w", network, err)
 	}
 	st.UpdatedAt = parseTime(ts)
 	return st, nil
@@ -994,50 +995,51 @@ func (s *SQLite) GetAuditState(ctx context.Context, _ string) (AuditState, error
 func (s *SQLite) SaveAuditState(ctx context.Context, st AuditState) error {
 	now := formatTime(time.Now().UTC())
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
-		VALUES (1, ?, ?)
-		ON CONFLICT (id) DO UPDATE SET
+		INSERT INTO audit_state (network, verified_through_ledger, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT (network) DO UPDATE SET
 			verified_through_ledger = excluded.verified_through_ledger,
 			updated_at              = excluded.updated_at`,
-		st.VerifiedThroughLedger, now,
+		defaultNetwork(st.Network), st.VerifiedThroughLedger, now,
 	)
 	if err != nil {
-		return fmt.Errorf("saving audit state: %w", err)
+		return fmt.Errorf("saving audit state for network %q: %w", st.Network, err)
 	}
 	return nil
 }
 
-func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, _ string, ledger int64) (AuditState, error) {
+func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, network string, ledger int64) (AuditState, error) {
 	now := formatTime(time.Now().UTC())
+	network = defaultNetwork(network)
 
-	// First INSERT will succeed when the table is empty.
+	// First INSERT will succeed when the table has no row for this network.
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
-		VALUES (1, ?, ?)`,
-		ledger, now)
+		INSERT INTO audit_state (network, verified_through_ledger, updated_at)
+		VALUES (?, ?, ?)`,
+		network, ledger, now)
 	if err == nil {
-		return AuditState{VerifiedThroughLedger: ledger, UpdatedAt: time.Now().UTC()}, nil
+		return AuditState{Network: network, VerifiedThroughLedger: ledger, UpdatedAt: time.Now().UTC()}, nil
 	}
 
 	// Row exists — update only when the candidate is greater than the stored value.
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE audit_state
 		SET verified_through_ledger = ?, updated_at = ?
-		WHERE id = 1 AND ? > verified_through_ledger`,
-		ledger, now, ledger)
+		WHERE network = ? AND ? > verified_through_ledger`,
+		ledger, now, network, ledger)
 	if err != nil {
 		return AuditState{}, fmt.Errorf("saving audit state (if greater): %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n > 0 {
-		return s.GetAuditState(ctx, "")
+		return s.GetAuditState(ctx, network)
 	}
 	// Candidate was not greater — return the current stored state.
-	return s.GetAuditState(ctx, "")
+	return s.GetAuditState(ctx, network)
 }
 
 func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT network, contract_id FROM watched_contracts ORDER BY network, contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
@@ -1045,7 +1047,7 @@ func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, e
 	var out []WatchedContract
 	for rows.Next() {
 		var wc WatchedContract
-		if err := rows.Scan(&wc.ContractID); err != nil {
+		if err := rows.Scan(&wc.Network, &wc.ContractID); err != nil {
 			return nil, err
 		}
 		out = append(out, wc)
@@ -1053,19 +1055,20 @@ func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, e
 	return out, rows.Err()
 }
 
-func (s *SQLite) AddWatchedContract(ctx context.Context, contractID string) error {
+func (s *SQLite) AddWatchedContract(ctx context.Context, w WatchedContract) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO watched_contracts (contract_id) VALUES (?)
-		ON CONFLICT (contract_id) DO NOTHING`, contractID)
+		INSERT INTO watched_contracts (network, contract_id) VALUES (?, ?)
+		ON CONFLICT (network, contract_id) DO NOTHING`, defaultNetwork(w.Network), w.ContractID)
 	if err != nil {
 		return fmt.Errorf("adding watched contract: %w", err)
 	}
 	return nil
 }
 
-func (s *SQLite) RemoveWatchedContract(ctx context.Context, contractID string) error {
+func (s *SQLite) RemoveWatchedContract(ctx context.Context, w WatchedContract) error {
 	result, err := s.db.ExecContext(ctx,
-		`DELETE FROM watched_contracts WHERE contract_id = ?`, contractID)
+		`DELETE FROM watched_contracts WHERE network = ? AND contract_id = ?`,
+		defaultNetwork(w.Network), w.ContractID)
 	if err != nil {
 		return fmt.Errorf("removing watched contract: %w", err)
 	}
@@ -1082,18 +1085,24 @@ func (s *SQLite) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditF
 		b, _ := json.Marshal(f.MissingIDs)
 		missingIDs = string(b)
 	}
+	// created_at returns as a driver string, not a time.Time: SQLite's
+	// column default is a strftime expression and the driver does not
+	// convert it, so the scan goes through the shared parseTime helper
+	// exactly like every other read of this column.
+	var createdAt string
 	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO audit_findings
-			(from_ledger, to_ledger, expected_count, actual_count,
+			(network, from_ledger, to_ledger, expected_count, actual_count,
 			 missing_ids, status, attempts)
-		VALUES (?, ?, ?, ?, ?, ?, 0)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 0)
 		RETURNING id, created_at`,
-		f.FromLedger, f.ToLedger, f.ExpectedCount, f.ActualCount,
+		defaultNetwork(f.Network), f.FromLedger, f.ToLedger, f.ExpectedCount, f.ActualCount,
 		missingIDs, f.Status,
-	).Scan(&f.ID, &f.CreatedAt)
+	).Scan(&f.ID, &createdAt)
 	if err != nil {
 		return AuditFinding{}, fmt.Errorf("recording audit finding: %w", err)
 	}
+	f.CreatedAt = parseTime(createdAt)
 	return f, nil
 }
 
@@ -1123,17 +1132,18 @@ func (s *SQLite) UpdateAuditFinding(ctx context.Context, f AuditFinding) error {
 	return nil
 }
 
-func (s *SQLite) ListOpenFindingsByRange(ctx context.Context, _ string, fromLedger, toLedger int64) (AuditFinding, error) {
+func (s *SQLite) ListOpenFindingsByRange(ctx context.Context, network string, fromLedger, toLedger int64) (AuditFinding, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, from_ledger, to_ledger, expected_count, actual_count,
+		SELECT id, network, from_ledger, to_ledger, expected_count, actual_count,
 		       missing_ids, status, attempts, last_attempted_at, last_error, created_at
 		FROM audit_findings
-		WHERE status IN ('open', 'unrecoverable')
+		WHERE network = ?
+		  AND status IN ('open', 'unrecoverable')
 		  AND from_ledger <= ?
 		  AND to_ledger   >= ?
 		ORDER BY id DESC
 		LIMIT 1`,
-		toLedger, fromLedger,
+		defaultNetwork(network), toLedger, fromLedger,
 	)
 	return scanAuditFinding(row)
 }
@@ -1146,7 +1156,7 @@ func scanAuditFinding(row *sql.Row) (AuditFinding, error) {
 		missingIDs    string
 		createdAt     string
 	)
-	err := row.Scan(&f.ID, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
+	err := row.Scan(&f.ID, &f.Network, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
 		&missingIDs, &f.Status, &f.Attempts, &lastAttempted, &lastError, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AuditFinding{}, ErrNotFound

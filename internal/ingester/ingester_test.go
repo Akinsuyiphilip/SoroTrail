@@ -1208,7 +1208,7 @@ func TestIngester_PicksUpRuntimeWatchListChange(t *testing.T) {
 	}
 	st := newMockStore()
 	require.NoError(t, st.AddWatchedContract(context.Background(),
-		"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
+		store.WatchedContract{ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}))
 	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
 
 	// Pass 1: list has only A.
@@ -1225,8 +1225,8 @@ func TestIngester_PicksUpRuntimeWatchListChange(t *testing.T) {
 
 	// Operator POSTs B and C; ingester does not know about this directly
 	// — it just re-reads the list on the next pass.
-	require.NoError(t, st.AddWatchedContract(context.Background(), contractB))
-	require.NoError(t, st.AddWatchedContract(context.Background(), contractC))
+	require.NoError(t, st.AddWatchedContract(context.Background(), store.WatchedContract{ContractID: contractB}))
+	require.NoError(t, st.AddWatchedContract(context.Background(), store.WatchedContract{ContractID: contractC}))
 	require.NoError(t, st.SaveIngestionState(context.Background(),
 		store.IngestionState{LastIngestedLedger: 100}))
 
@@ -1597,7 +1597,7 @@ func TestIngester_PicksUpRuntimeWatchListRemoval(t *testing.T) {
 		},
 	}
 	st := newMockStore()
-	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.AddWatchedContract(context.Background(), store.WatchedContract{ContractID: contractA}))
 	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
 
 	_, err := ing.runOnce(context.Background())
@@ -1605,7 +1605,7 @@ func TestIngester_PicksUpRuntimeWatchListRemoval(t *testing.T) {
 	require.Len(t, st.watched, 1)
 
 	// Operator DELETE's A; list transitions to empty.
-	require.NoError(t, st.RemoveWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.RemoveWatchedContract(context.Background(), store.WatchedContract{ContractID: contractA}))
 	require.NoError(t, st.SaveIngestionState(context.Background(),
 		store.IngestionState{LastIngestedLedger: 100}))
 

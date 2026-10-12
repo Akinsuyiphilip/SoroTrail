@@ -3464,6 +3464,15 @@
                 "true"
               ]
             }
+          },
+          {
+            "name": "network",
+            "in": "query",
+            "description": "The network whose watch-list entry to remove. Omit to remove from the deployment's configured NETWORK (falling back to \"default\"). A contract watched on several networks keeps its other entries.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "testnet"
           }
         ],
         "security": [
@@ -5361,6 +5370,11 @@
             "pattern": "^C[A-Z2-7]{55}$",
             "description": "Stellar contract ID to add to the watch list.",
             "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          },
+          "network": {
+            "type": "string",
+            "description": "The Stellar network this entry is watched on. Omit to file the contract on the deployment's configured NETWORK (falling back to \"default\" when that is unset). The same contract watched on two networks is two independent watch-list entries.",
+            "example": "testnet"
           }
         }
       },
@@ -5516,6 +5530,11 @@
             "type": "string",
             "pattern": "^C[A-Z2-7]{55}$"
           },
+          "network": {
+            "type": "string",
+            "description": "The network this entry is watched on. Always present in responses; entries written without a network are reported as \"default\".",
+            "example": "testnet"
+          },
           "added_at": {
             "type": "string",
             "format": "date-time",
@@ -5547,6 +5566,7 @@
         "description": "Result of adding a contract to the global watch list.",
         "required": [
           "contract_id",
+          "network",
           "added_at",
           "history_from_ledger"
         ],
@@ -5554,6 +5574,10 @@
           "contract_id": {
             "type": "string",
             "pattern": "^C[A-Z2-7]{55}$"
+          },
+          "network": {
+            "type": "string",
+            "description": "The network the entry was filed on (echoes the request's network or the deployment default)."
           },
           "added_at": {
             "type": "string",
@@ -5576,6 +5600,7 @@
         "description": "Result of removing a contract from the global watch list.",
         "required": [
           "contract_id",
+          "network",
           "removed_at",
           "history_preserved"
         ],
@@ -5583,6 +5608,10 @@
           "contract_id": {
             "type": "string",
             "pattern": "^C[A-Z2-7]{55}$"
+          },
+          "network": {
+            "type": "string",
+            "description": "The network the entry was removed from."
           },
           "removed_at": {
             "type": "string",

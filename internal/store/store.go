@@ -357,12 +357,15 @@ type AuditState struct {
 	UpdatedAt time.Time
 }
 
-// WatchedContract is one entry of the watch list: a contract ID and the
-// time it was added (either by env seeding on startup, or by a runtime
-// POST). The API uses this to render the GET response; the ingester reads
-// only ContractID for its filter batches.
+// WatchedContract is one entry of the watch list: a contract ID, the
+// network it is watched on, and the time it was added (either by env
+// seeding on startup, or by a runtime POST). The API uses this to render
+// the GET response; the ingester reads ContractID and Network for its
+// filter batches so a contract watched on one network is not fetched
+// with the filters of another.
 type WatchedContract struct {
 	ContractID string    `json:"contract_id"`
+	Network    string    `json:"network,omitempty"`
 	AddedAt    time.Time `json:"added_at"`
 }
 
@@ -920,40 +923,55 @@ type Store interface {
 
 	// Ping(ctx context.Context) error
 
+	// GetIngestionState returns the default network's ingestion state.
+	// The network argument lives on GetIngestionStateForNetwork; this
+	// convenience wrapper keeps the common single-network call sites
+	// one line.
 	GetIngestionState(ctx context.Context) (IngestionState, error)
 
-	// SaveIngestionState upserts the singleton ingestion state row,
-	// replacing all fields unconditionally.
+	// SaveIngestionState upserts one network's ingestion state row,
+	// replacing all fields unconditionally. A row whose Network field is
+	// empty is stored under the "default" network.
 	SaveIngestionState(ctx context.Context, s IngestionState) error
 
 	GetAuditState(ctx context.Context, network string) (AuditState, error)
 	SaveAuditState(ctx context.Context, s AuditState) error
 	// SaveAuditStateIfGreater atomically sets verified_through_ledger
-	// only when it is strictly greater than the stored value. Returns the
+	// only when it is strictly greater than the stored value for the
+	// network named in the AuditState argument. Returns the
 	// post-write AuditState (whether or not it was modified). It's an
 	// UPDATE ... WHERE clause, so concurrent auditors can't regress the
 	// HWM even if they race.
 	SaveAuditStateIfGreater(ctx context.Context, network string, ledger int64) (AuditState, error)
 
+	// Watched-contract state. Every method is network-scoped: entries
+	// carry the network they were added on, List returns the union
+	// across networks (one row per (network, contract)), and mutation
+	// methods apply to one network at a time. An empty Network argument
+	// means the "default" network.
+	//
 	// ListWatchedContracts returns the union of the operator-configured
-	// watch list and every tenant's watch list, which is what ingestion
-	// must fetch. It is intentionally not scoped: ingestion serves all
-	// tenants at once, and a contract two tenants both want is fetched
-	// once. Removal is implicit — a contract disappears from the union
-	// when the last row naming it is gone.
+	// watch list and every tenant's request, all networks included,
+	// which is what ingestion must fetch. It is intentionally not
+	// scoped by a caller-side tenant: ingestion serves all tenants at
+	// once, and a contract two tenants both want is fetched once.
+	// Removal is implicit per network — an entry disappears from the
+	// union when the last row naming it on that network is gone.
 	ListWatchedContracts(ctx context.Context) ([]WatchedContract, error)
-	AddWatchedContract(ctx context.Context, contractID string) error
-	// RemoveWatchedContract stops future ingestion for the given contract
-	// by removing its row from watched_contracts. It does NOT delete any
-	// (event) rows already in storage — removal is "stop watching", not
-	// "drop history", so a removed contract's events stay queryable.
-	// ErrNotFound is returned when no row matches the given ID, so the
-	// API can surface 404 for typos.
-	RemoveWatchedContract(ctx context.Context, contractID string) error
+	AddWatchedContract(ctx context.Context, w WatchedContract) error
+	// RemoveWatchedContract stops future ingestion for the given
+	// contract on the given network by removing its row from
+	// watched_contracts. It does NOT delete any (event) rows already in
+	// storage — removal is "stop watching", not "drop history", so a
+	// removed contract's events stay queryable. ErrNotFound is returned
+	// when no row matches the pair, so the API can surface 404 for
+	// typos.
+	RemoveWatchedContract(ctx context.Context, w WatchedContract) error
 
 	// Per-contract resume cursors for watched-contract ingestion. A
-	// contract that falls behind does not hold back the others; each row
-	// tracks its own last ingested ledger + pagination cursor.
+	// contract that falls behind does not hold back the others; each
+	// (network, contract) row tracks its own last ingested ledger +
+	// pagination cursor.
 	GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error)
 	SaveContractCursor(ctx context.Context, c ContractCursor) error
 	DeleteContractCursor(ctx context.Context, contractID string) error

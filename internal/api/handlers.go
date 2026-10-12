@@ -1815,10 +1815,15 @@ func (s *Server) assembleStats(ctx context.Context) (store.Stats, error) {
 
 type addWatchedRequest struct {
 	ContractID string `json:"contract_id"`
+	// Network names the Stellar network this entry is watched on.
+	// Empty means the deployment's default network, which keeps the
+	// pre-multi-network request body valid.
+	Network string `json:"network,omitempty"`
 }
 
 type addWatchedResponse struct {
 	ContractID string `json:"contract_id"`
+	Network    string `json:"network"`
 
 	AddedAt string `json:"added_at"`
 
@@ -1828,6 +1833,7 @@ type addWatchedResponse struct {
 
 type removeWatchedResponse struct {
 	ContractID string `json:"contract_id"`
+	Network    string `json:"network"`
 
 	RemovedAt string `json:"removed_at"`
 
@@ -1903,14 +1909,27 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	modeTransition := ""
 
-	if len(current) == 0 {
+	// The mode transition is per target network: ingestion on a network
+	// switches from "all contract events" to a specific list when that
+	// network gains its first entry. Entries on other networks keep
+	// their own deployments' modes and are irrelevant here.
+	targetNetwork := s.effectiveNetwork(req.Network)
+	onTargetNetwork := 0
+	for _, wc := range current {
+		wcNetwork := wc.Network
+		if wcNetwork == "" {
+			wcNetwork = "default"
+		}
+		if wcNetwork == defaultNetworkLabel(targetNetwork) {
+			onTargetNetwork++
+		}
+	}
+	if onTargetNetwork == 0 {
 
 		if r.URL.Query().Get("confirm") != "true" {
 
 			writeError(w, http.StatusBadRequest, errors.New(
-
 				"adding the first watched contract would switch ingestion from "+
-
 					"'all contract events' to a specific list — pass ?confirm=true to acknowledge"))
 
 			return
@@ -1932,7 +1951,8 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	if err := s.store.AddWatchedContract(r.Context(), req.ContractID); err != nil {
+	wanted := store.WatchedContract{ContractID: req.ContractID, Network: s.effectiveNetwork(req.Network)}
+	if err := s.store.AddWatchedContract(r.Context(), wanted); err != nil {
 
 		loggerFromContext(r.Context()).Error("adding watched contract", "contract_id", req.ContractID, "error", err)
 
@@ -1970,6 +1990,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, addWatchedResponse{
 
 		ContractID: req.ContractID,
+		Network:    defaultNetworkLabel(wanted.Network),
 
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
 
@@ -1981,18 +2002,18 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
-
 	id := chi.URLParam(r, "id")
 
 	if !config.ValidContractID(id) {
-
 		writeError(w, http.StatusBadRequest,
-
 			fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", id))
-
 		return
-
 	}
+	// Removal addresses one (network, contract) row. An explicit
+	// ?network= wins; otherwise the entry is removed from the
+	// deployment's own network, which is where the add endpoint would
+	// have filed it.
+	network := s.effectiveNetwork(r.URL.Query().Get("network"))
 
 	current, err := s.store.ListWatchedContracts(r.Context())
 
@@ -2008,7 +2029,26 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 	modeTransition := ""
 
-	if len(current) == 1 && current[0].ContractID == id {
+	// The mode-transition check is per deployment: ingestion falls back
+	// to "all contract events" only when this removal empties the watch
+	// list on the target network — the network the ingester polls. An
+	// entry still watched on another network does not keep this
+	// deployment's specific-list mode alive, and vice versa.
+	onTargetNetwork := 0
+	removingIsOnlyEntry := false
+	for _, wc := range current {
+		wcNetwork := wc.Network
+		if wcNetwork == "" {
+			wcNetwork = "default"
+		}
+		if wcNetwork == defaultNetworkLabel(network) {
+			onTargetNetwork++
+			if wc.ContractID == id {
+				removingIsOnlyEntry = true
+			}
+		}
+	}
+	if onTargetNetwork == 1 && removingIsOnlyEntry {
 
 		if r.URL.Query().Get("confirm") != "true" {
 
@@ -2026,7 +2066,7 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 	}
 
-	if err := s.store.RemoveWatchedContract(r.Context(), id); err != nil {
+	if err := s.store.RemoveWatchedContract(r.Context(), store.WatchedContract{ContractID: id, Network: network}); err != nil {
 
 		if errors.Is(err, store.ErrNotFound) {
 
@@ -2051,6 +2091,7 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, removeWatchedResponse{
 
 		ContractID: id,
+		Network:    defaultNetworkLabel(network),
 
 		RemovedAt: time.Now().UTC().Format(time.RFC3339),
 

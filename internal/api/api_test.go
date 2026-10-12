@@ -312,13 +312,13 @@ func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContra
 	return s.watchedList, s.watchedListErr
 }
 
-func (s *stubStore) AddWatchedContract(_ context.Context, id string) error {
-	s.added = append(s.added, id)
+func (s *stubStore) AddWatchedContract(_ context.Context, w store.WatchedContract) error {
+	s.added = append(s.added, w.ContractID)
 	return s.addErr
 }
 
-func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
-	s.removed = append(s.removed, id)
+func (s *stubStore) RemoveWatchedContract(_ context.Context, w store.WatchedContract) error {
+	s.removed = append(s.removed, w.ContractID)
 	return s.removeErr
 }
 
