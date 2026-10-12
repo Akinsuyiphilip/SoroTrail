@@ -1631,20 +1631,87 @@ func (s *SQLite) ListContracts(context.Context, ContractsFilter) ([]ContractSumm
 	return nil, "", errUnsupported("sqlite", "ListContracts")
 }
 
-// Per-contract cursors are not implemented for the SQLite backend: watched
-// ingestion there always uses the single global ingestion_state row. These
-// refuse explicitly instead of returning a zero cursor, so a caller that
-// expects per-contract resume positions learns the capability is absent
-// rather than silently resuming from ledger 0.
-func (s *SQLite) GetContractCursor(context.Context, string) (ContractCursor, error) {
-	return ContractCursor{}, errUnsupported("sqlite", "GetContractCursor")
+// Per-contract cursors mirror the Postgres implementation. Watched-mode
+// ingestion uses them as its resume position, so a missing implementation
+// here would silently fall back to the global ingestion_state row and one
+// lagging contract would hold back every other watched contract — the
+// failure mode issue #534 describes. UpdatedAt and updated_at are stored
+// through the same padded-string convention as ingestion_state so
+// byte-wise ordering matches chronological ordering.
+func (s *SQLite) GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error) {
+	var (
+		c  ContractCursor
+		ts string
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT contract_id, last_ingested_ledger, last_cursor, updated_at
+		 FROM contract_cursors WHERE contract_id = ?`, contractID,
+	).Scan(&c.ContractID, &c.LastIngestedLedger, &c.LastCursor, &ts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ContractCursor{}, ErrNotFound
+	}
+	if err != nil {
+		return ContractCursor{}, fmt.Errorf("loading cursor for contract %s: %w", contractID, err)
+	}
+	c.UpdatedAt = parseTime(ts)
+	return c, nil
 }
-func (s *SQLite) SaveContractCursor(context.Context, ContractCursor) error {
-	return errUnsupported("sqlite", "SaveContractCursor")
+
+// SaveContractCursor upserts one contract's resume position.
+func (s *SQLite) SaveContractCursor(ctx context.Context, c ContractCursor) error {
+	now := formatTime(time.Now().UTC())
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO contract_cursors (contract_id, last_ingested_ledger, last_cursor, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (contract_id) DO UPDATE SET
+			last_ingested_ledger = excluded.last_ingested_ledger,
+			last_cursor          = excluded.last_cursor,
+			updated_at           = excluded.updated_at`,
+		c.ContractID, c.LastIngestedLedger, c.LastCursor, now,
+	)
+	if err != nil {
+		return fmt.Errorf("saving cursor for contract %s: %w", c.ContractID, err)
+	}
+	return nil
 }
-func (s *SQLite) DeleteContractCursor(context.Context, string) error {
-	return errUnsupported("sqlite", "DeleteContractCursor")
+
+// DeleteContractCursor removes a contract's cursor row (used when a
+// contract leaves the watch list). It returns ErrNotFound when no row
+// matches so the removal of an unknown contract reads as an error rather
+// than a silent no-op.
+func (s *SQLite) DeleteContractCursor(ctx context.Context, contractID string) error {
+	result, err := s.db.ExecContext(ctx,
+		`DELETE FROM contract_cursors WHERE contract_id = ?`, contractID)
+	if err != nil {
+		return fmt.Errorf("deleting cursor for contract %s: %w", contractID, err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
-func (s *SQLite) ListContractCursors(context.Context) ([]ContractCursor, error) {
-	return nil, errUnsupported("sqlite", "ListContractCursors")
+
+// ListContractCursors returns every tracked per-contract resume position.
+func (s *SQLite) ListContractCursors(ctx context.Context) ([]ContractCursor, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT contract_id, last_ingested_ledger, last_cursor, updated_at
+		 FROM contract_cursors ORDER BY contract_id`)
+	if err != nil {
+		return nil, fmt.Errorf("listing contract cursors: %w", err)
+	}
+	defer rows.Close()
+	var out []ContractCursor
+	for rows.Next() {
+		var (
+			c  ContractCursor
+			ts string
+		)
+		if err := rows.Scan(&c.ContractID, &c.LastIngestedLedger, &c.LastCursor, &ts); err != nil {
+			return nil, fmt.Errorf("scanning contract cursor: %w", err)
+		}
+		c.UpdatedAt = parseTime(ts)
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
