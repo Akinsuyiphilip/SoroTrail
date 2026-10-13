@@ -148,6 +148,10 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		Prefix:  prefix,
 		KeyHash: hash,
 	})
+	if errors.Is(err, store.ErrUnsupported) {
+		writeError(w, http.StatusNotImplemented, err)
+		return
+	}
 	if err != nil {
 		s.log.Error("persisting API key", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("creating API key failed"))
@@ -158,6 +162,10 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 	keys, err := s.store.ListAPIKeys(r.Context())
+	if errors.Is(err, store.ErrUnsupported) {
+		writeError(w, http.StatusNotImplemented, err)
+		return
+	}
 	if err != nil {
 		s.log.Error("listing API keys", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing API keys failed"))
@@ -173,6 +181,10 @@ func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.RevokeAPIKey(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrUnsupported) {
+			writeError(w, http.StatusNotImplemented, err)
+			return
+		}
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, fmt.Errorf("API key %d not found", id))
 			return
