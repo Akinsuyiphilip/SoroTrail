@@ -1552,6 +1552,10 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 	}
 	items, cursor, err := s.store.ListContracts(r.Context(), f)
 	if err != nil {
+		if errors.Is(err, store.ErrUnsupported) {
+			writeError(w, http.StatusNotImplemented, err)
+			return
+		}
 		// A cursor that passes the charset check but not the decode is
 		// bad client input (400), not a server fault (500).
 		if errors.Is(err, store.ErrInvalidContractsCursor) {
