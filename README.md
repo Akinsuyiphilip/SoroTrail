@@ -1,5 +1,8 @@
 # SoroTrail
 
+[![CI](https://img.shields.io/github/actions/workflow/status/sorotrail/SoroTrail/ci.yml?branch=main&label=CI)](https://github.com/sorotrail/SoroTrail/actions/workflows/ci.yml)
+[![Go version](https://img.shields.io/github/go-mod/go-version/sorotrail/SoroTrail?filename=go.mod&logo=go)](https://go.dev/doc/install)
+[![License](https://img.shields.io/github/license/sorotrail/SoroTrail)](LICENSE)
 
 SoroTrail
 A contract event indexer for the Stellar/Soroban network.
@@ -13,8 +16,6 @@ events themselves before the RPC drops them.
 SoroTrail does exactly that: it polls a Stellar RPC endpoint, stores contract
 events durably in Postgres or SQLite, and serves them back through a queryable
 HTTP API long after the RPC has forgotten them.
-
-[![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/<repo>/actions/workflows/ci.yml)
 
 ```
  Stellar RPC ──getEvents──▶ ingester ──▶ Postgres/SQLite ◀── HTTP API ◀── you
