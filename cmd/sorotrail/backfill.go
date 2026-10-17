@@ -207,11 +207,21 @@ func runBackfill(args []string) error {
 	return nil
 }
 
+// backfillRunner abstracts *backfill.Backfiller for testing.
+type backfillRunner interface {
+	Run(ctx context.Context) (backfill.Summary, error)
+}
+
+var (
+	backfillInitialBackoff = time.Second
+	backfillSleep          = sleepCtx
+)
+
 // runBackfillWithRetry runs the backfiller and retries on transient
 // Horizon errors (rate limits) with jittered exponential backoff up to
 // MaxBackoff. Other errors surface immediately.
-func runBackfillWithRetry(ctx context.Context, b *backfill.Backfiller, log loggerLike) (backfill.Summary, error) {
-	backoff := time.Second
+func runBackfillWithRetry(ctx context.Context, b backfillRunner, log loggerLike) (backfill.Summary, error) {
+	backoff := backfillInitialBackoff
 	for {
 		sum, err := b.Run(ctx)
 		if ctx.Err() != nil {
@@ -229,7 +239,7 @@ func runBackfillWithRetry(ctx context.Context, b *backfill.Backfiller, log logge
 		}
 		log.Warn("backfill transient error; retrying",
 			"error", err, "retry_in", sleep)
-		if !sleepCtx(ctx, sleep) {
+		if !backfillSleep(ctx, sleep) {
 			// Interrupt during retry backs off: return the partial
 			// summary so the operator sees what was committed.
 			return backfill.Summary{}, nil

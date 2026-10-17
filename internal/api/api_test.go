@@ -149,11 +149,13 @@ type stubStore struct {
 	countContractsErr    error
 	lastContractsFilter  store.ContractsFilter
 
-	addressEvents    []store.Event
-	addressCursor    string
-	addressEventsErr error
-	addressCount     int64
-	addressCountErr  error
+	addressEvents     []store.Event
+	addressCursor     string
+	addressEventsErr  error
+	addressCount      int64
+	addressCountErr   error
+	addressSummary    store.AddressSummary
+	addressSummaryErr error
 
 	deadLettersResult []store.DeadLetter
 	deadLettersCursor string
@@ -384,7 +386,7 @@ func (s *stubStore) CountAddressEvents(_ context.Context, address string) (int64
 	return s.addressCount, s.addressCountErr
 }
 func (s *stubStore) GetAddressSummary(context.Context, string) (store.AddressSummary, error) {
-	return store.AddressSummary{}, nil
+	return s.addressSummary, s.addressSummaryErr
 }
 func (s *stubStore) UpsertAddressRefs(context.Context, []store.AddressRef) error {
 	return nil
