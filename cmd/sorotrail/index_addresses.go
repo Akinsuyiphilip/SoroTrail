@@ -154,8 +154,13 @@ type addressIndexSummary struct {
 	duration       time.Duration
 }
 
+type addressIndexStore interface {
+	QueryEvents(ctx context.Context, filter store.EventFilter) ([]store.Event, string, error)
+	UpsertAddressRefs(ctx context.Context, refs []store.AddressRef) error
+}
+
 type addressIndexer struct {
-	store     *store.Postgres
+	store     addressIndexStore
 	batchSize int
 	from      int64
 	to        int64
