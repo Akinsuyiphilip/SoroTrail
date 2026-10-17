@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"text/tabwriter"
@@ -16,24 +17,41 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
+// apiKeyStore abstracts the store calls required by the apikey subcommands.
+type apiKeyStore interface {
+	CreateAPIKey(ctx context.Context, k store.APIKey) (store.APIKey, error)
+	ListAPIKeys(ctx context.Context) ([]store.APIKey, error)
+	RevokeAPIKey(ctx context.Context, id int64) error
+}
+
+// openAPIKeyStore is the store opener seam used by apikey subcommands.
+var openAPIKeyStore = func(ctx context.Context) (apiKeyStore, func(), error) {
+	return openStore(ctx)
+}
+
 // runAPIKey implements `sorotrail apikey`: issue, list, and revoke the
 // API keys used to authenticate write/streaming requests when
 // API_KEY_AUTH_ENABLED=true. The CLI talks to the database directly, so
 // it is the bootstrap path for the first key (the /apikeys endpoints
 // require an existing key).
 func runAPIKey(args []string) error {
+	return runAPIKeyTo(os.Stdout, args)
+}
+
+// runAPIKeyTo is runAPIKey with an explicit output writer for testability.
+func runAPIKeyTo(w io.Writer, args []string) error {
 	if len(args) == 0 {
 		return errors.New("apikey requires a subcommand: create, list, revoke")
 	}
 	switch args[0] {
 	case "create":
-		return apikeyCreate(args[1:])
+		return apikeyCreateTo(w, args[1:])
 	case "list":
-		return apikeyList(args[1:])
+		return apikeyListTo(w, args[1:])
 	case "revoke":
-		return apikeyRevoke(args[1:])
+		return apikeyRevokeTo(w, args[1:])
 	case "help", "-h", "--help":
-		apikeyUsage()
+		apikeyUsageTo(w)
 		return nil
 	default:
 		return fmt.Errorf("unknown apikey subcommand %q (want create|list|revoke)", args[0])
@@ -41,7 +59,11 @@ func runAPIKey(args []string) error {
 }
 
 func apikeyUsage() {
-	fmt.Fprint(os.Stderr, `usage: sorotrail apikey <command>
+	apikeyUsageTo(os.Stderr)
+}
+
+func apikeyUsageTo(w io.Writer) {
+	fmt.Fprint(w, `usage: sorotrail apikey <command>
 
 Manages the API keys that authenticate write/streaming requests when
 API_KEY_AUTH_ENABLED=true (see README, "API key authentication").
@@ -76,7 +98,12 @@ func openStore(ctx context.Context) (*store.Postgres, func(), error) {
 }
 
 func apikeyCreate(args []string) error {
+	return apikeyCreateTo(os.Stdout, args)
+}
+
+func apikeyCreateTo(w io.Writer, args []string) error {
 	fs := flag.NewFlagSet("apikey create", flag.ContinueOnError)
+	fs.SetOutput(w)
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `usage: sorotrail apikey create [--name NAME]
 
@@ -102,7 +129,7 @@ flags:
 	}
 
 	ctx := context.Background()
-	st, cleanup, err := openStore(ctx)
+	st, cleanup, err := openAPIKeyStore(ctx)
 	if err != nil {
 		return err
 	}
@@ -121,15 +148,20 @@ flags:
 		return err
 	}
 
-	fmt.Printf("created API key %d (%s)\n", created.ID, created.Name)
-	fmt.Printf("prefix: %s\n", created.Prefix)
-	fmt.Printf("key:    %s\n", key)
-	fmt.Println("store this key now — it will not be shown again.")
+	fmt.Fprintf(w, "created API key %d (%s)\n", created.ID, created.Name)
+	fmt.Fprintf(w, "prefix: %s\n", created.Prefix)
+	fmt.Fprintf(w, "key:    %s\n", key)
+	fmt.Fprintln(w, "store this key now — it will not be shown again.")
 	return nil
 }
 
 func apikeyList(args []string) error {
+	return apikeyListTo(os.Stdout, args)
+}
+
+func apikeyListTo(w io.Writer, args []string) error {
 	fs := flag.NewFlagSet("apikey list", flag.ContinueOnError)
+	fs.SetOutput(w)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -138,7 +170,7 @@ func apikeyList(args []string) error {
 	}
 
 	ctx := context.Background()
-	st, cleanup, err := openStore(ctx)
+	st, cleanup, err := openAPIKeyStore(ctx)
 	if err != nil {
 		return err
 	}
@@ -149,25 +181,30 @@ func apikeyList(args []string) error {
 		return err
 	}
 	if len(keys) == 0 {
-		fmt.Println("no API keys")
+		fmt.Fprintln(w, "no API keys")
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tNAME\tPREFIX\tCREATED\tSTATUS")
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tNAME\tPREFIX\tCREATED\tSTATUS")
 	for _, k := range keys {
 		status := "active"
 		if k.Revoked() {
 			status = "revoked"
 		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n",
 			k.ID, k.Name, k.Prefix, k.CreatedAt.Format("2006-01-02 15:04:05"), status)
 	}
-	return w.Flush()
+	return tw.Flush()
 }
 
 func apikeyRevoke(args []string) error {
+	return apikeyRevokeTo(os.Stdout, args)
+}
+
+func apikeyRevokeTo(w io.Writer, args []string) error {
 	fs := flag.NewFlagSet("apikey revoke", flag.ContinueOnError)
+	fs.SetOutput(w)
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `usage: sorotrail apikey revoke ID
 
@@ -191,7 +228,7 @@ next request; the action cannot be undone (issue a new key instead).
 	}
 
 	ctx := context.Background()
-	st, cleanup, err := openStore(ctx)
+	st, cleanup, err := openAPIKeyStore(ctx)
 	if err != nil {
 		return err
 	}
@@ -203,6 +240,6 @@ next request; the action cannot be undone (issue a new key instead).
 		}
 		return err
 	}
-	fmt.Printf("revoked API key %d\n", id)
+	fmt.Fprintf(w, "revoked API key %d\n", id)
 	return nil
 }
