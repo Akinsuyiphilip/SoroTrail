@@ -22,6 +22,7 @@ type Broker struct {
 	mu          sync.RWMutex
 	subscribers map[int64]*subscriber
 	nextID      int64
+	closed      bool
 }
 
 type subscriber struct {
@@ -49,6 +50,11 @@ func (b *Broker) Subscribe(filter store.EventFilter) (<-chan store.Event, func()
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		ch := make(chan store.Event)
+		close(ch)
+		return ch, func() {}
+	}
 
 	id := b.nextID
 	b.nextID++
@@ -82,15 +88,13 @@ func (b *Broker) Publish(events []store.Event) {
 		return
 	}
 	b.mu.RLock()
-	// Snapshot subscribers under the read lock, then publish outside it so a
-	// slow send doesn't stall new subscriptions.
-	subs := make(map[int64]*subscriber, len(b.subscribers))
-	for id, s := range b.subscribers {
-		subs[id] = s
+	if b.closed || len(b.subscribers) == 0 {
+		b.mu.RUnlock()
+		return
 	}
-	b.mu.RUnlock()
 
-	for _, s := range subs {
+	var dropped []int64
+	for _, s := range b.subscribers {
 		for _, e := range events {
 			if !eventMatches(s.filter, e) {
 				continue
@@ -99,16 +103,23 @@ func (b *Broker) Publish(events []store.Event) {
 			case s.ch <- e:
 			default:
 				// Buffer full: drop this subscriber.
-				b.mu.Lock()
-				if existing, ok := b.subscribers[s.id]; ok && existing == s {
-					close(s.ch)
-					delete(b.subscribers, s.id)
-				}
-				b.mu.Unlock()
+				dropped = append(dropped, s.id)
 				goto nextSub // break out of the inner event loop
 			}
 		}
 	nextSub:
+	}
+	b.mu.RUnlock()
+
+	if len(dropped) > 0 {
+		b.mu.Lock()
+		for _, id := range dropped {
+			if s, ok := b.subscribers[id]; ok {
+				close(s.ch)
+				delete(b.subscribers, id)
+			}
+		}
+		b.mu.Unlock()
 	}
 }
 
@@ -119,6 +130,10 @@ func (b *Broker) Shutdown() {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		return
+	}
+	b.closed = true
 	for id, s := range b.subscribers {
 		close(s.ch)
 		delete(b.subscribers, id)
