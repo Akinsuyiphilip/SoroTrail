@@ -132,14 +132,18 @@ type compressWriter struct {
 	encoding string
 	minSize  int
 
-	status  int
-	wrote   bool // WriteHeader already sent to the client
-	decided bool
-	buf     []byte
-	enc     io.WriteCloser // set only when compressing
+	status   int
+	wrote    bool // WriteHeader already sent to the client
+	decided  bool
+	hijacked bool
+	buf      []byte
+	enc      io.WriteCloser // set only when compressing
 }
 
 func (w *compressWriter) WriteHeader(status int) {
+	if w.hijacked {
+		return
+	}
 	// Hold the status until the encoding is known: Content-Encoding and
 	// Content-Length must be settled before headers go out.
 	w.status = status
@@ -149,7 +153,7 @@ func (w *compressWriter) WriteHeader(status int) {
 }
 
 func (w *compressWriter) flushHeader() {
-	if w.wrote {
+	if w.wrote || w.hijacked {
 		return
 	}
 	w.wrote = true
@@ -160,6 +164,9 @@ func (w *compressWriter) flushHeader() {
 }
 
 func (w *compressWriter) Write(b []byte) (int, error) {
+	if w.hijacked {
+		return 0, http.ErrHijacked
+	}
 	if w.decided {
 		return w.write(b)
 	}
@@ -239,6 +246,9 @@ func (w *compressWriter) shouldCompress() bool {
 // Close finishes the response: an undersized body is emitted uncompressed,
 // and a compressed one gets its trailer.
 func (w *compressWriter) Close() {
+	if w.hijacked {
+		return
+	}
 	if !w.decided {
 		// Never reached the threshold — send it as-is.
 		_ = w.decide(false)
@@ -253,6 +263,9 @@ func (w *compressWriter) Close() {
 // an unflushed response that hasn't reached the threshold gives up on
 // compression rather than holding bytes back waiting for more.
 func (w *compressWriter) Flush() {
+	if w.hijacked {
+		return
+	}
 	if !w.decided {
 		_ = w.decide(false)
 	}
@@ -272,7 +285,11 @@ func (w *compressWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if !ok {
 		return nil, nil, http.ErrNotSupported
 	}
-	return hj.Hijack()
+	conn, rw, err := hj.Hijack()
+	if err == nil {
+		w.hijacked = true
+	}
+	return conn, rw, err
 }
 
 // weakenETag converts a strong ETag to a weak one, leaving an already-weak
