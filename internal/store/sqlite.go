@@ -808,9 +808,12 @@ func (s *SQLite) GetDeadLetter(ctx context.Context, id int64) (DeadLetter, error
 }
 
 func (s *SQLite) DeleteDeadLetter(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM dead_letters WHERE id = ?", id)
+	res, err := s.db.ExecContext(ctx, "DELETE FROM dead_letters WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("deleting dead letter: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrNotFound
 	}
 	return nil
 }

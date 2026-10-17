@@ -1767,7 +1767,8 @@ throttled like a regular client.
 Pushes ingested events to the client over a single WebSocket connection
 as soon as they are written to the store. There is no replay — the
 stream starts at "now", and the client only sees events the indexer
-ingests after it connects.
+ingests after it connects. See [Live Subscriptions](docs/subscriptions.md)
+for delivery guarantees, reconnection guidance, and the catch-up pattern.
 
 Query parameters share the same EventFilter shape as GET /events
 (contract_id, type, topic, from_ledger, to_ledger,
@@ -1893,7 +1894,9 @@ Read-only query endpoints (`GET /events`, `GET /events/{id}`,
 Keys look like `sorotrail_<prefix>_<secret>` and are presented via either
 the `Authorization: Bearer <key>` header or the `X-API-Key: <key>` header.
 Only a bcrypt hash of the secret is stored in Postgres — the full key is
-displayed exactly once at creation and cannot be recovered later.
+displayed exactly once at creation and cannot be recovered later. See
+[API Key Lifecycle and Scopes](docs/api-keys.md) for full documentation on
+bootstrap keys, scopes, rotation procedures, and backend constraints.
 
 ### Managing keys
 
