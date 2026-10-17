@@ -1677,6 +1677,7 @@ func (s *Server) handleDeleteDeadLetter(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, errors.New("deleting dead letter failed"))
 		return
 	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 

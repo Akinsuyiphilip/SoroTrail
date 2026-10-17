@@ -160,10 +160,13 @@ type stubStore struct {
 	deadLettersResult []store.DeadLetter
 	deadLettersCursor string
 	deadLettersErr    error
+	listDeadLettersFn func(ctx context.Context, contractID string, limit int, cursor string) ([]store.DeadLetter, string, error)
 	// deadLettersCount is what CountDeadLetters returns; the error field
 	// drives the "count failed, header omitted" path.
 	deadLettersCount    int64
 	deadLettersCountErr error
+	deleteDeadLetterErr error
+	deleteDeadLetterFn  func(ctx context.Context, id int64) error
 
 	// deliveryAttemptsCount is what CountDeliveryAttempts returns; the
 	// error field drives the "count failed, header omitted" path.
@@ -3015,13 +3018,21 @@ func TestGetEventTransaction_NoInterferenceWithGetEvent(t *testing.T) {
 func (m *stubStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
 	return store.DeadLetter{}, nil
 }
-func (m *stubStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+func (m *stubStore) ListDeadLetters(ctx context.Context, contractID string, limit int, cursor string) ([]store.DeadLetter, string, error) {
+	if m.listDeadLettersFn != nil {
+		return m.listDeadLettersFn(ctx, contractID, limit, cursor)
+	}
 	return m.deadLettersResult, m.deadLettersCursor, m.deadLettersErr
 }
 func (m *stubStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
 	return store.DeadLetter{}, store.ErrNotFound
 }
-func (m *stubStore) DeleteDeadLetter(context.Context, int64) error { return nil }
+func (m *stubStore) DeleteDeadLetter(ctx context.Context, id int64) error {
+	if m.deleteDeadLetterFn != nil {
+		return m.deleteDeadLetterFn(ctx, id)
+	}
+	return m.deleteDeadLetterErr
+}
 func (m *stubStore) CountDeadLetters(context.Context, string) (int64, error) {
 	return m.deadLettersCount, m.deadLettersCountErr
 }
