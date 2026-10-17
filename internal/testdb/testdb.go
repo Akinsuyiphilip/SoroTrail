@@ -161,10 +161,34 @@ func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 		audit_findings,
 		watched_contracts,
 		replay_state,
-		dead_letters
-		RESTART IDENTITY`)
+		dead_letters,
+		api_keys,
+		subscriptions,
+		delivery_attempts,
+		backfill_state,
+		contract_cursors,
+		contract_meta,
+		contract_specs,
+		contract_spec_overrides,
+		event_addresses,
+		token_balances,
+		token_balance_state,
+		archive_chunks,
+		tenant_usage,
+		tenant_api_keys,
+		tenant_watched_contracts,
+		tenant_contract_grants,
+		tenants
+		RESTART IDENTITY CASCADE`)
 	if err != nil {
 		return fmt.Errorf("truncating tables: %w", err)
+	}
+	_, err = pool.Exec(ctx, `
+		INSERT INTO tenants (name, wildcard, is_admin, enabled)
+		VALUES ('default', true, true, true)
+		ON CONFLICT (name) DO NOTHING;`)
+	if err != nil {
+		return fmt.Errorf("re-seeding default tenant: %w", err)
 	}
 	_, err = pool.Exec(ctx, `
 		DO $$

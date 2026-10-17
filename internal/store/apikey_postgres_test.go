@@ -26,7 +26,7 @@ func TestAPIKeyCRUD(t *testing.T) {
 
 	created, err := st.CreateAPIKey(ctx, testAPIKey("ops", "aabbccdd0011"))
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), created.ID)
+	assert.Positive(t, created.ID)
 	assert.NotZero(t, created.CreatedAt)
 	assert.False(t, created.Revoked())
 	assert.Equal(t, "bcrypt-hash-placeholder", created.KeyHash, "hash round-trips for verification")

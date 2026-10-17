@@ -5,7 +5,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -48,13 +50,18 @@ func TestAPIKey_PostgresIntegration(t *testing.T) {
 	assert.Contains(t, buf.String(), "active")
 
 	// 3. Revoke API key in real Postgres
-	buf.Reset()
-	err = apikeyRevokeTo(&buf, []string{"1"})
+	keys, err := st.ListAPIKeys(ctx)
 	require.NoError(t, err)
-	assert.Contains(t, buf.String(), "revoked API key 1")
+	require.NotEmpty(t, keys)
+	keyID := keys[0].ID
+
+	buf.Reset()
+	err = apikeyRevokeTo(&buf, []string{strconv.FormatInt(keyID, 10)})
+	require.NoError(t, err)
+	assert.Contains(t, buf.String(), fmt.Sprintf("revoked API key %d", keyID))
 
 	// 4. Assert authentication rejection in Postgres
-	keys, err := st.ListAPIKeys(ctx)
+	keys, err = st.ListAPIKeys(ctx)
 	require.NoError(t, err)
 	require.NotEmpty(t, keys)
 	assert.True(t, keys[0].Revoked(), "key in database must be marked revoked")
