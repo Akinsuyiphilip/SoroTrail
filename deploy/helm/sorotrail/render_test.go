@@ -12,12 +12,16 @@
 // (see the TestRenderGolden_* doc comments).
 //
 // The tests skip when the helm binary is unavailable, so `go test ./...`
-// stays green on machines without Helm; CI's runner ships Helm and runs
-// them for real.
+// stays green on machines without Helm; CI's helm job installs Helm with
+// azure/setup-helm and lints and templates the chart, but the test job
+// (go test ./...) has no Helm either, so these golden tests only run where a
+// contributor has installed it. That is why the skip has to be loud: without
+// the notice a green run looks like it verified the chart.
 package sorotrail_test
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,22 +35,75 @@ import (
 
 var update = flag.Bool("update", false, "regenerate golden files instead of comparing")
 
+// requireHelmEnv turns the helm-less skip into a failure. CI sets it in the job
+// that installs Helm, so the chart tests cannot quietly skip there and leave the
+// job green: a missing or shadowed binary fails instead of reporting success for
+// a suite that never rendered the chart. Locally it stays unset, because
+// failing every contributor without Helm would break the suite for them (issue
+// #1074).
+const requireHelmEnv = "REQUIRE_HELM_CHART_TESTS"
+
+// helmInstallHint names where to get the binary. It is quoted verbatim in the
+// skip message, the failure message and the notice so the three cannot drift
+// apart. The version matches the one CI's helm job pins.
+const helmInstallHint = "install Helm v3.15.0 via https://helm.sh/docs/intro/install/"
+
+// TestMain emits the skip notice on stderr. It lands in the output when the
+// package fails and under -v, so a failing run says outright that the chart went
+// unverified instead of leaving the reader to spot three SKIP lines.
+//
+// It cannot reach the default output of a clean `go test ./...`: the go command
+// prints only the final "ok" summary line for a passing package and discards the
+// test binary's output entirely (go help test), stderr included. So the notice a
+// plain run needs is emitted from outside the test binary — `make test`,
+// `make test-fast` and `make test-ci` run scripts/check_helm_chart_tests.sh for
+// exactly that reason (issue #1074).
+func TestMain(m *testing.M) {
+	if notice := helmSkipNotice(); notice != "" {
+		fmt.Fprintln(os.Stderr, notice)
+	}
+	os.Exit(m.Run())
+}
+
+// helmSkipNotice reports, as a single line, that this package's chart tests
+// cannot run because helm is not on PATH. It returns "" when helm is available
+// or when the tests are required, so the caller prints nothing in those cases.
+func helmSkipNotice() string {
+	if _, err := exec.LookPath("helm"); err == nil {
+		return ""
+	}
+	if os.Getenv(requireHelmEnv) != "" {
+		// helmPath fails the tests in this case; the notice would be noise
+		// on top of the failure it already reports.
+		return ""
+	}
+	return fmt.Sprintf("NOTICE: helm is not on PATH, so every test in deploy/helm/sorotrail was SKIPPED and the chart goldens were NOT verified (the same is true of the CI test job, which does not install Helm). To run them, %s. Set %s=1 to turn the skip into a failure.",
+		helmInstallHint, requireHelmEnv)
+}
+
+// helmPath returns the helm binary. Without helm the tests skip, because
+// failing would break the suite for every contributor who does not have it;
+// with requireHelmEnv set the skip becomes a failure so a job that installs
+// Helm can assert the chart tests really ran.
+func helmPath(t *testing.T) string {
+	t.Helper()
+	p, err := exec.LookPath("helm")
+	if err != nil {
+		if os.Getenv(requireHelmEnv) != "" {
+			t.Fatalf("%s is set but helm is not on PATH; %s, or unset %s to skip the chart tests",
+				requireHelmEnv, helmInstallHint, requireHelmEnv)
+		}
+		t.Skipf("helm not installed; %s, or set %s=1 to fail instead of skipping (see CONTRIBUTING.md)",
+			helmInstallHint, requireHelmEnv)
+	}
+	return p
+}
+
 // chartDir resolves the chart directory relative to this test file, so
 // the tests run from any working directory.
 func chartDir() string {
 	_, file, _, _ := runtime.Caller(0)
 	return filepath.Dir(file)
-}
-
-// helmPath returns the helm binary, skipping the test when it is not
-// installed.
-func helmPath(t *testing.T) string {
-	t.Helper()
-	p, err := exec.LookPath("helm")
-	if err != nil {
-		t.Skip("helm not installed; install Helm (https://helm.sh) to run the chart golden tests")
-	}
-	return p
 }
 
 // renderChart runs `helm template` with the given extra args and returns
@@ -197,4 +254,31 @@ func manifest(t *testing.T, rendered, kind string) string {
 	}
 	t.Fatalf("rendered output contains no %s manifest", kind)
 	return ""
+}
+
+// TestHelmSkipNotice pins the wording that makes the helm-less skip visible
+// (issue #1074). It guards the copy in three places at once: the skip message,
+// the REQUIRE_HELM_CHART_TESTS failure message, and the notice
+// scripts/check_helm_chart_tests.sh repeats to make the gap visible in the
+// default make output, where the test binary's own output does not survive. A
+// regression here silently restores the "green run looks like chart coverage"
+// problem the notice exists to prevent.
+func TestHelmSkipNotice(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err == nil {
+		t.Skip("helm is installed, so there is no skip notice to assert")
+	}
+
+	// The notice is what the plain, non-verbose run prints, so it must hold
+	// up with the escape hatch unset. t.Setenv also fails the test if it
+	// leaks into the suite's real environment.
+	t.Setenv(requireHelmEnv, "")
+
+	notice := helmSkipNotice()
+	require.NotEmpty(t, notice, "helm is missing, so the package must announce the skip")
+	assert.Contains(t, notice, requireHelmEnv,
+		"the notice must name the variable that turns the skip into a failure")
+	assert.Contains(t, notice, helmInstallHint,
+		"the notice must quote the install hint, so it stays in step with the skip message")
+	assert.NotContains(t, strings.TrimSpace(notice), "\n",
+		"the notice is printed once per run and has to stay a single line")
 }

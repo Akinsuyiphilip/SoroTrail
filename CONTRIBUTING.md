@@ -44,6 +44,41 @@ seams — most features should slot in behind an existing interface.
 The full, copy-pasteable setup and testing walkthrough lives in
 [`docs/local-setup.md`](docs/local-setup.md).
 
+### Helm chart tests
+
+A green `make test` does **not** cover the Helm chart. The chart tests in
+`deploy/helm/sorotrail/render_test.go` shell out to `helm template`, so every
+one of them skips when `helm` is not on PATH, and CI's test job
+(`go test ./...`) does not install Helm either — only the separate `helm` job
+does, and that job lints and templates the chart rather than running these
+tests. Missing that is how a PR that adds a configuration variable, or renames
+a template key, passes every local check and still fails review with a chart
+that cannot set the new variable.
+
+Two things close the gap:
+
+- Without `helm` on PATH, `go test ./...` prints a `NOTICE:` line saying the
+  chart tests were skipped. That is the signal, and it means a green run with
+  the notice is not chart coverage. Install Helm v3.15.0 (the version CI pins)
+  to make it go away and run the tests for real — see
+  <https://helm.sh/docs/intro/install/>.
+- Set `REQUIRE_HELM_CHART_TESTS=1` to turn the skip into a failure, so the job
+  that installs Helm can assert the chart tests really ran instead of trusting
+  the job configuration.
+
+The guard tests a chart change trips over are `TestRenderGolden_DefaultValues`
+and `TestRenderGolden_RepresentativeOverrides`: both render the chart and
+compare the output byte for byte, so adding or renaming a value fails the
+comparison until the golden files are regenerated. Regenerate them with:
+
+```sh
+go test ./deploy/helm/sorotrail -run TestRenderGolden -update
+```
+
+`TestRender_ManifestInvariants` checks the same render structurally. Anything
+that adds a chart value must also cover it in `testdata/overrides.yaml` and
+regenerate the goldens in the same pull request.
+
 ### How the integration test layer works (issue #9)
 
 Per the issue, four coverage areas are required. They each have an
@@ -208,7 +243,9 @@ Before submitting a pull request, run `make ci` — it reproduces the CI gate
 locally (build, `go vet` with and without the `integration` tag, the tagged
 and untagged test suites, the benchmark smoke run, and `golangci-lint`) and
 stops at the first failing step, just like CI. The database-backed tests skip
-gracefully when `TEST_DATABASE_URL` (or Docker) is unavailable, so `make ci`
+gracefully when `TEST_DATABASE_URL` (or Docker) is unavailable — and, as noted
+under [Helm chart tests](#helm-chart-tests), so do the chart tests when Helm is
+missing, which is why that run prints a notice — so `make ci`
 passes without Postgres and runs the full gate once one is available. Every
 target is documented; run `make help` to list them all.
 

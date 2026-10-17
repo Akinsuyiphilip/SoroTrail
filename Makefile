@@ -11,7 +11,7 @@ BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown
 
 LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
 
-.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean
+.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean test-verbose helm-tests-visible
 .PHONY: build build-all build-all-integration run test test-fast test-db test-integration vet vet-integration test-ci lint cover cover-html migrate-up migrate-down docker-up docker-down simtest simtest-long clean bench bench-ci seed spec spec-check client ci
 .PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean
 
@@ -42,17 +42,28 @@ run: build ## Build and run the binary
 
 # ── Test ─────────────────────────────────────────────────────────────────────
 
-test: ## Run the unit suite with race detector
+test: helm-tests-visible ## Run the unit suite with race detector
 	go test -race ./...
 
-test-fast: ## Run unit tests without the race detector
+test-fast: helm-tests-visible ## Run unit tests without the race detector
 	go test ./...
 
 test-db: ## Run full test suite against Postgres (requires DATABASE_URL)
 	TEST_DATABASE_URL=$(DATABASE_URL) go test -p 1 ./...
 
-test-ci: ## Mirror the CI test job exactly (race-enabled, serial, 120s timeout)
+test-ci: helm-tests-visible ## Mirror the CI test job exactly (race-enabled, serial, 120s timeout)
 	go test -p 1 ./... -count=1 -race -timeout=120s
+
+test-verbose: helm-tests-visible ## Run the unit suite verbosely, so SKIP lines are visible
+	go test ./... -count=1 -v
+
+# The chart tests shell out to helm and skip without it, and a skipped test
+# prints nothing in the default output, so a contributor sees a green test run
+# that never rendered the chart. The notice has to be emitted outside the test
+# binary — the go command discards a passing package's output — hence the
+# prerequisite. It never fails the build: see scripts/check_helm_chart_tests.sh.
+helm-tests-visible:
+	@scripts/check_helm_chart_tests.sh
 
 test-integration: ## Run the integration-tagged suite against a real Postgres
 	go test -tags=integration -p 1 ./... -count=1
