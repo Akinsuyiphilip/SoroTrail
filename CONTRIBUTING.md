@@ -14,6 +14,10 @@ seams — most features should slot in behind an existing interface.
 4. `make cover` runs the test suite with coverage and prints a per-package
    summary; `make cover-html` opens the HTML report in your browser.
 5. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
+6. `make check-monitoring` validates the Prometheus rules and the Grafana
+   dashboard the way CI does (needs [promtool](https://prometheus.io/download/)
+   and python3; no running Prometheus required) — run it when you touch
+   anything under `deploy/`.
 
 The integration tests truncate the tables they use — point
 `TEST_DATABASE_URL` at a throwaway database, not one with data you care

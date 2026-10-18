@@ -2,7 +2,7 @@ BINARY := bin/sorotrail
 MIGRATIONS := internal/store/migrations
 DATABASE_URL ?= postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
 
-.PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down clean
+.PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down clean check-monitoring
 
 build:
 	go build -o $(BINARY) ./cmd/sorotrail
@@ -22,6 +22,18 @@ test-db:
 
 lint:
 	golangci-lint run
+
+# Validate the operator-facing monitoring assets. promtool parses the rule
+# file and runs the unit tests in deploy/prometheus/sorotrail-rules-test.yml;
+# scripts/validate_monitoring.py then asserts the dashboard parses as a real
+# Grafana dashboard and that every metric both assets reference is one
+# SoroTrail actually exports (deploy/prometheus/exported-metrics.txt).
+# Needs promtool on PATH (ships with Prometheus); no Prometheus server or
+# secrets required, so CI runs the same thing.
+check-monitoring:
+	promtool check rules deploy/prometheus/sorotrail-rules.yml
+	promtool test rules deploy/prometheus/sorotrail-rules-test.yml
+	python3 scripts/validate_monitoring.py
 
 cover:
 	go test -coverprofile=coverage.out ./... && go tool cover -func=coverage.out
