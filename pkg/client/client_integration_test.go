@@ -97,7 +97,12 @@ func TestClientAgainstRealServer(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, "ok", got.Status)
-		assert.Equal(t, "ok", got.Checks["database"])
+		// Since #718 each entry is an object — status, optional detail and
+		// its own latency — rather than a bare string.
+		dbCheck, ok := got.Checks["database"].(map[string]any)
+		require.Truef(t, ok, "checks.database must be an object, got %T", got.Checks["database"])
+		assert.Equal(t, "ok", dbCheck["status"])
+		assert.Contains(t, dbCheck, "latency_ms")
 	})
 
 	t.Run("Version", func(t *testing.T) {

@@ -108,10 +108,10 @@ func documentedShape(t *testing.T, schemas map[string]schemaNode, name string) w
 // the code names them for handlers (contractListResponse) — and an automated
 // match on either side would hide a rename rather than catch one.
 var schemaSurfaces = map[string]reflect.Type{
-	"APIKey":                    reflect.TypeOf(store.APIKey{}),
-	"ContractSummary":           reflect.TypeOf(store.ContractSummary{}),
-	"ContractsPage":             reflect.TypeOf(contractListResponse{}),
+	"APIKey":          reflect.TypeOf(store.APIKey{}),
+	"ContractSummary": reflect.TypeOf(store.ContractSummary{}), "ContractsPage": reflect.TypeOf(contractListResponse{}),
 	"CreateSubscriptionRequest": reflect.TypeOf(createSubscriptionRequest{}),
+	"DependencyCheck":           reflect.TypeOf(dependencyCheck{}),
 	"DeliveryAttempt":           reflect.TypeOf(store.DeliveryAttempt{}),
 	"EnrichedEvent":             reflect.TypeOf(store.EnrichedEvent{}),
 	"ErrorResponse":             reflect.TypeOf(errorResponse{}),
