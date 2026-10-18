@@ -419,6 +419,52 @@ jobs:
         if: always()
         run: ./scripts/check_lint_toolchain.sh --verify-binary
 
+  # Issue #480: commit 4653a66 was titled "add Dependabot and govulncheck to
+  # dependency management", but only the Dependabot half landed, so dependency
+  # CVEs went unreported. This is that missing half. govulncheck's default
+  # symbol scan fails the build (exit status 3) only when a known vulnerability
+  # is reachable from code the module actually builds, which keeps the check
+  # actionable instead of red on every unused transitive advisory.
+  #
+  # `go run ...@latest` keeps the scanner out of go.mod, so the module under
+  # scan is the project's own dependency set and nothing has to be reviewed and
+  # bumped to get a newer scanner. Two things follow from that. A future x/vuln
+  # release needing a newer Go than go.mod targets fails here as a `go run`
+  # error naming the version, which is the prompt to move go.mod forward rather
+  # than a silent hole. And because the standard library is scanned at the exact
+  # patch go.mod names, that directive has to stay on a patched 1.26.x; see the
+  # comment on the setup-go step below.
+  vulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        id: go
+        with:
+          go-version-file: go.mod
+          # setup-go installs the exact patch named by go.mod's `go` directive
+          # rather than the newest release of that minor, so the version pinned
+          # there is what gets scanned — including its standard library. Keeping
+          # the directive on the newest 1.26 patch is what keeps this job green;
+          # an older patch brings back reachable stdlib advisories that no
+          # dependency bump can fix. setup-go's own caching is off for the same
+          # reason as in the other jobs that compile (see `test-matrix`), and
+          # govulncheck type-checks the untagged module, so it shares the
+          # `plain` cache flavour.
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
   # Issue #550: docker-publish.yml only builds once a tag is pushed, so a
   # Dockerfile change that broke the image was discovered on main, after the
   # merge. The Dockerfile is multi-stage and cross-compiles, so it has ways
