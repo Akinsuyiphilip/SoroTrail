@@ -33,7 +33,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
@@ -82,14 +81,22 @@ func setupShared(t *testing.T, ctx context.Context, url string, migrate func(url
 	return pool
 }
 
+// runPostgresContainer is a seam for tests. Without a live Docker daemon
+// there is no way to make testcontainers return the "Docker unavailable"
+// error shape, so the skip path in setupContainer is otherwise untestable.
+// Production always points this at tcpostgres.Run.
+var runPostgresContainer = tcpostgres.Run
+
 // setupContainer brings up an ephemeral Postgres 16-alpine container with
-// a fresh database. The postgres module ships its own default readiness
-// wait strategy; we don't redeclare it here so a startup failure surfaces
-// the underlying error rather than masking it behind a duplicate probe.
+// a fresh database. testcontainers-go v0.44 no longer applies a default
+// readiness wait strategy in the postgres module, so declare the module's
+// own BasicWaitStrategies: it waits for the initdb restart to finish and
+// for the mapped port to accept connections. Without it, migrate() races
+// Postgres startup and fails with "connection refused".
 func setupContainer(t *testing.T, ctx context.Context, migrate func(url string) error) *pgxpool.Pool {
 	t.Helper()
-	pgC, err := tcpostgres.RunContainer(ctx,
-		testcontainers.WithImage("postgres:16-alpine"),
+	pgC, err := runPostgresContainer(ctx, "postgres:16-alpine",
+		tcpostgres.BasicWaitStrategies(),
 	)
 	if err != nil {
 		if isDockerUnavailable(err) {
@@ -152,7 +159,10 @@ func isDockerUnavailable(err error) bool {
 // would overlap ("partition would overlap partition", SQLSTATE 42P17).
 // Dropping them here keeps every package's DB-backed tests starting from
 // the clean layout Migrate produced, regardless of what a previous
-// package did.
+// package did. Those experiments also drop the default partition itself
+// when they rebuild the partition set, so recreate it when missing;
+// otherwise a later insert outside the leftover range children fails
+// with "no partition of relation events found for row".
 func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 	_, err := pool.Exec(ctx, `TRUNCATE
 		events,
@@ -204,9 +214,12 @@ func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 		    LOOP
 		        EXECUTE format('DROP TABLE IF EXISTS %I', child);
 		    END LOOP;
+		    IF to_regclass('public.events_default') IS NULL THEN
+		        CREATE TABLE events_default PARTITION OF events DEFAULT;
+		    END IF;
 		END $$;`)
 	if err != nil {
-		return fmt.Errorf("dropping leftover event partitions: %w", err)
+		return fmt.Errorf("resetting event partitions: %w", err)
 	}
 	return nil
 }
