@@ -162,7 +162,7 @@ kubectl get pods
 kubectl logs -l app.kubernetes.io/name=sorotrail
 kubectl port-forward svc/sorotrail 8080:80
 curl http://localhost:8080/health
-# {"status":"ok","checks":{"database":"ok","rpc":"ok"}}
+# {"status":"ok","checks":{"database":{"status":"ok","latency_ms":1},"rpc":{"status":"ok","latency_ms":2}}}
 ```
 
 ### 5. Tear down
