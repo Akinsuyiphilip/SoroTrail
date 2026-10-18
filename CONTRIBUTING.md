@@ -205,8 +205,9 @@ pin, and the Go version recorded beside it, whenever the Go version moves. See
 ## Verification & Automated Checks
 
 Before submitting a pull request, run `make ci` — it reproduces the CI gate
-locally (build, `go vet` with and without the `integration` tag, the tagged
-and untagged test suites, the benchmark smoke run, and `golangci-lint`) and
+locally (build, `go vet` with and without the `integration` tag, the OpenAPI
+drift check, the migration numbering gate, the tagged and untagged test suites,
+the benchmark smoke run, and `golangci-lint`) and
 stops at the first failing step, just like CI. The database-backed tests skip
 gracefully when `TEST_DATABASE_URL` (or Docker) is unavailable, so `make ci`
 passes without Postgres and runs the full gate once one is available. Every
@@ -227,6 +228,7 @@ make test-integration # integration-tagged suite against a real Postgres (requir
 make test-db          # full test suite against Postgres (requires live DATABASE_URL)
 make bench-ci         # benchmark smoke run
 make lint             # golangci-lint run, guarded against toolchain drift
+make migrations-check # migration numbering is loadable; needs no database
 ```
 
 ### Lint toolchain drift
@@ -265,7 +267,10 @@ runs several static checks without a Postgres connection so a broken migration
 is caught at build time:
 
 - **Version uniqueness** — no two .up.sql files share a version number
-  (`TestMigrate_VersionNumbersAreUnique`).
+  (`TestMigrate_VersionNumbersAreUnique`). CI runs this one on its own, in the
+  `migrations` job, before the suites that a collision would break; the failure
+  names both colliding files. Reproduce it locally with
+  `make migrations-check`, which needs no database.
 - **Paired up/down** — every .up.sql has a matching .down.sql and vice versa
   (`TestMigrate_FilesAreWellFormed`).
 - **No drop-after-create** — a migration cannot drop a table that a later
@@ -278,6 +283,37 @@ The integration suite (`go test -tags=integration`) exercises the full
 up-from-empty → down-to-zero → up-again round-trip against a real Postgres
 (`TestMigrate_UpDownUpRoundTrip`), and verifies that each down migration
 reverses its up exactly (`TestMigrate_EachDownReversesItsUp`).
+
+### Picking the next migration version number
+
+A schema change is a pair of files in `internal/store/migrations/` sharing one
+four-digit version: `0028_some_change.up.sql` and `0028_some_change.down.sql`.
+Take the next free number from the directory listing rather than from the
+highest number you remember:
+
+```bash
+ls internal/store/migrations/*.up.sql | sort | tail -3
+```
+
+The series must be strictly loadable: golang-migrate refuses to open an
+embedded directory in which two `.up.sql` files carry the same version, and
+that failure is not confined to your migration — every database-backed test
+reports the same load error, so the collision looks like a broken suite rather
+than a broken numbering.
+
+The realistic way to hit it is a merge, not an authoring mistake: two branches
+each take "the next number" from the same base, both look correct on their own,
+and both pass CI on their own branch. Neither is wrong until they are combined.
+So re-run `make migrations-check` after you merge or rebase `main` into your
+branch — not only when you add the file — and if your number is already taken
+on `main`, renumber **your own** files to the next free number. Never renumber
+or edit a migration that has been applied anywhere, including on a shared
+development database; add a forward migration instead.
+
+`migrations-check` covers the Postgres series. SQLite keeps its own numbered
+series in `internal/store/migrations/sqlite/`, so adding a Postgres migration
+does not consume a SQLite version, and a SQLite migration does not need a
+number that is free in the Postgres directory.
 
 Run `sorotrail migrate-status` to report pending migrations without applying
 them — useful for pre-deploy checks.

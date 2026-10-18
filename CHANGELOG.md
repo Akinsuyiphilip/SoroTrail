@@ -6,15 +6,12 @@
 
 ### Changed
 
-- Health endpoints (`GET /health`, `GET /readyz`): each entry in `checks`
-  is now an object (`status`, `detail`, `latency_ms`) instead of a bare
-  string, and every check reports `ok`, `degraded` or `unready` — an
-  unanswered dependency (`unready`) is now distinguished from a reachable
-  but unhealthy one (`degraded`), and each check runs under its own
-  5-second timeout so one hung dependency can't starve the others. Clients
-  that read `checks.<name>` as a string should read its `status` field.
-  Spec version bumped to 0.2.0; shapes documented in `api/openapi.yaml`.
+- CI caches Go modules and build output with an explicit key that includes the Go version, `go.sum` and the build-tag flavour, so the `-tags=integration` job no longer shares a single cache slot with the untagged jobs.
+- The integration-tagged suite now runs against a matrix of Postgres 15 and 16 rather than 16 alone, and the aggregate `integration` check still reports the name branch tooling expects.
+- Migration version-number collisions are gated by their own database-free `migrations` job and `make migrations-check`, ahead of the suites one collision would otherwise break. [CONTRIBUTING.md](CONTRIBUTING.md) documents how to pick the next version number.
 
 ### Fixed
+
+- The in-process event broker in `internal/api` honours every filter field the REST query path does: a subscription with `topic0`–`topic3`, `topic_contains`, `has_value`, `tx_hash`, `network`, `contract_ids`, `contract_id_prefix`, `in_successful_call`, `tx_index`, `op_index`, `from_time` or `to_time` no longer receives events the equivalent `GET /events` query excludes. The shared table of filter cases that proves it is run against both halves, one of them against a real Postgres. The live `/events/ws` broadcaster in `internal/broadcast` keeps its own, narrower matcher and is unchanged — see [docs/subscriptions.md](docs/subscriptions.md).
 
 ### Removed

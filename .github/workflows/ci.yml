@@ -10,6 +10,37 @@ permissions:
   contents: read
 
 jobs:
+  # Issue #547: a duplicate migration version is a merge-time hazard, not an
+  # authoring one — two branches both take "the next number", both merge, and
+  # the embedded series then refuses to load (golang-migrate's iofs errors on
+  # the colliding version), which fails every database-backed test at once.
+  # The assertion lives in internal/store/migrate_test.go and needs no
+  # database, but it only ran as part of the full suite, so the contributor
+  # who caused it found out late and behind unrelated failures. This job runs
+  # it on its own: no services, no Postgres, seconds of wall clock, and the
+  # failure names both colliding files.
+  migrations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        id: go
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
+      - name: Check migration version numbers are unique
+        run: make migrations-check
+
   test-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -42,9 +73,31 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
+        id: go
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          # Every job that compiles Go uses this same block plus the matching
+          # actions/cache step, instead of setup-go's built-in `cache: true`.
+          # Its cache key is derived from the runner OS, the Go version and
+          # go.sum alone, so a job that builds with `-tags=integration` and a
+          # job that builds without any tags land on one slot. The build cache
+          # is content-addressed, so that never yields a wrong build, but the
+          # two flavours do re-save over each other run after run instead of
+          # each keeping a stable hit. Adding the tag flavour to the key gives
+          # them separate entries; `restore-keys` narrows only along go.sum, so
+          # a dependency bump still restores the previous cache. setup-go's own
+          # caching is off so the two mechanisms do not race to restore and
+          # then overwrite the same directories.
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
       - name: Build
         run: go build ./...
       - name: Vet
@@ -96,7 +149,7 @@ jobs:
   # matrix later gains or drops a Postgres version.
   test:
     runs-on: ubuntu-latest
-    needs: test-matrix
+    needs: [migrations, test-matrix]
     if: always()
     steps:
       - name: Report matrix result
@@ -107,18 +160,43 @@ jobs:
             echo "::error::one or more test-matrix legs did not succeed"
             exit 1
           fi
+      # The migration gate is also folded into the required `test` context. On
+      # its own the `migrations` job only reports a red check; a colliding
+      # version number makes every database-backed test fail later, so nothing
+      # should merge while it is broken.
+      - name: Report migration gate result
+        run: |
+          result='${{ needs.migrations.result }}'
+          echo "migrations result: $result"
+          if [ "$result" != "success" ]; then
+            echo "::error::the migration series is not loadable (see the migrations job)"
+            exit 1
+          fi
 
   # Issue #9: separate CI job for the integration test layer gated behind
   # the `integration` build tag. Same Postgres service as the `test-matrix` job;
   # `-p 1` is required because internal/store and internal/replay
   # integration tests share the database and truncate the same tables.
+  #
+  # Issue #548: the schema uses partitioned tables, GIN indexes on JSONB and
+  # partial indexes, and the planner treats those differently between major
+  # versions, so the tagged suite runs against the same Postgres matrix as the
+  # unit suite. Pinning this job to one version meant a query plan that only
+  # regressed on the other supported release reached main untested.
   # integration test workflow
-  integration:
+  integration-matrix:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      # As in `test-matrix`: report every leg rather than cancelling the
+      # survivors, so a break that only shows on one Postgres version is not
+      # hidden behind a cancelled job.
+      fail-fast: false
+      matrix:
+        postgres-version: ["15", "16"]
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.postgres-version }}-alpine
         env:
           POSTGRES_USER: sorotrail
           POSTGRES_PASSWORD: sorotrail
@@ -133,9 +211,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
+        id: go
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          # See the `test-matrix` job for why caching is an explicit step and
+          # not setup-go's built-in one. This job is the reason the key needs a
+          # tag flavour: everything it compiles is built with
+          # `-tags=integration`, so its entries are keyed apart from the
+          # untagged builds and neither flavour waits on the other's save.
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-integration-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-integration-
       - name: Build (integration tag)
         run: go build -tags=integration ./...
       - name: Vet (integration tag)
@@ -150,18 +243,23 @@ jobs:
           done
           echo "Postgres did not become ready in time" >&2
           exit 1
-      - name: Migration safety gate
+      - name: Migration safety gate (Postgres ${{ matrix.postgres-version }})
         # Exercise the up → down → up round-trip to verify every migration
         # reverses cleanly and re-applies identically. This is the most
         # valuable safety check: a broken down migration is invisible until
         # a rollback is needed in production.
+        #
+        # The version is in the step name as well as the job name: a red check
+        # row is read as `integration-matrix (16) > Migration safety gate
+        # (Postgres 16)`, which says which release broke without opening the
+        # log.
         run: >
           go test -tags=integration -p 1 -count=1 -run
           'TestMigrate_UpFromEmpty|TestMigrate_DownFromHead|TestMigrate_UpDownUpRoundTrip|TestMigrate_EachDownReversesItsUp'
           ./internal/store/...
         env:
           TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
-      - name: Run integration tests
+      - name: Run integration tests (Postgres ${{ matrix.postgres-version }})
         # The integration tests cover:
         #   1. migration up from empty
         #     (internal/store/store_integration_test.go)
@@ -178,6 +276,25 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
 
+  # Same aggregate-for-matrix pattern as `test` above: the integration check
+  # that tooling and reviewers look for keeps its name, and it passes only when
+  # every Postgres leg passed. Without it the required context would be reported
+  # as `integration-matrix (15)` / `(16)` and a rule asking for `integration`
+  # would sit at "Expected" forever.
+  integration:
+    runs-on: ubuntu-latest
+    needs: integration-matrix
+    if: always()
+    steps:
+      - name: Report matrix result
+        run: |
+          result='${{ needs.integration-matrix.result }}'
+          echo "integration-matrix result: $result"
+          if [ "$result" != "success" ]; then
+            echo "::error::one or more integration-matrix legs did not succeed"
+            exit 1
+          fi
+
   coverage:
     runs-on: ubuntu-latest
     needs: test-matrix
@@ -186,7 +303,14 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          # No actions/cache step here, unlike the jobs that compile: this job
+          # downloads the matrix legs' coverage profiles and hands them to
+          # Codecov without running a Go build command of its own, so a cached
+          # tree would be restored and saved unchanged — spending the workflow's
+          # 10 GB cache quota for no hit. setup-go is left in place because a
+          # Go toolchain is what this job has always assumed; only its caching
+          # is switched off.
+          cache: false
       - name: Download all coverage artifacts
         uses: actions/download-artifact@v8
         with:
@@ -205,9 +329,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
+        id: go
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          # See `test-matrix` for why setup-go's own caching is off. This job
+          # compiles Go (the linter type-checks the whole module), so it gets
+          # the same explicit cache step as the other jobs that build —
+          # golangci-lint-action only archives `~/.cache/golangci-lint` and
+          # leaves the Go caches to whoever set up Go.
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
       # A `toolchain` directive can land in go.mod by accident when a newer local
       # Go runs `go get` / `go mod tidy`. The pinned linter below was built with
       # an older Go and refuses to start when go.mod targets a newer one, so fail

@@ -73,14 +73,29 @@ For example, to listen only to transfer events from a specific token contract:
 
 ### Filter agreement with the SQL query path
 
-The WebSocket streaming filter logic evaluates incoming events in memory before
-they are dispatched to subscribers. The evaluation rules are designed to agree
-with SQL filtering on the storage backend:
+The streaming filter logic evaluates incoming events in memory before they are
+dispatched to subscribers. The evaluation rules are designed to agree with SQL
+filtering on the storage backend:
 
 - Topic filtering matches if the requested topic is contained within the event's
   topics array. Whitespace is normalized before comparison.
 - Multiple constraints are combined conjunctively (`AND`).
 - Type filtering matches any of the supplied comma-delimited types.
+
+The in-process broker (`internal/api/broker.go`) applies every field of the
+filter language the REST query path does — `network`, `contract_ids`,
+`contract_id_prefix`, `tx_hash`, `topic0`–`topic3`, `topic_contains`,
+`in_successful_call`, `tx_index`, `op_index` and `has_value` as well as the
+parameters in the table above. That agreement is asserted, not merely intended:
+one shared table of filter cases is run against the matcher and against a real
+Postgres `GET /events` query, and the two must select exactly the same events
+(`TestEventMatches_ParityWithSQLQueryPath`, integration-tagged).
+
+The broadcaster used by the live `/events/ws` upgrade
+(`internal/broadcast/broadcast.go`) currently consults a subset of those fields,
+so a handshake that sets one of the others narrows the REST query without
+narrowing the stream. Fixing it means the same table applied to that matcher,
+which is not yet in place.
 
 If an invalid filter parameter is supplied (such as an unknown event type or an
 unparseable timestamp), the server rejects the WebSocket upgrade immediately

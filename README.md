@@ -237,7 +237,10 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | PostgreSQL 16 | Supported |
 
 Any Postgres 15+ release should work; only the above versions are exercised in
-the test matrix.
+CI. Both suites that touch the database run the full matrix — the unit job for
+the Postgres-backed conformance tests and the `integration`-tagged job for
+migrations, reorgs and the API filter tests — so a planner or index behaviour
+difference between the two majors fails a leg rather than reaching a deployment.
 
 ## Configuration
 
