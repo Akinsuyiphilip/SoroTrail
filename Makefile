@@ -9,7 +9,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unk
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown")
 
-LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
+LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
 
 .PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean
 .PHONY: build build-all build-all-integration run test test-fast test-db test-integration vet vet-integration test-ci lint cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check docker-up docker-down simtest simtest-long clean bench bench-ci seed spec spec-check client ci
