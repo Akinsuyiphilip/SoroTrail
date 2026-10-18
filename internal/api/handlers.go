@@ -215,11 +215,6 @@ func wrapEnvelope(data any, cursor string) envelopeResponse {
 	return envelopeResponse{Data: data, NextCursor: cursor}
 }
 
-type healthResponse struct {
-	Status string            `json:"status"`
-	Checks map[string]string `json:"checks"`
-}
-
 type versionResponse struct {
 	Version string `json:"version"`
 
@@ -409,106 +404,6 @@ func eventToMap(ev store.Event, fields map[string]bool) map[string]any {
 
 	return m
 
-}
-
-// handleHealth is the liveness probe. It reports whether the process
-// is alive and able to serve HTTP requests. It intentionally does NOT
-// check external dependencies (database, RPC) so a dependency outage
-// cannot trigger a restart loop — that is the readiness probe's job
-// (see handleReadyz).
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-
-	defer cancel()
-
-	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok"}}
-	status := http.StatusOK
-
-	// DB connectivity check: Ping the store to verify the database is reachable.
-
-	if err := s.store.Ping(ctx); err != nil {
-
-		resp.Status, resp.Checks["database"] = "degraded", err.Error()
-
-		status = http.StatusServiceUnavailable
-
-	}
-
-	if health, err := s.rpc.GetHealth(ctx); err != nil {
-
-		resp.Status, resp.Checks["rpc"] = "degraded", err.Error()
-
-		status = http.StatusServiceUnavailable
-
-	} else if health.Status != "healthy" {
-
-		resp.Status, resp.Checks["rpc"] = "degraded", fmt.Sprintf("rpc reports %q", health.Status)
-
-		status = http.StatusServiceUnavailable
-
-	}
-
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-
-	writeJSON(w, status, resp)
-
-}
-
-// handleMetrics serves the Prometheus /metrics endpoint. The response is
-// always cacheNoStore so scrapers never see a stale snapshot.
-func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Checks: map[string]string{"process": "ok"}})
-}
-
-func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	resp := healthResponse{Status: "ok", Checks: map[string]string{
-		"database":      "ok",
-		"rpc":           "ok",
-		"ingestion_lag": "ok",
-	}}
-	status := http.StatusOK
-
-	if err := s.store.Ping(ctx); err != nil {
-		resp.Status = "degraded"
-		resp.Checks["database"] = err.Error()
-		status = http.StatusServiceUnavailable
-	}
-	if health, err := s.rpc.GetHealth(ctx); err != nil {
-		resp.Status = "degraded"
-		resp.Checks["rpc"] = err.Error()
-		status = http.StatusServiceUnavailable
-	} else if health.Status != "healthy" {
-		resp.Status = "degraded"
-		resp.Checks["rpc"] = fmt.Sprintf("rpc reports %q", health.Status)
-		status = http.StatusServiceUnavailable
-	}
-
-	// Check ingestion lag: if we're more than 100 ledgers behind the chain
-	// head, mark the instance as not ready (it should be pulled from the
-	// load balancer until it catches up).
-	if state, err := s.store.GetIngestionState(ctx); err == nil {
-		// Only check lag if we have an ingestion state and an RPC client.
-		if s.rpc != nil {
-			if health, err := s.rpc.GetHealth(ctx); err == nil {
-				lag := ingestLagLedgers(int64(health.LatestLedger), state.LastIngestedLedger)
-				if lag > 100 && state.LastIngestedLedger > 0 {
-					resp.Status = "degraded"
-					resp.Checks["ingestion_lag"] = fmt.Sprintf(
-						"%d ledgers behind (last ingested: %d, chain head: %d)",
-						lag, state.LastIngestedLedger, health.LatestLedger)
-					status = http.StatusServiceUnavailable
-				}
-			}
-		}
-	}
-
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-	writeJSON(w, status, resp)
 }
 
 // handleDeleteEvents is the admin-only bulk delete endpoint. It deletes all

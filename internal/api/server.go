@@ -224,6 +224,11 @@ type Server struct {
 	// cors is the CORS middleware config. Wired via SetCORS from main so
 	// the API does not import the config package.
 	cors CORSConfig
+
+	// checkTimeout bounds EACH dependency probe behind /health and
+	// /readyz. The zero value means healthCheckTimeout; only tests set it,
+	// so the timeout paths don't sleep through the production budget.
+	checkTimeout time.Duration
 }
 
 // SetHTTPRequestBodyLimit sets the request body size limit, in bytes, for all handlers accepting a body.
