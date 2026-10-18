@@ -11,9 +11,9 @@ BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown
 
 LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
 
-.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean
-.PHONY: build build-all build-all-integration run test test-fast test-db test-integration vet vet-integration test-ci lint cover cover-html migrate-up migrate-down docker-up docker-down simtest simtest-long clean bench bench-ci seed spec spec-check client ci
-.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean
+.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci cover cover-html migrate-up migrate-down migrations-check seed docker-up docker-down spec clean
+.PHONY: build build-all build-all-integration run test test-fast test-db test-integration vet vet-integration test-ci lint cover cover-html migrate-up migrate-down migrations-check docker-up docker-down simtest simtest-long clean bench bench-ci seed spec spec-check client ci
+.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html migrate-up migrate-down migrations-check seed docker-up docker-down spec clean
 
 # ── Self-documenting help ────────────────────────────────────────────────────
 # Every target that starts with a double-hash comment (##) is listed by
@@ -102,7 +102,7 @@ bench-ci: ## Benchmark smoke run (CI-length, no DB required)
 # Composed from the existing targets so the two cannot drift.
 # Runs as sub-makes so the first failure stops the run.
 
-ci: build-all vet spec-check test-ci bench-ci build-all-integration vet-integration test-integration lint ## Reproduce the full CI gate locally (first failure stops)
+ci: build-all vet spec-check migrations-check test-ci bench-ci build-all-integration vet-integration test-integration lint ## Reproduce the full CI gate locally (first failure stops)
 
 # ── Client ───────────────────────────────────────────────────────────────────
 
@@ -129,6 +129,14 @@ migrate-up: ## Apply all pending migrations
 
 migrate-down: ## Roll back the last migration
 	migrate -path $(MIGRATIONS) -database "$(DATABASE_URL)" down 1
+
+# Two branches can each take "the next number" and merge cleanly, and the
+# embedded series then refuses to load — golang-migrate rejects a duplicate
+# version, so every database-backed test fails at once instead of the one that
+# broke. The check reads the embedded directory only, so it needs no Postgres
+# and runs in seconds; CI gates on it in the `migrations` job.
+migrations-check: ## Fail when two migrations share a version number (no database needed)
+	go test ./internal/store/ -run TestMigrate_VersionNumbersAreUnique -count=1
 
 seed: ## Seed the database with sample events
 	go run ./cmd/seed -db="$(DATABASE_URL)" -count=1000000
