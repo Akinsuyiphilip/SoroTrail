@@ -122,13 +122,19 @@ jobs:
       # and internal/replay share one database and truncate the same tables.
       # -race catches data races inside a single package's test binary.
       #
+      # The command itself lives in the Makefile's cover-ci target so the
+      # exact CI coverage profile can be reproduced locally with one make
+      # target instead of transcribing flags out of this workflow. The
+      # coverage job below merges the resulting profile with the integration
+      # legs' so tagged-only code counts as covered.
+      #
       # TEST_DATABASE_URL also drives the store conformance suite, which runs
       # the same assertions against every backend it can reach: SQLite always
       # (no server), and Postgres via the variable set here. ClickHouse is
       # registered in the same table but skips cleanly unless TEST_CLICKHOUSE_URL
       # is set, so a backend without a service in this job never fails it.
       - name: Test (with Postgres integration tests)
-        run: go test -p 1 ./... -count=1 -race -timeout=120s -coverprofile=coverage.out -covermode=atomic
+        run: make cover-ci
         env:
           TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
       - name: Upload coverage artifact
@@ -272,9 +278,21 @@ jobs:
         # -p 1 because the integration tests in internal/store and
         # internal/replay share the service Postgres and TRUNCATE the
         # same tables between tests.
-        run: go test -tags=integration -p 1 -timeout 5m ./... -count=1
+        #
+        # The command lives in the Makefile's cover-integration-ci target
+        # (see the test-matrix comment). The profile it writes is merged
+        # with the unit legs' by the coverage job, so migrations and the
+        # store/ingester paths that only run against a real Postgres count
+        # as covered instead of looking untested.
+        run: make cover-integration-ci
         env:
           TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-int-pg${{ matrix.postgres-version }}
+          path: coverage.out
+          retention-days: 5
 
   # Same aggregate-for-matrix pattern as `test` above: the integration check
   # that tooling and reviewers look for keeps its name, and it passes only when
@@ -295,9 +313,14 @@ jobs:
             exit 1
           fi
 
+  # Reports a whole-module coverage figure on every pull request (issue
+  # #552). It waits for both test matrices because the unit legs and the
+  # integration-tagged legs cover disjoint sets of paths: migrations and the
+  # database-backed store/ingester code only compile behind the integration
+  # tag, so a unit-only profile makes them look untested.
   coverage:
     runs-on: ubuntu-latest
-    needs: test-matrix
+    needs: [test-matrix, integration-matrix]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -311,11 +334,38 @@ jobs:
           # Go toolchain is what this job has always assumed; only its caching
           # is switched off.
           cache: false
+      # Each artifact lands in its own subdirectory (no merge-multiple) so
+      # the four coverage.out files do not overwrite each other before the
+      # merge below sees them — that silent last-writer-wins is exactly the
+      # gap issue #552 was opened about.
       - name: Download all coverage artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: coverage-pg*
-          merge-multiple: true
+          pattern: coverage-*
+          path: coverage-artifacts
+      # Sum the hit counts rather than picking one profile: a statement
+      # exercised by either suite must stay covered in the merged figure.
+      # The total is advisory for now — no threshold blocks the PR.
+      - name: Merge coverage profiles
+        run: |
+          ./scripts/merge_coverage.sh coverage.out coverage-artifacts/*/coverage.out
+          echo "Merged total: $(go tool cover -func=coverage.out | tail -n 1)"
+      - name: Write coverage summary
+        run: |
+          total=$(go tool cover -func=coverage.out | tail -n 1 | awk '{print $3}')
+          {
+            echo "### Test coverage"
+            echo ""
+            echo "Total: **${total}** (unit and integration-tagged suites, Postgres 15 and 16, merged)"
+            echo ""
+            echo "Advisory only for now — no threshold blocks this pull request."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload merged coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-merged
+          path: coverage.out
+          retention-days: 5
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:
@@ -369,12 +419,39 @@ jobs:
         if: always()
         run: ./scripts/check_lint_toolchain.sh --verify-binary
 
+  # Issue #550: docker-publish.yml only builds once a tag is pushed, so a
+  # Dockerfile change that broke the image was discovered on main, after the
+  # merge. The Dockerfile is multi-stage and cross-compiles, so it has ways
+  # to break that `go build ./...` in the test job will never catch. This job
+  # builds the same image on every PR — without pushing it.
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - name: Build Docker image
-        run: docker build --no-cache .
+      # Same action versions and platforms as the publish workflow so the two
+      # builds stay comparable. QEMU is only needed for the tiny final stage
+      # (apk + COPY): the build stage declares --platform=$BUILDPLATFORM and
+      # cross-compiles natively, so it does not run under emulation.
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      # No build args, tags or registry login: docker-publish.yml passes none
+      # either (the Dockerfile's ARGs default to "unknown" and the tags come
+      # from docker/metadata-action at publish time), so this build exercises
+      # the same defaults the published image gets.
+      - name: Build image (amd64 + arm64, nothing pushed)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          # Restore the cache the pushes to main populate. Cache *export* is
+          # restricted to push events on purpose: a pull request from a fork
+          # runs with a read-only token, and a denied cache upload fails the
+          # whole build instead of degrading to a cold one. Reading the base
+          # branch's cache is allowed for fork PRs, so they still build warm.
+          cache-from: type=gha
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
 
   helm:
     runs-on: ubuntu-latest
@@ -389,6 +466,16 @@ jobs:
         run: |
           if helm lint deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db --set replicaCount=not-a-number; then
             echo "::error::Schema validation did not reject invalid replicaCount"
+            exit 1
+          fi
+      # A misspelled key is the failure mode the schema exists for and the
+      # one template syntax checks cannot see: helm silently ignores unknown
+      # values, so without this gate an operator's typo would deploy the
+      # chart with the default and the setting would never take effect.
+      - name: Helm lint (unknown value — schema must reject)
+        run: |
+          if helm lint deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db --set replicaCont=2; then
+            echo "::error::Schema validation did not reject unknown value replicaCont"
             exit 1
           fi
       - name: Helm template render (defaults)
