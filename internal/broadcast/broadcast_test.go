@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/khaylebfortune/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 func mkEvent(id, contractID string, ledger int64) store.Event {
@@ -27,7 +27,7 @@ func mkEvent(id, contractID string, ledger int64) store.Event {
 
 func TestBroadcaster_DeliversMatchingEvents(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{ContractID: "CA"})
+	sub := b.Subscribe(store.EventFilter{ContractID: "CA", Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	b.Publish(context.Background(), []store.Event{
@@ -51,7 +51,7 @@ func TestBroadcaster_DeliversMatchingEvents(t *testing.T) {
 
 func TestBroadcaster_FilterByType(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{Type: "system"})
+	sub := b.Subscribe(store.EventFilter{Types: []string{"system"}, Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	b.Publish(context.Background(), []store.Event{
@@ -71,7 +71,7 @@ func TestBroadcaster_FilterByType(t *testing.T) {
 
 func TestBroadcaster_FilterByLedgerRange(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{FromLedger: 5, ToLedger: 10})
+	sub := b.Subscribe(store.EventFilter{FromLedger: 5, ToLedger: 10, Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	b.Publish(context.Background(), []store.Event{
@@ -95,7 +95,7 @@ func TestBroadcaster_FilterByLedgerRange(t *testing.T) {
 
 func TestBroadcaster_SlowConsumerEviction(t *testing.T) {
 	b := New(1) // tiny buffer
-	sub := b.Subscribe(store.EventFilter{})
+	sub := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	// Fill the buffer (size 1) and then send another event to trigger eviction.
@@ -113,7 +113,7 @@ func TestBroadcaster_SlowConsumerEviction(t *testing.T) {
 
 func TestBroadcaster_NoMatch(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{ContractID: "CB"})
+	sub := b.Subscribe(store.EventFilter{ContractID: "CB", Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	b.Publish(context.Background(), []store.Event{
@@ -129,7 +129,7 @@ func TestBroadcaster_NoMatch(t *testing.T) {
 
 func TestBroadcaster_CloseUnsubscribes(t *testing.T) {
 	b := New(10)
-	sub := b.Subscribe(store.EventFilter{})
+	sub := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
 	sub.Close()
 
 	// Should not panic; the subscriber should be removed.
@@ -138,7 +138,7 @@ func TestBroadcaster_CloseUnsubscribes(t *testing.T) {
 
 func TestBroadcaster_ConcurrentPublish(t *testing.T) {
 	b := New(64)
-	sub := b.Subscribe(store.EventFilter{})
+	sub := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
 	defer sub.Close()
 
 	var wg sync.WaitGroup
@@ -165,5 +165,38 @@ func TestBroadcaster_ConcurrentPublish(t *testing.T) {
 			}
 			t.Fatalf("expected 10 events, got %d", received)
 		}
+	}
+}
+
+// TestBroadcaster_DisconnectDuringPublishDoesNotPanic covers the acceptance
+// criterion "a disconnect mid-publish does not panic": Publish reads its
+// subscriber list under Broadcaster.mu but sends to each subscriber's
+// channel outside that lock, so a concurrent Close (called from the
+// client's own goroutine, e.g. on a WebSocket read-loop exit) can race a
+// send on the same channel. Subscription.chMu (see broadcast.go) is what
+// makes close and send mutually exclusive; this test fails under -race,
+// or panics with "send on closed channel", if that synchronization
+// regresses.
+func TestBroadcaster_DisconnectDuringPublishDoesNotPanic(t *testing.T) {
+	const publishers = 8
+	const iterations = 200
+
+	for iter := 0; iter < iterations; iter++ {
+		b := New(1000)
+		sub := b.Subscribe(store.EventFilter{Scope: store.WildcardScope()})
+
+		var wg sync.WaitGroup
+		wg.Add(publishers + 1)
+		for g := 0; g < publishers; g++ {
+			go func(n int) {
+				defer wg.Done()
+				b.Publish(context.Background(), []store.Event{mkEvent(fmt.Sprintf("e%d", n), "CA", int64(n))})
+			}(g)
+		}
+		go func() {
+			defer wg.Done()
+			sub.Close()
+		}()
+		wg.Wait()
 	}
 }
