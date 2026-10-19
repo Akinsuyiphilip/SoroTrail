@@ -5,23 +5,23 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// ClickHouse implements Store with clickhouse-go/v2.
-// It is intentionally minimal for now and is wired through the same
-// interface so the app can select it via DATABASE_URL.
+// ClickHouse implements Store over ClickHouse's HTTP interface (the
+// clickhouseExecutor wrapping it predates, and never grew into, a native
+// driver dependency). It is intentionally minimal for now and is wired
+// through the same interface so the app can select it via DATABASE_URL.
 //
-// contributors: Ping performs a real TCP dial to the server so the
-// readiness probe cannot report healthy against an unreachable database.
+// Every method below (Ping included) talks to the server over the HTTP
+// interface the executor wraps, so the readiness probe and the query path
+// fail against exactly the same dependency.
 type ClickHouse struct {
-	host string
-	port int
-	cfg  clickHouseConfig
+	cfg clickHouseConfig
 }
 
 var _ Store = (*ClickHouse)(nil)
@@ -164,7 +164,7 @@ func NewStoreFromURL(databaseURL string) (Store, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ClickHouse{host: cfg.host, port: cfg.port, cfg: cfg}, nil
+		return &ClickHouse{cfg: cfg}, nil
 	}
 	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
 		return &Postgres{}, nil
@@ -530,9 +530,32 @@ func (c *ClickHouse) AggregateEvents(ctx context.Context, f EventFilter, bucket 
 	return nil, nil
 }
 
+// clickHouseIngestionStateVersion mints the updated_at version stamped onto
+// every SaveIngestionState row. DateTime64(3) only resolves a millisecond,
+// so two saves inside the same millisecond would carry equal versions;
+// ReplacingMergeTree then collapses equal versions in an unspecified order
+// and FINAL could hand a restarting ingester the older resume position,
+// silently rewinding the frontier it just persisted. Keeping the version
+// strictly increasing within the process makes the newer save always win.
+var lastClickHouseIngestionStateVersion atomic.Int64
+
+func clickHouseIngestionStateVersion(now time.Time) time.Time {
+	ms := now.UnixMilli()
+	for {
+		last := lastClickHouseIngestionStateVersion.Load()
+		if ms <= last {
+			ms = last + 1
+		}
+		if lastClickHouseIngestionStateVersion.CompareAndSwap(last, ms) {
+			return time.UnixMilli(ms).UTC()
+		}
+	}
+}
+
 // GetIngestionState returns the single default-network ingestion row, or
 // ErrNotFound on a fresh instance. FINAL collapses the ReplacingMergeTree's
-// appended versions to the newest one, which is the durable resume position.
+// appended versions to the newest one, which is the durable resume position
+// the ingester restarts from (issue #523).
 func (c *ClickHouse) GetIngestionState(ctx context.Context) (IngestionState, error) {
 	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
 		"SELECT network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state FINAL WHERE network = 'default' LIMIT 1")
@@ -548,12 +571,14 @@ func (c *ClickHouse) GetIngestionState(ctx context.Context) (IngestionState, err
 // SaveIngestionState appends a new version of the singleton row. ClickHouse
 // has no efficient row-level UPDATE, so an upsert is an insert of a newer
 // version keyed by network; the schema's ReplacingMergeTree(updated_at) makes
-// readers see the latest without waiting for a background merge.
+// readers see the latest without waiting for a background merge. updated_at
+// comes from clickHouseIngestionStateVersion so back-to-back saves can never
+// tie on that version column (issue #523).
 func (c *ClickHouse) SaveIngestionState(ctx context.Context, s IngestionState) error {
 	if s.Network == "" {
 		s.Network = "default"
 	}
-	now := time.Now().UTC()
+	now := clickHouseIngestionStateVersion(time.Now().UTC())
 	row := map[string]any{
 		"network":              s.Network,
 		"last_ingested_ledger": s.LastIngestedLedger,
@@ -1458,16 +1483,26 @@ func (c *ClickHouse) DeleteDeadLetter(ctx context.Context, id int64) error {
 	return nil
 }
 
+// Ping performs a real round-trip to ClickHouse over the HTTP interface
+// every query in this file uses, rather than merely opening a socket: the
+// native TCP port a clickhouse:// URL names is not the port this backend
+// talks to, so a dial there could succeed while the interface the app
+// depends on is dead — or fail while it is healthy behind a proxy — either
+// way leaving /readyz reporting an instance that cannot serve (issue #524).
+// SELECT 1 is the cheapest statement the server will answer, and it runs
+// under the caller's context, which is what lets the readiness probe's own
+// deadline bound how long an unresponsive server can stall the probe.
 func (c *ClickHouse) Ping(ctx context.Context) error {
-	if c.host == "" {
+	if c.cfg.host == "" {
 		return fmt.Errorf("clickhouse: not configured (empty host)")
 	}
-	addr := net.JoinHostPort(c.host, strconv.Itoa(c.port))
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	out, err := newClickHouseExecutor(c.cfg).query(ctx, c.cfg.databaseOrDefault(), "SELECT 1 FORMAT TabSeparated")
 	if err != nil {
-		return fmt.Errorf("clickhouse ping %s: %w", addr, err)
+		return fmt.Errorf("clickhouse ping: %w", err)
 	}
-	conn.Close()
+	if out != "1" {
+		return fmt.Errorf("clickhouse ping: unexpected response %q", out)
+	}
 	return nil
 }
 
