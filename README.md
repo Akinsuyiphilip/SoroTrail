@@ -22,6 +22,11 @@ HTTP API long after the RPC has forgotten them.
  Stellar RPC ──getEvents──▶ ingester ──▶ Postgres/SQLite ◀── HTTP API ◀── you
 ```
 
+## Community
+
+We welcome contributors and expect all participants to follow our
+[Code of Conduct](CODE_OF_CONDUCT.md). To report a security issue, use the
+private channel described in [SECURITY.md](SECURITY.md).
 
 ## Quickstart
 text
