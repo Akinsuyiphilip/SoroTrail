@@ -33,6 +33,10 @@ func (s *Server) handleGetContract(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
 		return
 	}
+	if !scopeFrom(r.Context()).Allows(contractID) {
+		writeForbiddenContract(w, contractID)
+		return
+	}
 
 	summary, err := s.store.GetContractSummary(r.Context(), contractID)
 	if errors.Is(err, store.ErrNotFound) {
@@ -57,6 +61,10 @@ func (s *Server) handleContractStats(w http.ResponseWriter, r *http.Request) {
 	contractID := chi.URLParam(r, "id")
 	if !config.ValidContractID(contractID) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid contract ID %q", contractID))
+		return
+	}
+	if !scopeFrom(r.Context()).Allows(contractID) {
+		writeForbiddenContract(w, contractID)
 		return
 	}
 

@@ -1437,6 +1437,7 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 		SortKey:          r.URL.Query().Get("sort"),
 		Order:            r.URL.Query().Get("order"),
 		Cursor:           r.URL.Query().Get("cursor"),
+		Scope:            scopeFrom(r.Context()),
 	}
 	if !store.ValidContractsSortKey(f.SortKey) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf(
