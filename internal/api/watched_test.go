@@ -358,4 +358,3 @@ func TestWatchedContracts_PostCrossNetworkHistoryFromLedger(t *testing.T) {
 			"adding on testnet uses testnet's ingestion state, not default's")
 	})
 }
-
