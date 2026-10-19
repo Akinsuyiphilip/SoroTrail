@@ -1043,6 +1043,13 @@ func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, network string, le
 }
 
 func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
+	return s.ListWatchedContractsScoped(ctx, WildcardScope())
+}
+
+func (s *SQLite) ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error) {
+	if sc.DeniesAll() {
+		return []WatchedContract{}, nil
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT network, contract_id FROM watched_contracts ORDER BY network, contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
@@ -1054,7 +1061,9 @@ func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, e
 		if err := rows.Scan(&wc.Network, &wc.ContractID); err != nil {
 			return nil, err
 		}
-		out = append(out, wc)
+		if sc.Allows(wc.ContractID) {
+			out = append(out, wc)
+		}
 	}
 	return out, rows.Err()
 }
