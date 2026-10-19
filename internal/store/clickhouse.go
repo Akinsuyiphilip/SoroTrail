@@ -557,10 +557,15 @@ func clickHouseIngestionStateVersion(now time.Time) time.Time {
 // appended versions to the newest one, which is the durable resume position
 // the ingester restarts from (issue #523).
 func (c *ClickHouse) GetIngestionState(ctx context.Context) (IngestionState, error) {
+	return c.GetIngestionStateForNetwork(ctx, "default")
+}
+
+func (c *ClickHouse) GetIngestionStateForNetwork(ctx context.Context, network string) (IngestionState, error) {
+	network = defaultNetwork(network)
 	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
-		"SELECT network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state FINAL WHERE network = 'default' LIMIT 1")
+		"SELECT network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state FINAL WHERE network = "+clickHouseQuoteString(network)+" LIMIT 1")
 	if err != nil {
-		return IngestionState{}, fmt.Errorf("loading ingestion state: %w", err)
+		return IngestionState{}, fmt.Errorf("loading ingestion state for network %q: %w", network, err)
 	}
 	if len(rows) == 0 {
 		return IngestionState{}, ErrNotFound
