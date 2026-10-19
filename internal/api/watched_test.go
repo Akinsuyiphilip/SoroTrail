@@ -304,3 +304,57 @@ func TestWatchedContracts_GetReturnsList(t *testing.T) {
 	require.Len(t, got.Contracts, 2)
 	assert.Equal(t, 2, got.Count)
 }
+
+func TestWatchedContracts_PostCrossNetworkHistoryFromLedger(t *testing.T) {
+	t.Run("does not leak default network state, cursor, or RPC health to another network", func(t *testing.T) {
+		st := &stubStore{
+			watchedList: []store.WatchedContract{
+				{ContractID: testContract, Network: "default"},
+			},
+			ingestion: store.IngestionState{
+				Network:            "default",
+				LastIngestedLedger: 50_000_000,
+			},
+			contractCursors: map[string]store.ContractCursor{
+				testContract: {ContractID: testContract, LastIngestedLedger: 49_000_000},
+			},
+		}
+		rc := &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 51_000_000, OldestLedger: 50_000_000}}
+		ts := newTestServerWithKey(st, rc, watchedTestKey)
+
+		resp, body := watchedRoute(t, ts, http.MethodPost, "?confirm=true", true,
+			map[string]string{"contract_id": testContract, "network": "testnet"})
+		require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+		var got addWatchedResponse
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, "testnet", got.Network)
+		assert.Equal(t, "all_to_specific", got.ModeTransition)
+		assert.Equal(t, int64(0), got.HistoryFromLedger,
+			"adding on testnet must not report mainnet's cursor or RPC health ledger")
+	})
+
+	t.Run("uses target network ingestion state when present", func(t *testing.T) {
+		st := &stubStore{
+			watchedList: []store.WatchedContract{
+				{ContractID: watchedOtherContract, Network: "testnet"},
+			},
+			ingestionByNet: map[string]store.IngestionState{
+				"default": {Network: "default", LastIngestedLedger: 50_000_000},
+				"testnet": {Network: "testnet", LastIngestedLedger: 123_456},
+			},
+		}
+		rc := &stubRPC{health: rpc.Health{Status: "healthy", LatestLedger: 51_000_000, OldestLedger: 50_000_000}}
+		ts := newTestServerWithKey(st, rc, watchedTestKey)
+
+		resp, body := watchedRoute(t, ts, http.MethodPost, "", true,
+			map[string]string{"contract_id": testContract, "network": "testnet"})
+		require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+		var got addWatchedResponse
+		require.NoError(t, json.Unmarshal(body, &got))
+		assert.Equal(t, "testnet", got.Network)
+		assert.Equal(t, int64(123_456), got.HistoryFromLedger,
+			"adding on testnet uses testnet's ingestion state, not default's")
+	})
+}
