@@ -264,6 +264,15 @@ func (s *guardedStore) ListWatchedContracts(ctx context.Context) ([]WatchedContr
 	return ids, err
 }
 
+func (s *guardedStore) ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.ListWatchedContractsScoped")
+	defer cancel()
+	start := time.Now()
+	ids, err := s.Store.ListWatchedContractsScoped(ctx, sc)
+	s.logSlowQuery(ctx, "store.ListWatchedContractsScoped", start, err)
+	return ids, err
+}
+
 func (s *guardedStore) AddWatchedContract(ctx context.Context, w WatchedContract) error {
 	ctx, cancel := s.wrapContext(ctx, "store.AddWatchedContract")
 	defer cancel()

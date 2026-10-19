@@ -1251,8 +1251,23 @@ const watchedContractsUnion = `
 	) w GROUP BY network, contract_id`
 
 func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
-	rows, err := p.pool.Query(ctx,
-		watchedContractsUnion+` ORDER BY network, contract_id`)
+	return p.ListWatchedContractsScoped(ctx, WildcardScope())
+}
+
+// ListWatchedContractsScoped returns watched contracts filtered by sc in SQL.
+func (p *Postgres) ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error) {
+	if sc.DeniesAll() {
+		return []WatchedContract{}, nil
+	}
+	var (
+		query = watchedContractsUnion + ` ORDER BY network, contract_id`
+		args  []any
+	)
+	if !sc.IsWildcard() {
+		query = `SELECT network, contract_id, added_at FROM (` + watchedContractsUnion + `) s WHERE contract_id = ANY($1) ORDER BY network, contract_id`
+		args = []any{sc.Contracts()}
+	}
+	rows, err := p.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
