@@ -3314,7 +3314,7 @@
       "delete": {
         "operationId": "removeTenantWatch",
         "summary": "Remove a contract from the tenant's watch list",
-        "description": "Removes a contract from the calling tenant's watch list.",
+        "description": "Removes a contract from the calling tenant's watch list. Removing a well-formed contract the tenant does not hold is a no-op that still answers 200 with the unchanged list, so retries stay idempotent; only a malformed contract_id is rejected with a 400.",
         "tags": [
           "Operations"
         ],
@@ -3346,6 +3346,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
