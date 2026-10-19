@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -21,31 +22,6 @@ import (
 )
 
 var stdIOMu sync.Mutex
-
-// captureStdout captures os.Stdout output produced during fn.
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-	stdIOMu.Lock()
-	defer stdIOMu.Unlock()
-
-	r, w, err := os.Pipe()
-	require.NoError(t, err)
-
-	orig := os.Stdout
-	os.Stdout = w
-	defer func() {
-		os.Stdout = orig
-	}()
-
-	fn()
-	_ = w.Close()
-
-	var buf bytes.Buffer
-	_, err = io.Copy(&buf, r)
-	require.NoError(t, err)
-	_ = r.Close()
-	return buf.String()
-}
 
 // captureStderr captures os.Stderr output produced during fn.
 func captureStderr(t *testing.T, fn func()) string {
@@ -150,48 +126,403 @@ func TestNewLoggerUsesTextByDefault(t *testing.T) {
 	}
 }
 
-func TestAdminBootstrapIdempotencyAndCreation(t *testing.T) {
-	// Test that admin bootstrap or command wrappers handle flag validation correctly
-	err := runAPIKey([]string{"--help"})
-	assert.NoError(t, err)
+// TestExitCode asserts that exitCode correctly maps dispatch errors to process exit codes.
+func TestExitCode(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"nil error exits 0", nil, 0},
+		{"interrupted error exits 2", errInterrupted, 2},
+		{"wrapped interrupted error exits 2", fmt.Errorf("operation failed: %w", errInterrupted), 2},
+		{"generic error exits 1", errors.New("boom"), 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, exitCode(tt.err))
+		})
+	}
 }
 
-func TestDispatchUnknownCommand(t *testing.T) {
+// TestDispatch_RoutesDocumentedSubcommands asserts that each documented
+// subcommand routes to its respective handler and forwards arguments.
+func TestDispatch_RoutesDocumentedSubcommands(t *testing.T) {
 	tests := []struct {
-		name    string
-		args    []string
-		wantErr string
+		name       string
+		args       []string
+		wantErrMsg string
 	}{
 		{
-			name:    "unknown subcommand",
-			args:    []string{"unknown-cmd"},
-			wantErr: "unknown subcommand \"unknown-cmd\"",
+			name: "replay routes to runReplay and handles help flag cleanly",
+			args: []string{"replay", "--help"},
 		},
 		{
-			name:    "help subcommand",
-			args:    []string{"help"},
-			wantErr: "",
+			name:       "replay routes to runReplay and reports missing required flag",
+			args:       []string{"replay"},
+			wantErrMsg: "--from-ledger is required and must be positive",
 		},
 		{
-			name:    "dash h flag",
-			args:    []string{"-h"},
-			wantErr: "",
+			name: "backfill routes to runBackfill and handles help flag cleanly",
+			args: []string{"backfill", "--help"},
 		},
 		{
-			name:    "double dash help flag",
-			args:    []string{"--help"},
-			wantErr: "",
+			name:       "backfill routes to runBackfill and reports missing required flag",
+			args:       []string{"backfill"},
+			wantErrMsg: "--contract is required",
+		},
+		{
+			name: "index-addresses routes to runIndexAddresses and handles help flag cleanly",
+			args: []string{"index-addresses", "--help"},
+		},
+		{
+			name:       "index-addresses routes to runIndexAddresses and validates arguments",
+			args:       []string{"index-addresses", "--batch-size", "0"},
+			wantErrMsg: "--batch-size must be in 1..1000, got 0",
+		},
+		{
+			name: "apikey routes to runAPIKey and handles help flag cleanly",
+			args: []string{"apikey", "--help"},
+		},
+		{
+			name:       "apikey routes to runAPIKey and validates missing subcommand",
+			args:       []string{"apikey"},
+			wantErrMsg: "apikey requires a subcommand: create, list, revoke",
+		},
+		{
+			name: "contracts routes to runContracts and handles help flag cleanly",
+			args: []string{"contracts", "--help"},
+		},
+		{
+			name:       "contracts routes to runContracts and validates missing subcommand",
+			args:       []string{"contracts"},
+			wantErrMsg: "contracts requires a subcommand: add, list, or remove",
+		},
+		{
+			name: "migrate routes to runMigrate and handles help flag cleanly",
+			args: []string{"migrate", "--help"},
+		},
+		{
+			name:       "migrate routes to runMigrate and validates missing action",
+			args:       []string{"migrate"},
+			wantErrMsg: "migrate requires an action: up, down, or status",
+		},
+		{
+			name: "health routes to runHealth and handles help flag cleanly",
+			args: []string{"health", "--help"},
+		},
+		{
+			name: "schema-inspect routes to runSchemaInspect and handles help flag cleanly",
+			args: []string{"schema-inspect", "--help"},
+		},
+		{
+			name: "migrate-status routes to runMigrateStatus and handles help flag cleanly",
+			args: []string{"migrate-status", "--help"},
+		},
+		{
+			name: "completion routes to runCompletion and handles help flag cleanly",
+			args: []string{"completion", "--help"},
+		},
+		{
+			name: "version routes to runVersion and handles help flag cleanly",
+			args: []string{"version", "--help"},
+		},
+		{
+			name: "stats routes to runStats and handles help flag cleanly",
+			args: []string{"stats", "--help"},
+		},
+		{
+			name: "config routes to runConfig and handles help flag cleanly",
+			args: []string{"config", "--help"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := dispatch(tt.args)
-			if tt.wantErr == "" {
-				assert.NoError(t, err)
+			if tt.wantErrMsg != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrMsg)
 			} else {
-				assert.EqualError(t, err, tt.wantErr)
+				assert.NoError(t, err)
 			}
+		})
+	}
+
+	// Test healthcheck routing.
+	t.Run("healthcheck routes to runHealthcheck and returns nil on healthy probe", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/health" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"status":"ok"}`))
+			}
+		}))
+		defer srv.Close()
+
+		addr := strings.TrimPrefix(srv.URL, "http://")
+		err := dispatch([]string{"healthcheck", "--addr", addr, "--endpoint", "/health"})
+		assert.NoError(t, err)
+	})
+
+	// Test top-level version flags.
+	for _, flag := range []string{"--version", "-V"} {
+		t.Run(fmt.Sprintf("dispatch %s routes to version", flag), func(t *testing.T) {
+			err := dispatch([]string{flag, "--help"})
+			assert.NoError(t, err)
+		})
+	}
+
+	// Test help variants.
+	for _, flag := range []string{"help", "-h", "--help"} {
+		t.Run(fmt.Sprintf("dispatch %s prints usage and exits cleanly", flag), func(t *testing.T) {
+			stderr := captureStderr(t, func() {
+				err := dispatch([]string{flag})
+				assert.NoError(t, err)
+			})
+			assert.Contains(t, stderr, "usage: sorotrail")
+		})
+	}
+}
+
+// TestDispatch_UnknownSubcommand asserts that an unknown subcommand prints
+// usage information to stderr and returns an error describing the unknown command.
+func TestDispatch_UnknownSubcommand(t *testing.T) {
+	tests := []struct {
+		name       string
+		subcommand string
+	}{
+		{"arbitrary command foo", "foo"},
+		{"unrecognized start", "start"},
+		{"unrecognized serve", "serve"},
+		{"typo of replay", "replaay"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var err error
+			stderr := captureStderr(t, func() {
+				err = dispatch([]string{tt.subcommand})
+			})
+
+			require.Error(t, err)
+			assert.EqualError(t, err, fmt.Sprintf("unknown subcommand %q", tt.subcommand))
+			assert.Contains(t, stderr, "usage: sorotrail")
+		})
+	}
+}
+
+// TestDispatch_NoSubcommandRunsDefaultServerPath asserts that dispatch with
+// empty or nil arguments routes to run(), the default server path.
+func TestDispatch_NoSubcommandRunsDefaultServerPath(t *testing.T) {
+	// Set an invalid log level to verify config.Load() in run() is reached
+	// without actually spinning up postgres or background workers.
+	t.Setenv("LOG_LEVEL", "invalid_for_test")
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"nil slice", nil},
+		{"empty slice", []string{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := dispatch(tt.args)
+			require.Error(t, err)
+			// Proves that run() was called and config.Load() was reached.
+			assert.Contains(t, err.Error(), `LOG_LEVEL: "invalid_for_test" must be one of debug|info|warn|error`)
+		})
+	}
+
+	// In contrast, invoking a subcommand does not enter run().
+	t.Run("subcommand does not enter run path", func(t *testing.T) {
+		err := dispatch([]string{"replay", "--help"})
+		assert.NoError(t, err, "subcommands must not enter run() or fail on LOG_LEVEL")
+	})
+}
+
+// TestNewLogger_DocumentedFormats asserts that each documented log format
+// ("text" and "json") produces a functional *slog.Logger writing to os.Stdout.
+func TestNewLogger_DocumentedFormats(t *testing.T) {
+	tests := []struct {
+		name      string
+		format    string
+		assertOut func(t *testing.T, output string)
+	}{
+		{
+			name:   "text format produces structured key-value output",
+			format: "text",
+			assertOut: func(t *testing.T, output string) {
+				assert.Contains(t, output, "test text log message")
+				assert.Contains(t, output, "foo=bar")
+				assert.False(t, strings.HasPrefix(strings.TrimSpace(output), "{"), "text logger should not emit JSON")
+			},
+		},
+		{
+			name:   "json format produces valid parseable JSON output",
+			format: "json",
+			assertOut: func(t *testing.T, output string) {
+				var parsed map[string]any
+				err := json.Unmarshal([]byte(output), &parsed)
+				require.NoError(t, err, "json format must emit valid JSON, got: %s", output)
+				assert.Equal(t, "test json log message", parsed["msg"])
+				assert.Equal(t, "bar", parsed["foo"])
+				assert.Equal(t, "INFO", parsed["level"])
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output := captureStdout(t, func() {
+				logger := newLogger("info", tt.format)
+				require.NotNil(t, logger)
+				logger.Info(fmt.Sprintf("test %s log message", tt.format), "foo", "bar")
+			})
+
+			tt.assertOut(t, output)
+		})
+	}
+}
+
+// TestNewLogger_LogLevels asserts that newLogger configures the expected
+// slog level threshold for all valid log levels.
+func TestNewLogger_LogLevels(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		level     string
+		wantDebug bool
+		wantInfo  bool
+		wantWarn  bool
+		wantError bool
+	}{
+		{
+			name:      "debug level enables all levels",
+			level:     "debug",
+			wantDebug: true,
+			wantInfo:  true,
+			wantWarn:  true,
+			wantError: true,
+		},
+		{
+			name:      "info level disables debug",
+			level:     "info",
+			wantDebug: false,
+			wantInfo:  true,
+			wantWarn:  true,
+			wantError: true,
+		},
+		{
+			name:      "warn level disables debug and info",
+			level:     "warn",
+			wantDebug: false,
+			wantInfo:  false,
+			wantWarn:  true,
+			wantError: true,
+		},
+		{
+			name:      "error level enables only error",
+			level:     "error",
+			wantDebug: false,
+			wantInfo:  false,
+			wantWarn:  false,
+			wantError: true,
+		},
+		{
+			name:      "case-insensitive log level input",
+			level:     "DEBUG",
+			wantDebug: true,
+			wantInfo:  true,
+			wantWarn:  true,
+			wantError: true,
+		},
+		{
+			name:      "unspecified level defaults to info",
+			level:     "",
+			wantDebug: false,
+			wantInfo:  true,
+			wantWarn:  true,
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log := newLogger(tt.level, "text")
+			require.NotNil(t, log)
+
+			assert.Equal(t, tt.wantDebug, log.Enabled(ctx, slog.LevelDebug), "debug enabled check")
+			assert.Equal(t, tt.wantInfo, log.Enabled(ctx, slog.LevelInfo), "info enabled check")
+			assert.Equal(t, tt.wantWarn, log.Enabled(ctx, slog.LevelWarn), "warn enabled check")
+			assert.Equal(t, tt.wantError, log.Enabled(ctx, slog.LevelError), "error enabled check")
+		})
+	}
+}
+
+// TestLogLevel_InvalidRejectedWithClearMessage asserts that setting an invalid
+// LOG_LEVEL environment variable is rejected during startup with a clear error message.
+func TestLogLevel_InvalidRejectedWithClearMessage(t *testing.T) {
+	invalidLevels := []struct {
+		name  string
+		level string
+	}{
+		{"verbose", "verbose"},
+		{"trace", "trace"},
+		{"loud", "loud"},
+		{"warning typo", "warning"},
+		{"numeric string", "123"},
+		{"none", "none"},
+	}
+
+	for _, tt := range invalidLevels {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://localhost/dummy")
+			t.Setenv("LOG_LEVEL", tt.level)
+			err := dispatch(nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), fmt.Sprintf("LOG_LEVEL: %q must be one of debug|info|warn|error", tt.level))
+		})
+	}
+}
+
+// TestUsage_ListsEverySubcommand asserts that usage() lists all subcommands
+// that dispatch() knows how to route to.
+func TestUsage_ListsEverySubcommand(t *testing.T) {
+	stderr := captureStderr(t, func() {
+		usage()
+	})
+
+	assert.Contains(t, stderr, "usage: sorotrail")
+	assert.Contains(t, stderr, "With no subcommand, runs the indexer")
+
+	knownSubcommands := []struct {
+		subcommand  string
+		description string
+	}{
+		{"replay", "re-decode stored events"},
+		{"apikey", "issue, list, and revoke API keys"},
+		{"contracts", "add, list, and remove watched contracts"},
+		{"backfill", "ingest historical contract events"},
+		{"index-addresses", "rebuild the address→event inverted index"},
+		{"migrate", "apply, roll back, or inspect database migrations"},
+		{"health", "probe the API /health and exit nonzero on failure"},
+		{"healthcheck", "probe /health and exit"},
+		{"schema-inspect", "report migration state, partitions, and table sizes"},
+		{"migrate-status", "report pending migrations without applying them"},
+		{"completion", "print a shell completion script"},
+		{"version", "print the build version, commit, and build date"},
+		{"stats", "print store stats as a table"},
+		{"config", "print the effective configuration with secrets redacted"},
+	}
+
+	for _, tt := range knownSubcommands {
+		t.Run(tt.subcommand, func(t *testing.T) {
+			assert.Contains(t, stderr, tt.subcommand, "usage must list subcommand %q", tt.subcommand)
+			assert.Contains(t, stderr, tt.description, "usage must describe subcommand %q", tt.subcommand)
 		})
 	}
 }
