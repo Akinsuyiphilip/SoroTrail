@@ -307,6 +307,7 @@ func contractCursorFromRow(r clickHouseRow) ContractCursor {
 
 func watchedContractFromRow(r clickHouseRow) WatchedContract {
 	return WatchedContract{
+		Network:    r.str("network"),
 		ContractID: r.str("contract_id"),
 		AddedAt:    r.time("added_at"),
 	}

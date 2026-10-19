@@ -350,7 +350,7 @@ func runService(dryRun bool) error {
 		if len(cfg.WatchedContracts) > 0 {
 			ingestStore = watchListOverrideStore{
 				Store:   st,
-				watched: watchedContracts(cfg.WatchedContracts),
+				watched: watchedContracts(cfg.WatchedContracts, cfg.Network),
 			}
 		}
 		ing := ingester.New(rpcClient, ingestStore, decode.XDRDecoder{}, log, ingesterOptionsFromConfig(cfg, true))
@@ -361,8 +361,12 @@ func runService(dryRun bool) error {
 		return nil
 	}
 
+	// Seed WATCHED_CONTRACTS on the configured network: the watch list is
+	// keyed by (network, contract), and the ingester only fetches entries
+	// matching its own NETWORK, so seeding without the network would park
+	// the contracts on "default" and watch nothing.
 	for _, id := range cfg.WatchedContracts {
-		if err := st.AddWatchedContract(ctx, id); err != nil {
+		if err := st.AddWatchedContract(ctx, store.WatchedContract{ContractID: id, Network: cfg.Network}); err != nil {
 			return err
 		}
 	}
@@ -595,6 +599,7 @@ func runService(dryRun bool) error {
 	apiServer.SetCompressMinSize(cfg.CompressMinSize)
 	apiServer.SetHTTPRequestBodyLimit(cfg.HTTPRequestBodyLimit)
 	apiServer.SetExportMaxRange(cfg.ExportMaxRange)
+	apiServer.SetDefaultNetwork(cfg.Network)
 	apiServer.SetCORSConfig(api.CORSConfig{
 		AllowedOrigins: cfg.CORSAllowedOrigins,
 		AllowedMethods: cfg.CORSAllowedMethods,
@@ -822,10 +827,10 @@ func (s watchListOverrideStore) GetIngestionStateForNetwork(ctx context.Context,
 	return s.GetIngestionState(ctx)
 }
 
-func watchedContracts(ids []string) []store.WatchedContract {
+func watchedContracts(ids []string, network string) []store.WatchedContract {
 	out := make([]store.WatchedContract, len(ids))
 	for i, id := range ids {
-		out[i] = store.WatchedContract{ContractID: id}
+		out[i] = store.WatchedContract{ContractID: id, Network: network}
 	}
 	return out
 }

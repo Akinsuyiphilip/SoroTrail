@@ -1228,15 +1228,15 @@ func (p *Postgres) SaveAuditStateIfGreater(ctx context.Context, network string, 
 // "watched since" — the earliest claim is what ingestion has actually been
 // following.
 const watchedContractsUnion = `
-	SELECT contract_id, min(added_at) AS added_at FROM (
-		SELECT contract_id, added_at FROM watched_contracts
+	SELECT network, contract_id, min(added_at) AS added_at FROM (
+		SELECT network, contract_id, added_at FROM watched_contracts
 		UNION ALL
-		SELECT contract_id, added_at FROM tenant_watched_contracts
-	) w GROUP BY contract_id`
+		SELECT network, contract_id, added_at FROM tenant_watched_contracts
+	) w GROUP BY network, contract_id`
 
 func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
 	rows, err := p.pool.Query(ctx,
-		watchedContractsUnion+` ORDER BY contract_id`)
+		watchedContractsUnion+` ORDER BY network, contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
@@ -1245,7 +1245,7 @@ func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract,
 	var out []WatchedContract
 	for rows.Next() {
 		var wc WatchedContract
-		if err := rows.Scan(&wc.ContractID, &wc.AddedAt); err != nil {
+		if err := rows.Scan(&wc.Network, &wc.ContractID, &wc.AddedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, wc)
@@ -1253,13 +1253,15 @@ func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract,
 	return out, rows.Err()
 }
 
-// RemoveWatchedContract stops future ingestion for the given contract by
-// removing its row from watched_contracts. It does NOT delete any event
-// rows already in storage — those remain queryable. ErrNotFound signals a
-// typo so the API can respond 404.
-func (p *Postgres) RemoveWatchedContract(ctx context.Context, contractID string) error {
+// RemoveWatchedContract stops future ingestion for the given contract on
+// the given network by removing its row from watched_contracts. It does
+// NOT delete any event rows already in storage — those remain queryable.
+// ErrNotFound signals a typo in either half of the (network, contract)
+// pair so the API can respond 404.
+func (p *Postgres) RemoveWatchedContract(ctx context.Context, w WatchedContract) error {
 	tag, err := p.pool.Exec(ctx,
-		`DELETE FROM watched_contracts WHERE contract_id = $1`, contractID)
+		`DELETE FROM watched_contracts WHERE network = $1 AND contract_id = $2`,
+		defaultNetwork(w.Network), w.ContractID)
 	if err != nil {
 		return fmt.Errorf("removing watched contract: %w", err)
 	}
@@ -1269,10 +1271,11 @@ func (p *Postgres) RemoveWatchedContract(ctx context.Context, contractID string)
 	return nil
 }
 
-func (p *Postgres) AddWatchedContract(ctx context.Context, contractID string) error {
+func (p *Postgres) AddWatchedContract(ctx context.Context, w WatchedContract) error {
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO watched_contracts (contract_id) VALUES ($1)
-		ON CONFLICT (contract_id) DO NOTHING`, contractID)
+		INSERT INTO watched_contracts (network, contract_id) VALUES ($1, $2)
+		ON CONFLICT (network, contract_id) DO NOTHING`,
+		defaultNetwork(w.Network), w.ContractID)
 	if err != nil {
 		return fmt.Errorf("adding watched contract: %w", err)
 	}

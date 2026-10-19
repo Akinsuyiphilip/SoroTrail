@@ -326,6 +326,110 @@ func TestMultiNetwork_SameIDDifferentNetwork(t *testing.T) {
 	assert.Len(t, got, 2, "unscoped query returns both networks")
 }
 
+// TestMultiNetwork_WatchListPerNetwork asserts that the watch list is
+// keyed by (network, contract): adding the same contract on two networks
+// yields two entries, removal on one network leaves the other intact, and
+// re-adding an entry on the same network is a no-op.
+func TestMultiNetwork_WatchListPerNetwork(t *testing.T) {
+	st := newSQLiteStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA, Network: "testnet"}))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA, Network: "mainnet"}))
+
+	got, err := st.ListWatchedContracts(ctx)
+	require.NoError(t, err)
+	require.Len(t, got, 2, "the same contract on two networks must be two entries")
+	for _, wc := range got {
+		assert.NotEmpty(t, wc.Network, "every listed entry must carry its network")
+	}
+
+	// Empty Network writes land on "default" and are reported back as
+	// "default", never as an empty string the caller has to special-case.
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractB}))
+	got, err = st.ListWatchedContracts(ctx)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+	var sawDefault bool
+	for _, wc := range got {
+		if wc.ContractID == contractB {
+			assert.Equal(t, "default", wc.Network)
+			sawDefault = true
+		}
+	}
+	assert.True(t, sawDefault)
+
+	// Removal addresses one (network, contract) row: removing the testnet
+	// entry must leave the mainnet and default entries untouched.
+	require.NoError(t, st.RemoveWatchedContract(ctx, WatchedContract{ContractID: contractA, Network: "testnet"}))
+	require.ErrorIs(t, st.RemoveWatchedContract(ctx, WatchedContract{ContractID: contractA, Network: "testnet"}),
+		ErrNotFound, "the entry is gone; a second remove must 404")
+
+	got, err = st.ListWatchedContracts(ctx)
+	require.NoError(t, err)
+	require.Len(t, got, 2, "removal must be network-scoped, not global")
+	for _, wc := range got {
+		assert.NotEqual(t, "testnet", wc.Network)
+	}
+}
+
+// TestMultiNetwork_AuditStatePerNetwork pins the SQLite audit-state
+// alignment with Postgres: audit_state is keyed by network, an unknown
+// network reads as ErrNotFound rather than a shared singleton row, and
+// findings recorded for one network are invisible to another network's
+// open-findings lookup.
+func TestMultiNetwork_AuditStatePerNetwork(t *testing.T) {
+	st := newSQLiteStore(t)
+	ctx := context.Background()
+
+	_, err := st.GetAuditState(ctx, "testnet")
+	assert.ErrorIs(t, err, ErrNotFound, "a fresh database has no audit state for any network")
+
+	require.NoError(t, st.SaveAuditState(ctx, AuditState{Network: "testnet", VerifiedThroughLedger: 100}))
+	require.NoError(t, st.SaveAuditState(ctx, AuditState{Network: "mainnet", VerifiedThroughLedger: 200}))
+
+	testnetState, err := st.GetAuditState(ctx, "testnet")
+	require.NoError(t, err)
+	assert.Equal(t, int64(100), testnetState.VerifiedThroughLedger)
+
+	mainnetState, err := st.GetAuditState(ctx, "mainnet")
+	require.NoError(t, err)
+	assert.Equal(t, int64(200), mainnetState.VerifiedThroughLedger)
+
+	// The HWM is per network: a lower candidate must not regress
+	// testnet, and a higher one must advance only testnet.
+	regressed, err := st.SaveAuditStateIfGreater(ctx, "testnet", 50)
+	require.NoError(t, err)
+	assert.Equal(t, int64(100), regressed.VerifiedThroughLedger)
+	advanced, err := st.SaveAuditStateIfGreater(ctx, "testnet", 150)
+	require.NoError(t, err)
+	assert.Equal(t, int64(150), advanced.VerifiedThroughLedger)
+
+	mainnetState, err = st.GetAuditState(ctx, "mainnet")
+	require.NoError(t, err)
+	assert.Equal(t, int64(200), mainnetState.VerifiedThroughLedger,
+		"advancing one network's HWM must not touch another's")
+
+	// Findings: a finding recorded on testnet must not be returned by a
+	// mainnet open-findings lookup over the same ledger range.
+	_, err = st.RecordAuditFinding(ctx, AuditFinding{
+		Network:       "testnet",
+		FromLedger:    100,
+		ToLedger:      105,
+		ExpectedCount: 6,
+		ActualCount:   5,
+		Status:        FindingOpen,
+	})
+	require.NoError(t, err)
+
+	_, err = st.ListOpenFindingsByRange(ctx, "mainnet", 100, 105)
+	assert.ErrorIs(t, err, ErrNotFound, "findings are network-scoped")
+
+	found, err := st.ListOpenFindingsByRange(ctx, "testnet", 100, 105)
+	require.NoError(t, err)
+	assert.Equal(t, "testnet", found.Network)
+}
+
 // TestMultiNetwork_SubscriptionFilterByNetwork validates that
 // SubscriptionFilter.MatchesEvent correctly drops events from a
 // non-matching network.

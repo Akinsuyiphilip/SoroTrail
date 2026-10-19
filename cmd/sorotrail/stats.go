@@ -37,6 +37,17 @@ decode failures, guarded-store query errors) belong to the running indexer
 and are reported by its /stats endpoint instead.
 `
 
+// statsStore abstracts the store queries required by runStats.
+type statsStore interface {
+	Stats(ctx context.Context, sc store.Scope) (store.Stats, error)
+}
+
+// openStatsStore is the store opener seam used by runStats. In tests, it can
+// be overridden to supply a mock or test database without requiring a live Postgres.
+var openStatsStore = func(ctx context.Context) (statsStore, func(), error) {
+	return openStore(ctx)
+}
+
 func runStatsTo(w io.Writer, args []string) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.Usage = func() {
@@ -53,7 +64,7 @@ func runStatsTo(w io.Writer, args []string) error {
 	}
 
 	ctx := context.Background()
-	st, cleanup, err := openStore(ctx)
+	st, cleanup, err := openStatsStore(ctx)
 	if err != nil {
 		return err
 	}

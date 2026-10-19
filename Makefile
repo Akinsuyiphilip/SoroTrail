@@ -9,11 +9,11 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unk
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown")
 
-LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
+LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$(COMMIT) -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate=$(BUILD_DATE)"
 
-.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean
-.PHONY: build build-all build-all-integration run test test-fast test-db test-integration vet vet-integration test-ci lint cover cover-html migrate-up migrate-down docker-up docker-down simtest simtest-long clean bench bench-ci seed spec spec-check client ci
-.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html migrate-up migrate-down seed docker-up docker-down spec clean
+.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean
+.PHONY: build build-all build-all-integration run test test-fast test-db test-integration vet vet-integration test-ci lint cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check docker-up docker-down simtest simtest-long clean bench bench-ci seed spec spec-check client ci
+.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean
 
 # ── Self-documenting help ────────────────────────────────────────────────────
 # Every target that starts with a double-hash comment (##) is listed by
@@ -51,8 +51,12 @@ test-fast: ## Run unit tests without the race detector
 test-db: ## Run full test suite against Postgres (requires DATABASE_URL)
 	TEST_DATABASE_URL=$(DATABASE_URL) go test -p 1 ./...
 
+# Shared with cover-ci so the plain and coverage-instrumented runs of the CI
+# suite cannot drift: same packages, same serialization, same race detector.
+TEST_CI_FLAGS := -p 1 ./... -count=1 -race -timeout=120s
+
 test-ci: ## Mirror the CI test job exactly (race-enabled, serial, 120s timeout)
-	go test -p 1 ./... -count=1 -race -timeout=120s
+	go test $(TEST_CI_FLAGS)
 
 test-integration: ## Run the integration-tagged suite against a real Postgres
 	go test -tags=integration -p 1 ./... -count=1
@@ -102,7 +106,7 @@ bench-ci: ## Benchmark smoke run (CI-length, no DB required)
 # Composed from the existing targets so the two cannot drift.
 # Runs as sub-makes so the first failure stops the run.
 
-ci: build-all vet spec-check test-ci bench-ci build-all-integration vet-integration test-integration lint ## Reproduce the full CI gate locally (first failure stops)
+ci: build-all vet spec-check migrations-check test-ci bench-ci build-all-integration vet-integration test-integration lint ## Reproduce the full CI gate locally (first failure stops)
 
 # ── Client ───────────────────────────────────────────────────────────────────
 
@@ -120,6 +124,22 @@ cover: ## Run tests with coverage profile
 cover-html: cover ## Open coverage report in browser
 	go tool cover -html=coverage.out
 
+# CI runs this target in both test-matrix legs (see .github/workflows/ci.yml).
+# The command lives here rather than in the workflow so a contributor can
+# reproduce the exact CI coverage profile locally with one make target.
+# -covermode=atomic is what -race requires and must match the integration
+# legs' mode, or scripts/merge_coverage.sh rejects the mixed profiles.
+cover-ci: ## Mirror the CI test job, recording an atomic coverage profile
+	go test $(TEST_CI_FLAGS) -coverprofile=coverage.out -covermode=atomic
+
+# Tagged counterpart of cover-ci: the same database-backed suite the
+# integration job runs, plus a profile so code that only exists behind the
+# integration tag counts as covered once the coverage job merges the two
+# flavours. Without it, migrations and the store/ingester paths that need a
+# real Postgres look untested in the reported figure.
+cover-integration-ci: ## Mirror the CI integration job, recording an atomic coverage profile
+	go test -tags=integration -p 1 -timeout 5m ./... -count=1 -coverprofile=coverage.out -covermode=atomic
+
 # ── Database / Migrations ────────────────────────────────────────────────────
 # Migrations run automatically on startup; these targets are for manual control.
 # Requires the migrate CLI: https://github.com/golang-migrate/migrate
@@ -129,6 +149,14 @@ migrate-up: ## Apply all pending migrations
 
 migrate-down: ## Roll back the last migration
 	migrate -path $(MIGRATIONS) -database "$(DATABASE_URL)" down 1
+
+# Two branches can each take "the next number" and merge cleanly, and the
+# embedded series then refuses to load — golang-migrate rejects a duplicate
+# version, so every database-backed test fails at once instead of the one that
+# broke. The check reads the embedded directory only, so it needs no Postgres
+# and runs in seconds; CI gates on it in the `migrations` job.
+migrations-check: ## Fail when two migrations share a version number (no database needed)
+	go test ./internal/store/ -run TestMigrate_VersionNumbersAreUnique -count=1
 
 seed: ## Seed the database with sample events
 	go run ./cmd/seed -db="$(DATABASE_URL)" -count=1000000

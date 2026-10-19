@@ -1,5 +1,9 @@
 # SoroTrail
 
+[![CI](https://img.shields.io/github/actions/workflow/status/sorotrail/SoroTrail/ci.yml?branch=main&label=CI)](https://github.com/sorotrail/SoroTrail/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/codecov/c/github/sorotrail/SoroTrail?branch=main&label=coverage&logo=codecov)](https://codecov.io/gh/sorotrail/SoroTrail)
+[![Go version](https://img.shields.io/github/go-mod/go-version/sorotrail/SoroTrail?filename=go.mod&logo=go)](https://go.dev/doc/install)
+[![License](https://img.shields.io/github/license/sorotrail/SoroTrail)](LICENSE)
 
 SoroTrail
 A contract event indexer for the Stellar/Soroban network.
@@ -13,8 +17,6 @@ events themselves before the RPC drops them.
 SoroTrail does exactly that: it polls a Stellar RPC endpoint, stores contract
 events durably in Postgres or SQLite, and serves them back through a queryable
 HTTP API long after the RPC has forgotten them.
-
-[![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/<repo>/actions/workflows/ci.yml)
 
 ```
  Stellar RPC ──getEvents──▶ ingester ──▶ Postgres/SQLite ◀── HTTP API ◀── you
@@ -236,7 +238,10 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | PostgreSQL 16 | Supported |
 
 Any Postgres 15+ release should work; only the above versions are exercised in
-the test matrix.
+CI. Both suites that touch the database run the full matrix — the unit job for
+the Postgres-backed conformance tests and the `integration`-tagged job for
+migrations, reorgs and the API filter tests — so a planner or index behaviour
+difference between the two majors fails a leg rather than reaching a deployment.
 
 ## Configuration
 
@@ -244,196 +249,230 @@ All configuration comes from environment variables (see `.env.example`).
 Every variable the code reads is listed here — the table is generated from
 the struct tags in `internal/config/config.go` to prevent drift.
 
+The Reload column states when a change takes effect. `SIGHUP` marks the
+two values the running indexer re-reads and applies live; `restart` marks
+every other value, which is read exactly once at startup and held for the
+life of the process. Sending `kill -HUP <pid>` re-reads and re-validates
+the whole environment: an invalid reload is rejected and the previous
+configuration stays active, a valid one applies the reloadable subset,
+and a change to the topology values (`DATABASE_URL`, `RPC_URL`,
+`RPC_URLS`, `LOG_FORMAT`) is logged as restart-required so a
+multi-variable edit is never half-applied in silence.
+
 ### Network and RPC
 
-| Variable | Type | Default | Description |
-| `NETWORK` | string | `testnet` | Stellar network to index. Must be one of `testnet`, `mainnet`, `futurenet`. Determines the default `RPC_URL` and passphrase when `RPC_URL` is unset. |
-| --- | --- | --- | --- |
-| `RPC_URL` | URL | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Ignored when `RPC_URLS` is set. Point at a provider URL for mainnet. |
-| `RPC_URLS` | CSV | unset | Comma-separated, priority-ordered list of Stellar RPC endpoints. When set, enables the multi-provider failover client (see [Multi-provider failover](#multi-provider-failover)) and `RPC_URL` is ignored. Index 0 is tried first. |
-| `RPC_RATE_LIMIT` | float | `10` | Single-provider request rate limit (`requests/second`). The default matches the public endpoint limit — raising it against the public RPC will get you throttled. On HTTP 429 the client honors `Retry-After` (delta-seconds or HTTP-date, capped at 60s) before exponential backoff. Ignored when `RPC_URLS` is set (use `RPC_RATE_LIMIT_RPS` instead). |
-| `RPC_RATE_LIMIT_RPS` | float | `10` | Per-provider request rate limit (`requests/second`) for the failover client. Only read when `RPC_URLS` is set. |
-| `RPC_MAX_ATTEMPTS` | int | `3` | Maximum attempts (including the first) per failing RPC call before the error surfaces. |
-| `RPC_BASE_BACKOFF` | duration | `500ms` | Initial retry backoff duration; doubles on each subsequent retry. |
-| `RPC_MAX_BACKOFF` | duration | `30s` | Upper bound on the computed retry backoff. |
-| `RPC_JITTER` | bool | `true` | Randomize each computed backoff to [0.5×, 1.5×) so concurrent retries don't thundering-herd the endpoint. Never applied to a provider's `Retry-After` hint. |
-| `RPC_HTTP_TIMEOUT` | duration | `30s` | Timeout on the underlying HTTP client's RPC requests. Raise for a slow private RPC endpoint. |
+| Variable | Type | Default | Description | Reload |
+| `NETWORK` | string | `testnet` | Stellar network to index. Must be one of `testnet`, `mainnet`, `futurenet`. Determines the default `RPC_URL` and passphrase when `RPC_URL` is unset. | restart |
+| --- | --- | --- | --- | --- |
+| `RPC_URL` | URL | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Ignored when `RPC_URLS` is set. Point at a provider URL for mainnet. | restart |
+| `RPC_URLS` | CSV | unset | Comma-separated, priority-ordered list of Stellar RPC endpoints. When set, enables the multi-provider failover client (see [Multi-provider failover](#multi-provider-failover)) and `RPC_URL` is ignored. Index 0 is tried first. | restart |
+| `RPC_RATE_LIMIT` | float | `10` | Single-provider request rate limit (`requests/second`). The default matches the public endpoint limit — raising it against the public RPC will get you throttled. On HTTP 429 the client honors `Retry-After` (delta-seconds or HTTP-date, capped at 60s) before exponential backoff. Ignored when `RPC_URLS` is set (use `RPC_RATE_LIMIT_RPS` instead). | restart |
+| `RPC_RATE_LIMIT_RPS` | float | `10` | Per-provider request rate limit (`requests/second`) for the failover client. Only read when `RPC_URLS` is set. | restart |
+| `RPC_MAX_ATTEMPTS` | int | `3` | Maximum attempts (including the first) per failing RPC call before the error surfaces. | restart |
+| `RPC_BASE_BACKOFF` | duration | `500ms` | Initial retry backoff duration; doubles on each subsequent retry. | restart |
+| `RPC_MAX_BACKOFF` | duration | `30s` | Upper bound on the computed retry backoff. | restart |
+| `RPC_JITTER` | bool | `true` | Randomize each computed backoff to [0.5×, 1.5×) so concurrent retries don't thundering-herd the endpoint. Never applied to a provider's `Retry-After` hint. | restart |
+| `RPC_HTTP_TIMEOUT` | duration | `30s` | Timeout on the underlying HTTP client's RPC requests. Raise for a slow private RPC endpoint. | restart |
+
+#### Multi-network model (issue #537)
+
+SoroTrail is **multi-network**: every network-scoped table is keyed by a
+`network` column, and one database can hold events, ingestion state, audit
+state, audit findings and watch-list entries for several Stellar networks at
+once. A single process still ingests one network — the one named by
+`NETWORK` — but the schema no longer forces that to be the only one present.
+
+- `events`, `ingestion_state`, `audit_state`, `audit_findings`:
+  keyed by `network` (empty is normalized to `default`).
+- `watched_contracts` (and `tenant_watched_contracts`): one row per
+  `(network, contract_id)`. The same contract watched on testnet and mainnet
+  is two entries; the ingester only fetches the entries matching its own
+  `NETWORK`, and the API's watch-list endpoints accept an optional `network`
+  (body field on POST, query parameter on DELETE) that defaults to the
+  deployment's `NETWORK`.
+- The `all contract events` ↔ `specific list` ingestion-mode transition is
+  evaluated per network: only that network's entries count.
 
 ### Database
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `DATABASE_URL` | string | — (required) | Postgres or SQLite connection string. Use `postgres://…` for production or `sqlite:./sorotrail.db` for a zero-dependency single-binary setup. |
-| `DB_MAX_CONNS` | int | `0` | Max connections in the Postgres pool. `0` (default) uses pgx's default. |
-| `DB_MIN_CONNS` | int | `0` | Min connections kept warm in the pool (`0` = pgx default). |
-| `DB_MAX_CONN_LIFETIME` | duration | `0` | Max lifetime of a DB connection (`0` = no limit, e.g. `30m`). |
-| `DB_MAX_CONN_IDLE_TIME` | duration | `0` | Max idle time of a DB connection (`0` = no limit, e.g. `5m`). |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `DATABASE_URL` | string | — (required) | Postgres or SQLite connection string. Use `postgres://…` for production or `sqlite:./sorotrail.db` for a zero-dependency single-binary setup. | restart |
+| `DB_MAX_CONNS` | int | `0` | Max connections in the Postgres pool. `0` (default) uses pgx's default. | restart |
+| `DB_MIN_CONNS` | int | `0` | Min connections kept warm in the pool (`0` = pgx default). | restart |
+| `DB_MAX_CONN_LIFETIME` | duration | `0` | Max lifetime of a DB connection (`0` = no limit, e.g. `30m`). | restart |
+| `DB_MAX_CONN_IDLE_TIME` | duration | `0` | Max idle time of a DB connection (`0` = no limit, e.g. `5m`). | restart |
 
 ### Ingestion
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `POLL_INTERVAL` | duration | `5s` | Sleep between polls once caught up with the chain head. |
-| `POLL_INTERVAL_MIN` | duration | unset | Lower bound for the adaptive poll interval. Once caught up, the effective interval shrinks toward this when a cycle just observed backlog. Both `POLL_INTERVAL_MIN` and `POLL_INTERVAL_MAX` unset (the default) disables adaptation — the ingester always polls at exactly `POLL_INTERVAL`. See [Ingestion behavior additions](#ingestion-behavior-additions). |
-| `POLL_INTERVAL_MAX` | duration | unset | Upper bound for the adaptive poll interval. The effective interval grows toward this on an idle cycle. See `POLL_INTERVAL_MIN`. |
-| `WATCHED_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract triggers a backfill from `latest − RETENTION_LEDGERS`. |
-| `SKIP_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`) to never index events from. |
-| `START_LEDGER` | string | unset | Force cold-start ingestion from this ledger. Accepts an absolute number (≥ 2) or a relative offset like `latest-1000`. |
-| `START_LEDGER_RAW` | string | unset | Raw form of `START_LEDGER` before parsing. Used internally; operators should set `START_LEDGER` instead. |
-| `RETENTION_LEDGERS` | uint32 | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). See [Ingestion behavior](#ingestion-behavior). Clamped to the RPC's oldest retained ledger. |
-| `INGEST_PAGE_SIZE` | uint | `1000` | Maximum number of events per `getEvents` RPC page. |
-| `INGEST_BATCH_SIZE` | uint | `1000` | Number of events per upsert batch during ingestion. |
-| `INGESTER_MIN_BACKOFF` | duration | `1s` | Initial error backoff for the ingester's retry loop. |
-| `INGESTER_MAX_BACKOFF` | duration | `1m` | Maximum error backoff for the ingester. |
-| `INGESTER_JITTER_MIN` | duration | `0` | Lower bound for additive retry jitter on ingester errors. `0` preserves proportional jitter. |
-| `INGESTER_JITTER_MAX` | duration | `0` | Exclusive upper bound on additive retry jitter. `0` preserves proportional jitter up to half the current backoff. |
-| `PARTITION_LEDGER_SPAN` | uint32 | `120960` | Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. |
-| `SWEEP_CONCURRENCY` | int | `1` | Maximum number of filter batches fetched concurrently during a windowSweep pass. The RPC interval limiter still caps total request rate, so raising this helps only against private RPCs with more headroom. |
-| `MAX_EVENTS_PER_CYCLE` | uint | `0` (disabled) | Cap on events a single ingestion cycle may process, bounding per-cycle memory and latency. When hit, the sweep stops and the next cycle resumes with idempotent upserts. `0` disables the cap. |
-| `BATCH_SIZE` | uint | `0` (disabled) | Maximum events per store write (`UpsertEvents`), splitting a fetched page into smaller chunks. `0` keeps the historical single-write-per-page behavior. |
-| `BATCH_TARGET_LATENCY` | duration | `0` (disabled) | Per-write latency budget when `BATCH_SIZE` is set. Writes exceeding this cause adaptive chunk-size reduction and backpressure sleeps. `0` disables adaptation. |
-| `BATCH_MAX_BACKOFF` | duration | `1s` | Maximum backpressure sleep between batch writes. Only effective when both `BATCH_SIZE` and `BATCH_TARGET_LATENCY` are set. |
-| `INGESTION_LOCK_ENABLED` | bool | `false` | Acquire a Postgres advisory lock keyed by the RPC URL before starting ingestion. A second instance skips ingestion (but keeps serving the API), preventing double-processing. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `POLL_INTERVAL` | duration | `5s` | Sleep between polls once caught up with the chain head. | SIGHUP |
+| `POLL_INTERVAL_MIN` | duration | unset | Lower bound for the adaptive poll interval. Once caught up, the effective interval shrinks toward this when a cycle just observed backlog. Both `POLL_INTERVAL_MIN` and `POLL_INTERVAL_MAX` unset (the default) disables adaptation — the ingester always polls at exactly `POLL_INTERVAL`. See [Ingestion behavior additions](#ingestion-behavior-additions). | restart |
+| `POLL_INTERVAL_MAX` | duration | unset | Upper bound for the adaptive poll interval. The effective interval grows toward this on an idle cycle. See `POLL_INTERVAL_MIN`. | restart |
+| `WATCHED_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`). Empty = ingest **all** contract events. Each watched contract tracks its own resume cursor; adding a contract triggers a backfill from `latest − RETENTION_LEDGERS`. | restart |
+| `SKIP_CONTRACTS` | CSV | empty | Comma-separated contract IDs (`C...`) to never index events from. | restart |
+| `START_LEDGER` | string | unset | Force cold-start ingestion from this ledger. Accepts an absolute number (≥ 2) or a relative offset like `latest-1000`. | restart |
+| `START_LEDGER_RAW` | string | unset | Raw form of `START_LEDGER` before parsing. Used internally; operators should set `START_LEDGER` instead. | restart |
+| `RETENTION_LEDGERS` | uint32 | `17280` | Cold-start reach-back in ledgers (~24h at 5s/ledger). See [Ingestion behavior](#ingestion-behavior). Clamped to the RPC's oldest retained ledger. | restart |
+| `INGEST_PAGE_SIZE` | uint | `1000` | Maximum number of events per `getEvents` RPC page. | restart |
+| `INGEST_BATCH_SIZE` | uint | `1000` | Number of events per upsert batch during ingestion. | restart |
+| `INGESTER_MIN_BACKOFF` | duration | `1s` | Initial error backoff for the ingester's retry loop. | restart |
+| `INGESTER_MAX_BACKOFF` | duration | `1m` | Maximum error backoff for the ingester. | restart |
+| `INGESTER_JITTER_MIN` | duration | `0` | Lower bound for additive retry jitter on ingester errors. `0` preserves proportional jitter. | restart |
+| `INGESTER_JITTER_MAX` | duration | `0` | Exclusive upper bound on additive retry jitter. `0` preserves proportional jitter up to half the current backoff. | restart |
+| `PARTITION_LEDGER_SPAN` | uint32 | `120960` | Ledger range per events-table partition (~7 days at 5s/ledger). Partitions are created automatically on migration and at ingest time. | restart |
+| `SWEEP_CONCURRENCY` | int | `1` | Maximum number of filter batches fetched concurrently during a windowSweep pass. The RPC interval limiter still caps total request rate, so raising this helps only against private RPCs with more headroom. | restart |
+| `MAX_EVENTS_PER_CYCLE` | uint | `0` (disabled) | Cap on events a single ingestion cycle may process, bounding per-cycle memory and latency. When hit, the sweep stops and the next cycle resumes with idempotent upserts. `0` disables the cap. | restart |
+| `BATCH_SIZE` | uint | `0` (disabled) | Maximum events per store write (`UpsertEvents`), splitting a fetched page into smaller chunks. `0` keeps the historical single-write-per-page behavior. | restart |
+| `BATCH_TARGET_LATENCY` | duration | `0` (disabled) | Per-write latency budget when `BATCH_SIZE` is set. Writes exceeding this cause adaptive chunk-size reduction and backpressure sleeps. `0` disables adaptation. | restart |
+| `BATCH_MAX_BACKOFF` | duration | `1s` | Maximum backpressure sleep between batch writes. Only effective when both `BATCH_SIZE` and `BATCH_TARGET_LATENCY` are set. | restart |
+| `INGESTION_LOCK_ENABLED` | bool | `false` | Acquire a Postgres advisory lock keyed by the RPC URL before starting ingestion. A second instance skips ingestion (but keeps serving the API), preventing double-processing. | restart |
 
 ### Reorg detection
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `REORG_CONFIRMATION_WINDOW` | uint32 | `64` | Ledgers behind the ingest frontier re-scanned on a schedule for RPC-side reorgs. Once a ledger is further behind than this, it is considered finalized and never rewritten. `0` disables reorg detection. |
-| `REORG_RESCAN_INTERVAL` | duration | `1m` | Cadence of the periodic reorg re-scan. The re-scan shares the live RPC budget and runs after a successful ingest cycle. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `REORG_CONFIRMATION_WINDOW` | uint32 | `64` | Ledgers behind the ingest frontier re-scanned on a schedule for RPC-side reorgs. Once a ledger is further behind than this, it is considered finalized and never rewritten. `0` disables reorg detection. | restart |
+| `REORG_RESCAN_INTERVAL` | duration | `1m` | Cadence of the periodic reorg re-scan. The re-scan shares the live RPC budget and runs after a successful ingest cycle. | restart |
 
 ### Logging
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `LOG_LEVEL` | string | `info` | `debug` \| `info` \| `warn` \| `error`. |
-| `LOG_FORMAT` | string | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. |
-| `LAG_WARN_LEDGERS` | uint32 | `100` | Ingest-lag alarm threshold in ledgers. When the gap between chain head and last ingested ledger exceeds this, a WARN is logged; an INFO fires once the gap closes. `0` disables the alarm. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `LOG_LEVEL` | string | `info` | `debug` \| `info` \| `warn` \| `error`. | SIGHUP |
+| `LOG_FORMAT` | string | `text` | `text` \| `json`. JSON emits one JSON object per line, compatible with Loki, CloudWatch, and ELK. | restart |
+| `LAG_WARN_LEDGERS` | uint32 | `100` | Ingest-lag alarm threshold in ledgers. When the gap between chain head and last ingested ledger exceeds this, a WARN is logged; an INFO fires once the gap closes. `0` disables the alarm. | restart |
 
 ### API server
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `HTTP_ADDR` | string | `:8080` | API listen address. |
-| `HTTP_READ_TIMEOUT` | duration | `30s` | Maximum time to read the full request including body. `0` disables. |
-| `HTTP_WRITE_TIMEOUT` | duration | `30s` | Maximum time to write the full response. `0` disables. |
-| `HTTP_IDLE_TIMEOUT` | duration | `60s` | Maximum time a keep-alive connection may idle before being closed. `0` disables. |
-| `HTTP_READ_HEADER_TIMEOUT` | duration | `10s` | Maximum time to read request headers. The most important defence against slow-client attacks. `0` disables. |
-| `HTTP_REQUEST_BODY_LIMIT` | int64 | `1048576` | Maximum accepted request body size in bytes (1 MiB default). Protects against memory/resource exhaustion. |
-| `API_QUERY_TIMEOUT` | duration | `25s` | Per-request database timeout for API-originated store reads. Enforced in-process and mirrored to Postgres via `statement_timeout`. |
-| `API_SLOW_QUERY_THRESHOLD` | duration | `2s` | Warn when an API-originated store query exceeds this duration; logs include the query name and elapsed time. |
-| `API_MAX_LIMIT` | int | `500` | Upper bound on the `limit` and `recent` page-size parameters for list endpoints (`/events`, etc.). Values above the cap are rejected with 400 rather than clamped. |
-| `API_KEY` | string | empty | Gates the `/watched-contracts` management endpoints via constant-time header comparison. Empty means every write request is rejected with 503. |
-| `API_KEY_AUTH_ENABLED` | bool | `false` | Require a valid API key on write, streaming, and subscription-management endpoints (see [API key authentication](#api-key-authentication)); read endpoints stay public. Keys are issued/revoked via `sorotrail apikey` or the `/apikeys` endpoints. |
-| `STATS_CACHE_TTL` | duration | `5s` | How long `GET /stats` results are served from the per-scope cache before recomputation. `0` disables caching. |
-| `CACHE_PRIVATE` | bool | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set when serving per-user data behind an auth layer. |
-| `COMPRESS_MIN_SIZE` | int | `0` | Response body size (bytes) at or above which gzip/deflate encoding is applied. Negative disables compression entirely; `0` uses the built-in default. |
-| `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. |
-| `SHUTDOWN_TIMEOUT` | duration | `15s` | Maximum time for graceful HTTP server drain and component shutdown before the process is killed. `0` waits indefinitely. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `HTTP_ADDR` | string | `:8080` | API listen address. | restart |
+| `HTTP_READ_TIMEOUT` | duration | `30s` | Maximum time to read the full request including body. `0` disables. | restart |
+| `HTTP_WRITE_TIMEOUT` | duration | `30s` | Maximum time to write the full response. `0` disables. | restart |
+| `HTTP_IDLE_TIMEOUT` | duration | `60s` | Maximum time a keep-alive connection may idle before being closed. `0` disables. | restart |
+| `HTTP_READ_HEADER_TIMEOUT` | duration | `10s` | Maximum time to read request headers. The most important defence against slow-client attacks. `0` disables. | restart |
+| `HTTP_REQUEST_BODY_LIMIT` | int64 | `1048576` | Maximum accepted request body size in bytes (1 MiB default). Protects against memory/resource exhaustion. | restart |
+| `API_QUERY_TIMEOUT` | duration | `25s` | Per-request database timeout for API-originated store reads. Enforced in-process and mirrored to Postgres via `statement_timeout`. | restart |
+| `API_SLOW_QUERY_THRESHOLD` | duration | `2s` | Warn when an API-originated store query exceeds this duration; logs include the query name and elapsed time. | restart |
+| `API_MAX_LIMIT` | int | `500` | Upper bound on the `limit` and `recent` page-size parameters for list endpoints (`/events`, etc.). Values above the cap are rejected with 400 rather than clamped. | restart |
+| `API_KEY` | string | empty | Gates the `/watched-contracts` management endpoints via constant-time header comparison. Empty means every write request is rejected with 503. | restart |
+| `API_KEY_AUTH_ENABLED` | bool | `false` | Require a valid API key on write, streaming, and subscription-management endpoints (see [API key authentication](#api-key-authentication)); read endpoints stay public. Keys are issued/revoked via `sorotrail apikey` or the `/apikeys` endpoints. | restart |
+| `STATS_CACHE_TTL` | duration | `5s` | How long `GET /stats` results are served from the per-scope cache before recomputation. `0` disables caching. | restart |
+| `CACHE_PRIVATE` | bool | `false` | Flip cacheable responses from `Cache-Control: public` to `private`. Set when serving per-user data behind an auth layer. | restart |
+| `COMPRESS_MIN_SIZE` | int | `0` | Response body size (bytes) at or above which gzip/deflate encoding is applied. Negative disables compression entirely; `0` uses the built-in default. | restart |
+| `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. | restart |
+| `SHUTDOWN_TIMEOUT` | duration | `15s` | Maximum time for graceful HTTP server drain and component shutdown before the process is killed. `0` waits indefinitely. | restart |
 
 ### CORS
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `CORS_ALLOWED_ORIGINS` | CSV | empty | Browser origins allowed to call the API cross-origin. `*` allows any origin; otherwise each entry must be an explicit `scheme://host`. Empty = CORS disabled. Invalid entries (e.g. `null`, origins with a path) fail startup. |
-| `CORS_ALLOWED_METHODS` | CSV | `GET,POST,PUT,DELETE,OPTIONS` | Methods returned on preflight (`OPTIONS`) responses. |
-| `CORS_ALLOWED_HEADERS` | CSV | `Content-Type,X-API-Key,Accept` | Headers returned on preflight responses. |
-| `CORS_EXPOSED_HEADERS` | CSV | `X-Request-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset` | Response headers browser JavaScript may read via `Access-Control-Expose-Headers`. Empty suppresses the header entirely. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `CORS_ALLOWED_ORIGINS` | CSV | empty | Browser origins allowed to call the API cross-origin. `*` allows any origin; otherwise each entry must be an explicit `scheme://host`. Empty = CORS disabled. Invalid entries (e.g. `null`, origins with a path) fail startup. | restart |
+| `CORS_ALLOWED_METHODS` | CSV | `GET,POST,PUT,DELETE,OPTIONS` | Methods returned on preflight (`OPTIONS`) responses. | restart |
+| `CORS_ALLOWED_HEADERS` | CSV | `Content-Type,X-API-Key,Accept` | Headers returned on preflight responses. | restart |
+| `CORS_EXPOSED_HEADERS` | CSV | `X-Request-ID,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset` | Response headers browser JavaScript may read via `Access-Control-Expose-Headers`. Empty suppresses the header entirely. | restart |
 
 ### Rate limiting
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `RATE_LIMIT_RPS` | float | `0` (disabled) | Per-client HTTP request rate limit (`requests/second`). Must be set together with `RATE_LIMIT_BURST`; setting only one fails startup. |
-| `RATE_LIMIT_BURST` | int | `0` (disabled) | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. |
-| `RATE_LIMIT_TRUSTED_PROXY` | bool | `false` | Honor `X-Forwarded-For` for client IP detection. Only enable behind a trusted proxy that strips/rewrites the header. |
-| `HOURLY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 1-hour window. `0` disables the quota. |
-| `DAILY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 24-hour window. `0` disables the quota. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `RATE_LIMIT_RPS` | float | `0` (disabled) | Per-client HTTP request rate limit (`requests/second`). Must be set together with `RATE_LIMIT_BURST`; setting only one fails startup. | restart |
+| `RATE_LIMIT_BURST` | int | `0` (disabled) | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. | restart |
+| `RATE_LIMIT_TRUSTED_PROXY` | bool | `false` | Honor `X-Forwarded-For` for client IP detection. Only enable behind a trusted proxy that strips/rewrites the header. | restart |
+| `HOURLY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 1-hour window. `0` disables the quota. | restart |
+| `DAILY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 24-hour window. `0` disables the quota. | restart |
 
 ### Audit
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `AUDIT_ENABLED` | bool | `false` | Enable the background auditor. When `false` the binary behaves exactly like the pre-audit build. |
-| `AUDIT_POLL_INTERVAL` | duration | `30s` | Sleep between audit passes. |
-| `AUDIT_BATCH_LEDGERS` | uint32 | `100` | Ledger range covered by one audit pass. |
-| `AUDIT_LAG_THRESHOLD` | uint32 | `200` | Auditor sleeps until ingest is at least this many ledgers past the verified mark. |
-| `AUDIT_BUDGET_SHARE` | float | `0.10` | Fraction of the request budget the audit pool gets (rest goes to ingest). Must be in [0, 1]. |
-| `AUDIT_MAX_RPS` | float | `10` | Total request budget (`requests/second`) split between ingest and audit pools. |
-| `AUDIT_MAX_REPAIR_ATTEMPTS` | int | `3` | Repair iterations before a finding is kept open as `unrecoverable`. |
-| `AUDIT_FINDING_MAX_LEDGERS` | uint32 | `100` | Largest range a single finding is allowed to span. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `AUDIT_ENABLED` | bool | `false` | Enable the background auditor. When `false` the binary behaves exactly like the pre-audit build. | restart |
+| `AUDIT_POLL_INTERVAL` | duration | `30s` | Sleep between audit passes. | restart |
+| `AUDIT_BATCH_LEDGERS` | uint32 | `100` | Ledger range covered by one audit pass. | restart |
+| `AUDIT_LAG_THRESHOLD` | uint32 | `200` | Auditor sleeps until ingest is at least this many ledgers past the verified mark. | restart |
+| `AUDIT_BUDGET_SHARE` | float | `0.10` | Fraction of the request budget the audit pool gets (rest goes to ingest). Must be in [0, 1]. | restart |
+| `AUDIT_MAX_RPS` | float | `10` | Total request budget (`requests/second`) split between ingest and audit pools. | restart |
+| `AUDIT_MAX_REPAIR_ATTEMPTS` | int | `3` | Repair iterations before a finding is kept open as `unrecoverable`. | restart |
+| `AUDIT_FINDING_MAX_LEDGERS` | uint32 | `100` | Largest range a single finding is allowed to span. | restart |
 
 ### Retention pruning
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `RETENTION_MAX_AGE` | duration | `0` (disabled) | Delete events older than this duration. `0` with `RETENTION_MIN_LEDGER` unset disables the pruner entirely. |
-| `RETENTION_AGE` | duration | `0` (disabled) | Delete events older than this duration (age-based pruning job). `0` disables the age-based pruner. |
-| `RETENTION_POLL_INTERVAL` | duration | `1h` | How often the age-based pruner re-examines events older than `RETENTION_AGE`. |
-| `RETENTION_MIN_LEDGER` | uint64 | `0` (disabled) | Delete events with ledger below this value. `0` with `RETENTION_MAX_AGE` unset disables the pruner. |
-| `RETENTION_BATCH_SIZE` | int | `5000` | Maximum events deleted per pruner transaction. |
-| `RETENTION_PAUSE` | duration | `100ms` | Sleep between pruner batches to avoid holding a long lock. |
-| `RETENTION_INTERVAL` | duration | `1h` | How often the pruner runs. |
-| `RETENTION_DRY_RUN` | bool | `false` | Report what the pruner would delete without removing any rows. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `RETENTION_MAX_AGE` | duration | `0` (disabled) | Delete events older than this duration. `0` with `RETENTION_MIN_LEDGER` unset disables the pruner entirely. | restart |
+| `RETENTION_AGE` | duration | `0` (disabled) | Delete events older than this duration (age-based pruning job). `0` disables the age-based pruner. | restart |
+| `RETENTION_POLL_INTERVAL` | duration | `1h` | How often the age-based pruner re-examines events older than `RETENTION_AGE`. | restart |
+| `RETENTION_MIN_LEDGER` | uint64 | `0` (disabled) | Delete events with ledger below this value. `0` with `RETENTION_MAX_AGE` unset disables the pruner. | restart |
+| `RETENTION_BATCH_SIZE` | int | `5000` | Maximum events deleted per pruner transaction. | restart |
+| `RETENTION_PAUSE` | duration | `100ms` | Sleep between pruner batches to avoid holding a long lock. | restart |
+| `RETENTION_INTERVAL` | duration | `1h` | How often the pruner runs. | restart |
+| `RETENTION_DRY_RUN` | bool | `false` | Report what the pruner would delete without removing any rows. | restart |
 
 ### Archive
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `ARCHIVE_BUCKET` | string | empty | S3-compatible bucket for exporting pruned events as compressed NDJSON before deletion. Master switch — when set, `ARCHIVE_ENDPOINT` is also required. Empty disables archiving. |
-| `ARCHIVE_PREFIX` | string | empty | Key prefix for archived objects. |
-| `ARCHIVE_ENDPOINT` | string | empty | S3-compatible endpoint URL (e.g. `localhost:9000`). **Required** when `ARCHIVE_BUCKET` is set. |
-| `ARCHIVE_REGION` | string | empty | S3 region. |
-| `ARCHIVE_ACCESS_KEY_ID` | string | empty | **Secret.** S3 access key ID. |
-| `ARCHIVE_SECRET_ACCESS_KEY` | string | empty | **Secret.** S3 secret access key. |
-| `ARCHIVE_USE_SSL` | bool | `false` | Use TLS when connecting to the archive endpoint. |
-| `ARCHIVE_BEFORE_PRUNE` | bool | `false` | Export events to the archive before the pruner deletes them. |
-| `ARCHIVE_MAX_RETRIES` | int | `3` | Maximum upload retry attempts per event batch. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `ARCHIVE_BUCKET` | string | empty | S3-compatible bucket for exporting pruned events as compressed NDJSON before deletion. Master switch — when set, `ARCHIVE_ENDPOINT` is also required. Empty disables archiving. | restart |
+| `ARCHIVE_PREFIX` | string | empty | Key prefix for archived objects. | restart |
+| `ARCHIVE_ENDPOINT` | string | empty | S3-compatible endpoint URL (e.g. `localhost:9000`). **Required** when `ARCHIVE_BUCKET` is set. | restart |
+| `ARCHIVE_REGION` | string | empty | S3 region. | restart |
+| `ARCHIVE_ACCESS_KEY_ID` | string | empty | **Secret.** S3 access key ID. | restart |
+| `ARCHIVE_SECRET_ACCESS_KEY` | string | empty | **Secret.** S3 secret access key. | restart |
+| `ARCHIVE_USE_SSL` | bool | `false` | Use TLS when connecting to the archive endpoint. | restart |
+| `ARCHIVE_BEFORE_PRUNE` | bool | `false` | Export events to the archive before the pruner deletes them. | restart |
+| `ARCHIVE_MAX_RETRIES` | int | `3` | Maximum upload retry attempts per event batch. | restart |
 
 ### Export
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `EXPORT_MAX_RANGE` | int64 | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns 400 if exceeded. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `EXPORT_MAX_RANGE` | int64 | `17280` | Maximum ledger span a single `/contracts/{id}/export` call may request (~24h at 5s/ledger). Returns 400 if exceeded. | restart |
 
 ### Multi-tenancy
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `MULTI_TENANT` | bool | `false` | Serve several consumers from one deployment, each scoped to its own contracts. Off = no authentication, no tenant boundary. See [Multi-tenancy](docs/multi-tenancy.md). |
-| `MULTI_TENANT_MAX_WATCHED` | int | `250` | Cap on the union of all tenants' watch lists, bounding the ingester's RPC cost. `0` disables the cap. |
-| `MULTI_TENANT_USAGE_FLUSH` | duration | `10s` | How often accumulated per-tenant usage counters are persisted. |
-| `MULTI_TENANT_STREAM_SCOPE_SYNC` | duration | `30s` | How often an open stream re-resolves its tenant's grants, bounding how long a revoked grant keeps being served. |
-| `MULTI_TENANT_BOOTSTRAP_KEY` | string | empty | **Secret.** Admin API key installed for the seeded `default` tenant at startup. Solves the chicken-and-egg of a fresh install. Rejected unless `MULTI_TENANT=true`. Rotate by revoking through `/admin` once real keys exist. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `MULTI_TENANT` | bool | `false` | Serve several consumers from one deployment, each scoped to its own contracts. Off = no authentication, no tenant boundary. See [Multi-tenancy](docs/multi-tenancy.md). | restart |
+| `MULTI_TENANT_MAX_WATCHED` | int | `250` | Cap on the union of all tenants' watch lists, bounding the ingester's RPC cost. `0` disables the cap. | restart |
+| `MULTI_TENANT_USAGE_FLUSH` | duration | `10s` | How often accumulated per-tenant usage counters are persisted. | restart |
+| `MULTI_TENANT_STREAM_SCOPE_SYNC` | duration | `30s` | How often an open stream re-resolves its tenant's grants, bounding how long a revoked grant keeps being served. | restart |
+| `MULTI_TENANT_BOOTSTRAP_KEY` | string | empty | **Secret.** Admin API key installed for the seeded `default` tenant at startup. Solves the chicken-and-egg of a fresh install. Rejected unless `MULTI_TENANT=true`. Rotate by revoking through `/admin` once real keys exist. | restart |
 
 ### Horizon backfill
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `HORIZON_URL` | URL | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. |
-| `BACKFILL_RATE_RPS` | float | `10` | Pace against Horizon when backfilling. 10 req/s matches the public-instance cap; private deployments can lift this. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `HORIZON_URL` | URL | `https://horizon-testnet.stellar.org` | Stellar Horizon REST endpoint used by `sorotrail backfill` only. Live ingestion does not touch Horizon. | restart |
+| `BACKFILL_RATE_RPS` | float | `10` | Pace against Horizon when backfilling. 10 req/s matches the public-instance cap; private deployments can lift this. | restart |
 
 ### GraphQL
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `GRAPHQL_PLAYGROUND` | bool | `false` | Enable the GraphiQL UI at `/graphiql`. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `GRAPHQL_PLAYGROUND` | bool | `false` | Enable the GraphiQL UI at `/graphiql`. | restart |
 
 ### Metrics
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `METRICS_ENABLED` | bool | `false` | Enable metrics collection. |
-| `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. See also `METRICS_ENABLED`. |
+| Variable | Type | Default | Description | Reload |
+| --- | --- | --- | --- | --- |
+| `METRICS_ENABLED` | bool | `false` | Enable metrics collection. | restart |
+| `ENABLE_METRICS` | bool | `false` | Expose the Prometheus `/metrics` endpoint. See also `METRICS_ENABLED`. | restart |
 
 With `ENABLE_METRICS=true`, the Prometheus `/metrics` endpoint exposes the
 pipeline metrics (`sorotrail_*`) in addition to the per-server HTTP
-histogram. The RPC metrics answer the first question when ingestion falls
+histogram. The full catalogue — every metric the build exports, with its
+type, labels and meaning — is [docs/metrics.md](docs/metrics.md);
+it is generated from a table the metrics package's tests check against
+the code, so a renamed, removed or undocumented metric fails the build.
+
+The RPC metrics answer the first question when ingestion falls
 behind — is the upstream slow, failing, or being throttled by our own
 breaker:
 
 | Metric | Type | Labels | Meaning |
-| --- | --- | --- | --- |
+| --- | --- | --- | --- | --- |
 | `sorotrail_rpc_call_duration_seconds` | histogram | `method`, `outcome` (`success` \| `error`) | Latency of one JSON-RPC call. `method` is a fixed enum (`getEvents`, `getLatestLedger`, `getHealth`, `getLedgerEntries`, `simulateTransaction`); the histogram's `_count` for a `(method, outcome)` pair is the call total. |
 | `sorotrail_rpc_retries_total` | counter | `method`, `reason` (`backoff` \| `retry_after`) | Retry attempts after the first; `reason` says whether the wait came from the computed exponential backoff or a provider `Retry-After` hint. |
 | `sorotrail_rpc_backoff_seconds_total` | counter | `method` | Cumulative seconds slept between retries — a long tail means the provider is throttling. |
@@ -750,8 +789,9 @@ match, since `If-None-Match` comparison ignores the `W/` prefix.
 ## API reference
 
 GET /health
-Reports the API's view of its dependencies. 200 when both the database and
-the RPC are reachable and healthy, 503 otherwise.
+Reports the API's view of its dependencies, each reported individually with
+its own state (`ok`, `degraded` or `unready`), reason, and latency. 200 when
+every check is ok, 503 otherwise.
 
 ### Pagination
 
@@ -783,10 +823,54 @@ curl -s 'localhost:8080/events?cursor=0001099511627776-0000000009&limit=10'
 
 ### `GET /health`
 
+Reports the API's view of its dependencies — the database and the Stellar
+RPC — each one individually: `checks` holds one entry per dependency with
+its own `status` (`ok` | `degraded` | `unready`), a `detail` explaining any
+non-ok status, and how long that check alone took (`latency_ms`). Every
+check runs concurrently with its own 5-second budget, so one hung
+dependency cannot starve another's or mask its state. `200` only when
+every check is `ok`; a `degraded` or `unready` check yields `503`.
+
 curl -s localhost:8080/health
 JSON
 
-{"status":"ok","checks":{"database":"ok","rpc":"ok"}}
+{"status":"ok","checks":{"database":{"status":"ok","latency_ms":1},"rpc":{"status":"ok","latency_ms":84}}}
+
+### `GET /livez`
+
+Liveness probe for the process alone. Always `200` while the process is
+running, and it never touches a dependency — a dead database must pull
+the instance from rotation via `/readyz`, not get the binary restarted.
+Its `checks` carries the single `process` entry and nothing else.
+
+curl -s localhost:8080/livez
+JSON
+
+{"status":"ok","checks":{"process":{"status":"ok","latency_ms":0}}}
+
+### `GET /readyz`
+
+Readiness probe: the same per-dependency envelope as `/health`, plus the
+`ingestion_lag` check. The thresholds that separate the states:
+
+- **`unready`** — a dependency gave no answer: it errored, or blew its
+  5-second per-check budget. Applies to the database, the RPC, the
+  ingestion-state row, and the chain head (needed for the lag check).
+- **`degraded`** — everything answered, but suboptimal: the RPC reports
+  `getHealth` status other than `healthy`, or ingestion is more than 100
+  ledgers behind the chain head.
+- **`ok`** — everything answered and within threshold.
+
+Both `degraded` and `unready` answer `503` — staleness and failure both
+pull the instance from rotation — and the split lives in the body so an
+operator knows whether to wait or to intervene. The full response shape
+is documented in [`api/openapi.yaml`](api/openapi.yaml).
+
+curl -s localhost:8080/readyz
+JSON
+
+{"status":"ok","checks":{"database":{"status":"ok","latency_ms":1},"rpc":{"status":"ok","latency_ms":84},"ingestion_lag":{"status":"ok","latency_ms":2}}}
+
 GET /events
 Lists stored events in ascending (oldest-first) or descending (newest-first) order. Defaults to ascending.
 
@@ -1747,7 +1831,8 @@ throttled like a regular client.
 Pushes ingested events to the client over a single WebSocket connection
 as soon as they are written to the store. There is no replay — the
 stream starts at "now", and the client only sees events the indexer
-ingests after it connects.
+ingests after it connects. See [Live Subscriptions](docs/subscriptions.md)
+for delivery guarantees, reconnection guidance, and the catch-up pattern.
 
 Query parameters share the same EventFilter shape as GET /events
 (contract_id, type, topic, from_ledger, to_ledger,
@@ -1873,7 +1958,9 @@ Read-only query endpoints (`GET /events`, `GET /events/{id}`,
 Keys look like `sorotrail_<prefix>_<secret>` and are presented via either
 the `Authorization: Bearer <key>` header or the `X-API-Key: <key>` header.
 Only a bcrypt hash of the secret is stored in Postgres — the full key is
-displayed exactly once at creation and cannot be recovered later.
+displayed exactly once at creation and cannot be recovered later. See
+[API Key Lifecycle and Scopes](docs/api-keys.md) for full documentation on
+bootstrap keys, scopes, rotation procedures, and backend constraints.
 
 ### Managing keys
 
@@ -2034,9 +2121,9 @@ in normal operation — so the API serves two distinct cache policies:
   at/above the frontier are still growing, so they get
   `Cache-Control: no-cache` — a deliberate "when in doubt, don't
   cache" choice rather than a guess with a short max-age.
-- **`GET /health`** and **`GET /stats`** are always
-  `Cache-Control: no-store` so monitoring tooling, dashboards, and
-  alerting see real state rather than a stale replica.
+- **`GET /health`**, **`GET /livez`**, **`GET /readyz`** and **`GET /stats`**
+  are always `Cache-Control: no-store` so monitoring tooling, dashboards,
+  and alerting see real state rather than a stale replica.
 
 All cacheable responses set `Vary: Accept-Encoding` so a future
 compression middleware (#25) can serve distinct encoded variants
