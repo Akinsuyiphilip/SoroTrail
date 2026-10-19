@@ -81,3 +81,9 @@ Once a fix is available the maintainer will:
 Please do not publish details of the vulnerability yourself until the
 advisory is out — coordinated disclosure protects downstream operators
 who haven't upgraded yet.
+
+## Community conduct
+
+This policy covers security vulnerabilities only. Code of conduct or
+community behaviour issues are handled through a separate channel — see
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
