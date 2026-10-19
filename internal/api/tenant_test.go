@@ -153,6 +153,91 @@ func (s *scopedStore) GetEventsByTxHash(_ context.Context, txHash, excludeID str
 	return out, nil
 }
 
+func (s *scopedStore) ListContracts(_ context.Context, f store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	s.record(f.Scope)
+	counts := map[string]*store.ContractSummary{}
+	var order []string
+	for _, e := range s.visible(f.Scope) {
+		if f.ContractIDPrefix != "" && !strings.HasPrefix(e.ContractID, f.ContractIDPrefix) {
+			continue
+		}
+		cs, ok := counts[e.ContractID]
+		if !ok {
+			cs = &store.ContractSummary{
+				ContractID:  e.ContractID,
+				FirstLedger: e.Ledger,
+				LastLedger:  e.Ledger,
+			}
+			counts[e.ContractID] = cs
+			order = append(order, e.ContractID)
+		}
+		cs.EventCount++
+		if e.Ledger < cs.FirstLedger {
+			cs.FirstLedger = e.Ledger
+		}
+		if e.Ledger > cs.LastLedger {
+			cs.LastLedger = e.Ledger
+		}
+	}
+	out := make([]store.ContractSummary, 0, len(order))
+	for _, id := range order {
+		out = append(out, *counts[id])
+	}
+	return out, "", nil
+}
+
+func (s *scopedStore) CountContracts(ctx context.Context, f store.ContractsFilter) (int64, error) {
+	items, _, err := s.ListContracts(ctx, f)
+	return int64(len(items)), err
+}
+
+func (s *scopedStore) GetContractSummary(_ context.Context, contractID string) (store.ContractSummary, error) {
+	var cs store.ContractSummary
+	for _, e := range s.events {
+		if e.ContractID != contractID {
+			continue
+		}
+		if cs.ContractID == "" {
+			cs.ContractID = contractID
+			cs.FirstLedger = e.Ledger
+			cs.LastLedger = e.Ledger
+		}
+		cs.EventCount++
+	}
+	if cs.ContractID == "" {
+		return store.ContractSummary{}, store.ErrNotFound
+	}
+	return cs, nil
+}
+
+func (s *scopedStore) CountContractEvents(_ context.Context, contractID string) (int64, error) {
+	var n int64
+	for _, e := range s.events {
+		if e.ContractID == contractID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *scopedStore) GetContractMeta(context.Context, string) (store.ContractMeta, error) {
+	return store.ContractMeta{}, store.ErrNotFound
+}
+
+func (s *scopedStore) ContractEventTypeCounts(_ context.Context, contractID string) ([]store.ContractEventTypeCount, error) {
+	byType := map[string]int64{}
+	for _, e := range s.events {
+		if e.ContractID == contractID {
+			byType[e.Type]++
+		}
+	}
+	var out []store.ContractEventTypeCount
+	for typ, count := range byType {
+		out = append(out, store.ContractEventTypeCount{Type: typ, Count: count})
+	}
+	return out, nil
+}
+
 // fakeTenants is an in-memory TenantStore covering the parts the API needs.
 type fakeTenants struct {
 	store.TenantStore
@@ -494,6 +579,51 @@ func TestCrossTenantLeakMatrix(t *testing.T) {
 			path:       "/events/ev-a1/transaction",
 			wantStatus: http.StatusOK,
 			wantHidden: []string{"ev-b1", contractB},
+		},
+		{
+			name:        "list contracts is scoped to tenant grants",
+			path:        "/contracts",
+			wantStatus:  http.StatusOK,
+			wantVisible: []string{contractA},
+			wantHidden:  []string{contractB, contractC},
+		},
+		{
+			name:        "get contract summary for own contract",
+			path:        "/contracts/" + contractA,
+			wantStatus:  http.StatusOK,
+			wantVisible: []string{contractA},
+			wantHidden:  []string{contractB, contractC},
+		},
+		{
+			name:       "get contract summary for another tenant's contract is refused",
+			path:       "/contracts/" + contractB,
+			wantStatus: http.StatusForbidden,
+			wantHidden: []string{`"event_count"`},
+		},
+		{
+			name:       "get contract summary for an ungranted contract is refused",
+			path:       "/contracts/" + contractC,
+			wantStatus: http.StatusForbidden,
+			wantHidden: []string{`"event_count"`},
+		},
+		{
+			name:        "contract stats for own contract",
+			path:        "/contracts/" + contractA + "/stats",
+			wantStatus:  http.StatusOK,
+			wantVisible: []string{contractA, `"event_count":2`},
+			wantHidden:  []string{contractB, contractC},
+		},
+		{
+			name:       "contract stats for another tenant's contract is refused",
+			path:       "/contracts/" + contractB + "/stats",
+			wantStatus: http.StatusForbidden,
+			wantHidden: []string{`"event_count"`},
+		},
+		{
+			name:       "contract stats for an ungranted contract is refused",
+			path:       "/contracts/" + contractC + "/stats",
+			wantStatus: http.StatusForbidden,
+			wantHidden: []string{`"event_count"`},
 		},
 	}
 
