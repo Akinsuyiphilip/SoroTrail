@@ -186,6 +186,11 @@ type stubStore struct {
 	subscriptions []store.Subscription
 
 	contractCursors map[string]store.ContractCursor
+
+	// specOverride is the last value SetContractSpecOverride stored, so
+	// tests can assert exactly which bytes reached the store.
+	specOverride   []byte
+	specOverrideID string
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -389,9 +394,11 @@ func (s *stubStore) DeleteSubscription(context.Context, int64, store.Subscriptio
 	return nil
 }
 func (s *stubStore) GetContractSpecOverride(context.Context, string) ([]byte, error) {
-	return nil, nil
+	return s.specOverride, nil
 }
-func (s *stubStore) SetContractSpecOverride(context.Context, string, []byte) error {
+func (s *stubStore) SetContractSpecOverride(_ context.Context, id string, data []byte) error {
+	s.specOverrideID = id
+	s.specOverride = data
 	return nil
 }
 func (s *stubStore) DeleteContractSpecOverride(context.Context, string) error {

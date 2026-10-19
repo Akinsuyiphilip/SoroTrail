@@ -51,14 +51,23 @@ const maxJSONBodyBytes = 4 << 10
 // check. On success dst is overwritten with the decoded value; on any
 // error it is left untouched. Error text never quotes the body's values.
 func decodeJSONBody(r *http.Request, dst any) error {
-	rv := reflect.ValueOf(dst)
-	if rv.Kind() != reflect.Pointer || rv.IsNil() {
-		return fmt.Errorf("decodeJSONBody: dst must be a non-nil pointer, got %T", dst)
+	body, err := readJSONBody(r)
+	if err != nil {
+		return err
 	}
+	return decodeJSONBytes(body, dst)
+}
+
+// readJSONBody reads the request body once, bounded by the same cap
+// decodeJSONBody applies. Handlers that must inspect the body more than
+// once (the spec-override PUT tries a wrapped and a bare shape) read it
+// here and decode from the returned bytes: r.Body is a stream, so every
+// reread would see an empty request.
+func readJSONBody(r *http.Request) ([]byte, error) {
 	// Server requests always carry a non-nil Body, so an absent body shows
 	// up as zero bytes below; the nil check covers hand-built requests.
 	if r.Body == nil {
-		return errors.New("request body is empty")
+		return nil, errors.New("request body is empty")
 	}
 
 	// Read one byte past the cap so an oversized body is reported as too
@@ -66,13 +75,24 @@ func decodeJSONBody(r *http.Request, dst any) error {
 	// At most maxJSONBodyBytes+1 bytes are ever buffered.
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes+1))
 	if err != nil {
-		return fmt.Errorf("reading request body: %w", err)
+		return nil, fmt.Errorf("reading request body: %w", err)
 	}
 	if len(body) > maxJSONBodyBytes {
-		return fmt.Errorf("request body exceeds %d bytes", maxJSONBodyBytes)
+		return nil, fmt.Errorf("request body exceeds %d bytes", maxJSONBodyBytes)
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
-		return errors.New("request body is empty")
+		return nil, errors.New("request body is empty")
+	}
+	return body, nil
+}
+
+// decodeJSONBytes decodes one already-read body into dst with the same
+// guarantees decodeJSONBody has always given: unknown fields rejected,
+// exactly one JSON value, and a half-populated dst never published.
+func decodeJSONBytes(body []byte, dst any) error {
+	rv := reflect.ValueOf(dst)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return fmt.Errorf("decodeJSONBytes: dst must be a non-nil pointer, got %T", dst)
 	}
 
 	// Decode into a scratch value and publish it only on success:
