@@ -5,11 +5,11 @@ go 1.26.9
 require (
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/coder/websocket v1.8.15
-	github.com/go-chi/chi/v5 v5.3.2
+	github.com/go-chi/chi/v5 v5.5.0
 	github.com/golang-migrate/migrate/v4 v4.20.1
 	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/minio/minio-go/v7 v7.3.0
+	github.com/minio/minio-go/v7 v7.4.1
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/stellar/go-stellar-sdk v0.7.3
@@ -61,13 +61,12 @@ require (
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/rogpeppe/go-internal v1.15.0 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.6 // indirect
-	github.com/sirupsen/logrus v1.9.4 // indirect
+	github.com/sirupsen/logrus v1.10.2 // indirect
 	github.com/stellar/go-xdr v0.0.0-20260806060815-dc590f17552a // indirect
 	github.com/tklauser/go-sysconf v0.4.0 // indirect
 	github.com/tklauser/numcpus v0.12.0 // indirect
-	github.com/vektah/gqlparser/v2 v2.5.62
+	github.com/vektah/gqlparser/v2 v2.5.63
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
