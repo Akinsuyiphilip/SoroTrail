@@ -2350,7 +2350,7 @@ func TestIngester_LateContractBackfillsWhileOthersContinue(t *testing.T) {
 
 	// Contract A is already being watched (has a cursor at ledger 500).
 	st := newMockStore()
-	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.AddWatchedContract(context.Background(), store.WatchedContract{ContractID: contractA}))
 	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
 		ContractID:         contractA,
 		LastIngestedLedger: 500,
@@ -2387,8 +2387,8 @@ func TestIngester_PerContractCursorsAdvanceIndependently(t *testing.T) {
 	contractB := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
 	st := newMockStore()
-	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
-	require.NoError(t, st.AddWatchedContract(context.Background(), contractB))
+	require.NoError(t, st.AddWatchedContract(context.Background(), store.WatchedContract{ContractID: contractA}))
+	require.NoError(t, st.AddWatchedContract(context.Background(), store.WatchedContract{ContractID: contractB}))
 
 	// Contract A is behind (at ledger 100), contract B is already caught up (at ledger 500).
 	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
@@ -2437,8 +2437,8 @@ func TestIngester_ReclampAffectsAllInSharedBatch(t *testing.T) {
 	contractB := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
 	st := newMockStore()
-	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
-	require.NoError(t, st.AddWatchedContract(context.Background(), contractB))
+	require.NoError(t, st.AddWatchedContract(context.Background(), store.WatchedContract{ContractID: contractA}))
+	require.NoError(t, st.AddWatchedContract(context.Background(), store.WatchedContract{ContractID: contractB}))
 
 	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
 		ContractID:         contractA,
@@ -2478,8 +2478,8 @@ func TestIngester_WatchedCursorResumeAcrossRestart(t *testing.T) {
 	contractB := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
 	st := newMockStore()
-	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
-	require.NoError(t, st.AddWatchedContract(context.Background(), contractB))
+	require.NoError(t, st.AddWatchedContract(context.Background(), store.WatchedContract{ContractID: contractA}))
+	require.NoError(t, st.AddWatchedContract(context.Background(), store.WatchedContract{ContractID: contractB}))
 
 	evA1 := rpcEvent("ea-1", 100)
 	evA1.ContractID = contractA
