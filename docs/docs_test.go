@@ -204,6 +204,19 @@ func TestRequiredSections(t *testing.T) {
 				"## When to use GraphQL instead of REST",
 			},
 		},
+		{
+			doc: "spec-overrides.md",
+			headings: []string{
+				"## When an override is needed",
+				"## Authentication",
+				"## Endpoints",
+				"## Accepted JSON format",
+				"## Validation rules and error messages",
+				"## Wrapper vs. bare request body",
+				"## Precedence and contract upgrades",
+				"## Caching and propagation timing",
+			},
+		},
 	}
 
 	for _, tt := range tests {
