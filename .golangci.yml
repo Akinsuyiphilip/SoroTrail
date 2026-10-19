@@ -1,7 +1,9 @@
 version: "2"
 linters:
   enable:
+    - bodyclose
     - misspell
+    - rowserrcheck
     - unconvert
   exclusions:
     generated: lax
@@ -24,7 +26,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/khaylebfortune/sorotrail
+        - github.com/sorotrail/sorotrail
   exclusions:
     generated: lax
     paths:

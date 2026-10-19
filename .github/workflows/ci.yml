@@ -5,60 +5,526 @@ on:
     branches: [main]
   pull_request:
 
+# Minimal token scope; CI only reads repo contents and uploads caches.
+permissions:
+  contents: read
+
 jobs:
-  test:
+  # Issue #547: a duplicate migration version is a merge-time hazard, not an
+  # authoring one — two branches both take "the next number", both merge, and
+  # the embedded series then refuses to load (golang-migrate's iofs errors on
+  # the colliding version), which fails every database-backed test at once.
+  # The assertion lives in internal/store/migrate_test.go and needs no
+  # database, but it only ran as part of the full suite, so the contributor
+  # who caused it found out late and behind unrelated failures. This job runs
+  # it on its own: no services, no Postgres, seconds of wall clock, and the
+  # failure names both colliding files.
+  migrations:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        id: go
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
+      - name: Check migration version numbers are unique
+        run: make migrations-check
+
+  test-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # Report both Postgres versions even when one fails. With the default
+      # fail-fast the surviving leg is cancelled, so a contributor sees
+      # "test-matrix (16) failure, test-matrix (15) cancelled" and cannot tell
+      # whether the break is version-specific or general — and a failure that
+      # only shows on the cancelled version is hidden entirely. Gating is
+      # unaffected: the aggregate `test` job below still requires every leg.
+      fail-fast: false
+      matrix:
+        postgres-version: ["15", "16"]
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.postgres-version }}-alpine
+        env:
+          POSTGRES_USER: sorotrail
+          POSTGRES_PASSWORD: sorotrail
+          POSTGRES_DB: sorotrail
+        # Map to a non-default host port so the runner's own services
+        # (and any pre-installed Postgres on 5432) can't shadow ours.
+        ports:
+          - "5433:5432"
+        options: >-
+          --health-cmd "pg_isready -U sorotrail -d sorotrail"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        id: go
+        with:
+          go-version-file: go.mod
+          # Every job that compiles Go uses this same block plus the matching
+          # actions/cache step, instead of setup-go's built-in `cache: true`.
+          # Its cache key is derived from the runner OS, the Go version and
+          # go.sum alone, so a job that builds with `-tags=integration` and a
+          # job that builds without any tags land on one slot. The build cache
+          # is content-addressed, so that never yields a wrong build, but the
+          # two flavours do re-save over each other run after run instead of
+          # each keeping a stable hit. Adding the tag flavour to the key gives
+          # them separate entries; `restore-keys` narrows only along go.sum, so
+          # a dependency bump still restores the previous cache. setup-go's own
+          # caching is off so the two mechanisms do not race to restore and
+          # then overwrite the same directories.
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      # Fails in seconds with an actionable message when a contributor edited
+      # api/openapi.yaml without running `make spec`. pkg/docs' drift test
+      # catches the same staleness later in the suite; this step exists so the
+      # signal arrives before the ten-minute test run, not buried in its output.
+      - name: Verify generated OpenAPI JSON is current
+        run: make spec-check
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -p 5433 -U sorotrail -d sorotrail; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Postgres did not become ready in time" >&2
+          exit 1
+      # -p 1 serializes packages: the integration tests in internal/store
+      # and internal/replay share one database and truncate the same tables.
+      # -race catches data races inside a single package's test binary.
+      #
+      # The command itself lives in the Makefile's cover-ci target so the
+      # exact CI coverage profile can be reproduced locally with one make
+      # target instead of transcribing flags out of this workflow. The
+      # coverage job below merges the resulting profile with the integration
+      # legs' so tagged-only code counts as covered.
+      #
+      # TEST_DATABASE_URL also drives the store conformance suite, which runs
+      # the same assertions against every backend it can reach: SQLite always
+      # (no server), and Postgres via the variable set here. ClickHouse is
+      # registered in the same table but skips cleanly unless TEST_CLICKHOUSE_URL
+      # is set, so a backend without a service in this job never fails it.
+      - name: Test (with Postgres integration tests)
+        run: make cover-ci
+        env:
+          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-pg${{ matrix.postgres-version }}
+          path: coverage.out
+          retention-days: 5
+      - name: Verify Benchmarks (compilation and short run)
+        run: make bench-ci
+
+  # Branch protection on main requires a status check named `test`. A matrix
+  # job never reports that name — it reports `test (15)` and `test (16)` —
+  # so the required context stayed permanently "Expected — Waiting for
+  # status to be reported" and no pull request could ever merge on its own
+  # merits. This aggregate reports the name protection asks for and passes
+  # only when every matrix leg passed, so the rule keeps working if the
+  # matrix later gains or drops a Postgres version.
+  test:
+    runs-on: ubuntu-latest
+    needs: [migrations, test-matrix]
+    if: always()
+    steps:
+      - name: Report matrix result
+        run: |
+          result='${{ needs.test-matrix.result }}'
+          echo "test-matrix result: $result"
+          if [ "$result" != "success" ]; then
+            echo "::error::one or more test-matrix legs did not succeed"
+            exit 1
+          fi
+      # The migration gate is also folded into the required `test` context. On
+      # its own the `migrations` job only reports a red check; a colliding
+      # version number makes every database-backed test fail later, so nothing
+      # should merge while it is broken.
+      - name: Report migration gate result
+        run: |
+          result='${{ needs.migrations.result }}'
+          echo "migrations result: $result"
+          if [ "$result" != "success" ]; then
+            echo "::error::the migration series is not loadable (see the migrations job)"
+            exit 1
+          fi
+
+  # Issue #9: separate CI job for the integration test layer gated behind
+  # the `integration` build tag. Same Postgres service as the `test-matrix` job;
+  # `-p 1` is required because internal/store and internal/replay
+  # integration tests share the database and truncate the same tables.
+  #
+  # Issue #548: the schema uses partitioned tables, GIN indexes on JSONB and
+  # partial indexes, and the planner treats those differently between major
+  # versions, so the tagged suite runs against the same Postgres matrix as the
+  # unit suite. Pinning this job to one version meant a query plan that only
+  # regressed on the other supported release reached main untested.
+  # integration test workflow
+  integration-matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      # As in `test-matrix`: report every leg rather than cancelling the
+      # survivors, so a break that only shows on one Postgres version is not
+      # hidden behind a cancelled job.
+      fail-fast: false
+      matrix:
+        postgres-version: ["15", "16"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres-version }}-alpine
         env:
           POSTGRES_USER: sorotrail
           POSTGRES_PASSWORD: sorotrail
           POSTGRES_DB: sorotrail
         ports:
-          - 5432:5432
+          - "5433:5432"
         options: >-
           --health-cmd "pg_isready -U sorotrail"
           --health-interval 2s
           --health-timeout 2s
           --health-retries 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        id: go
         with:
           go-version-file: go.mod
-      - name: Build
-        run: go build ./...
-      - name: Vet
-        run: go vet ./...
-      - name: Test (with Postgres integration tests)
-        # -p 1 serializes packages: the integration tests in internal/store
-        # and internal/replay share one database and truncate the same tables.
-        run: go test -p 1 ./... -count=1
+          # See the `test-matrix` job for why caching is an explicit step and
+          # not setup-go's built-in one. This job is the reason the key needs a
+          # tag flavour: everything it compiles is built with
+          # `-tags=integration`, so its entries are keyed apart from the
+          # untagged builds and neither flavour waits on the other's save.
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-integration-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-integration-
+      - name: Build (integration tag)
+        run: go build -tags=integration ./...
+      - name: Vet (integration tag)
+        run: go vet -tags=integration ./...
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -p 5433 -U sorotrail -d sorotrail; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Postgres did not become ready in time" >&2
+          exit 1
+      - name: Migration safety gate (Postgres ${{ matrix.postgres-version }})
+        # Exercise the up → down → up round-trip to verify every migration
+        # reverses cleanly and re-applies identically. This is the most
+        # valuable safety check: a broken down migration is invisible until
+        # a rollback is needed in production.
+        #
+        # The version is in the step name as well as the job name: a red check
+        # row is read as `integration-matrix (16) > Migration safety gate
+        # (Postgres 16)`, which says which release broke without opening the
+        # log.
+        run: >
+          go test -tags=integration -p 1 -count=1 -run
+          'TestMigrate_UpFromEmpty|TestMigrate_DownFromHead|TestMigrate_UpDownUpRoundTrip|TestMigrate_EachDownReversesItsUp'
+          ./internal/store/...
         env:
-          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
+          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
+      - name: Run integration tests (Postgres ${{ matrix.postgres-version }})
+        # The integration tests cover:
+        #   1. migration up from empty
+        #     (internal/store/store_integration_test.go)
+        #   2. event upsert idempotency — same TOID twice → one row
+        #     (internal/store/events_integration_test.go)
+        #   3. ingestion_state save/resume across ingester restart
+        #     (internal/ingester/integration_test.go)
+        #   4. GET /events filter combinations against seeded data
+        #     (internal/api/api_integration_test.go)
+        # -p 1 because the integration tests in internal/store and
+        # internal/replay share the service Postgres and TRUNCATE the
+        # same tables between tests.
+        #
+        # The command lives in the Makefile's cover-integration-ci target
+        # (see the test-matrix comment). The profile it writes is merged
+        # with the unit legs' by the coverage job, so migrations and the
+        # store/ingester paths that only run against a real Postgres count
+        # as covered instead of looking untested.
+        run: make cover-integration-ci
+        env:
+          TEST_DATABASE_URL: postgres://sorotrail:sorotrail@localhost:5433/sorotrail?sslmode=disable
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-int-pg${{ matrix.postgres-version }}
+          path: coverage.out
+          retention-days: 5
+
+  # Same aggregate-for-matrix pattern as `test` above: the integration check
+  # that tooling and reviewers look for keeps its name, and it passes only when
+  # every Postgres leg passed. Without it the required context would be reported
+  # as `integration-matrix (15)` / `(16)` and a rule asking for `integration`
+  # would sit at "Expected" forever.
+  integration:
+    runs-on: ubuntu-latest
+    needs: integration-matrix
+    if: always()
+    steps:
+      - name: Report matrix result
+        run: |
+          result='${{ needs.integration-matrix.result }}'
+          echo "integration-matrix result: $result"
+          if [ "$result" != "success" ]; then
+            echo "::error::one or more integration-matrix legs did not succeed"
+            exit 1
+          fi
+
+  # Reports a whole-module coverage figure on every pull request (issue
+  # #552). It waits for both test matrices because the unit legs and the
+  # integration-tagged legs cover disjoint sets of paths: migrations and the
+  # database-backed store/ingester code only compile behind the integration
+  # tag, so a unit-only profile makes them look untested.
+  coverage:
+    runs-on: ubuntu-latest
+    needs: [test-matrix, integration-matrix]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          # No actions/cache step here, unlike the jobs that compile: this job
+          # downloads the matrix legs' coverage profiles and hands them to
+          # Codecov without running a Go build command of its own, so a cached
+          # tree would be restored and saved unchanged — spending the workflow's
+          # 10 GB cache quota for no hit. setup-go is left in place because a
+          # Go toolchain is what this job has always assumed; only its caching
+          # is switched off.
+          cache: false
+      # Each artifact lands in its own subdirectory (no merge-multiple) so
+      # the four coverage.out files do not overwrite each other before the
+      # merge below sees them — that silent last-writer-wins is exactly the
+      # gap issue #552 was opened about.
+      - name: Download all coverage artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: coverage-*
+          path: coverage-artifacts
+      # Sum the hit counts rather than picking one profile: a statement
+      # exercised by either suite must stay covered in the merged figure.
+      # The total is advisory for now — no threshold blocks the PR.
+      - name: Merge coverage profiles
+        run: |
+          ./scripts/merge_coverage.sh coverage.out coverage-artifacts/*/coverage.out
+          echo "Merged total: $(go tool cover -func=coverage.out | tail -n 1)"
+      - name: Write coverage summary
+        run: |
+          total=$(go tool cover -func=coverage.out | tail -n 1 | awk '{print $3}')
+          {
+            echo "### Test coverage"
+            echo ""
+            echo "Total: **${total}** (unit and integration-tagged suites, Postgres 15 and 16, merged)"
+            echo ""
+            echo "Advisory only for now — no threshold blocks this pull request."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload merged coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-merged
+          path: coverage.out
+          retention-days: 5
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: coverage.out
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        id: go
         with:
           go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@v8
+          # See `test-matrix` for why setup-go's own caching is off. This job
+          # compiles Go (the linter type-checks the whole module), so it gets
+          # the same explicit cache step as the other jobs that build —
+          # golangci-lint-action only archives `~/.cache/golangci-lint` and
+          # leaves the Go caches to whoever set up Go.
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
         with:
-          version: v2.12.2
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
+      # A `toolchain` directive can land in go.mod by accident when a newer local
+      # Go runs `go get` / `go mod tidy`. The pinned linter below was built with
+      # an older Go and refuses to start when go.mod targets a newer one, so fail
+      # here with the fix spelled out rather than in golangci-lint's own words.
+      - name: Guard against golangci-lint / Go toolchain drift
+        run: ./scripts/check_lint_toolchain.sh
+      # The pin lives in .golangci-lint-version so the workflow and `make lint`
+      # cannot disagree about which release runs. Dependabot bumps this action's
+      # ref but not its `version:` input, so the pin is a manual bump.
+      - name: Read the pinned golangci-lint version
+        id: lint_pin
+        run: echo "version=$(./scripts/check_lint_toolchain.sh --print-version)" >> "$GITHUB_OUTPUT"
+      - uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: ${{ steps.lint_pin.outputs.version }}
+      # Confirm the Go version recorded alongside the pin matches the release the
+      # action actually installed, so the record cannot rot. always() so it still
+      # reports when the lint step above failed.
+      - name: Verify the pinned release matches the recorded Go version
+        if: always()
+        run: ./scripts/check_lint_toolchain.sh --verify-binary
+
+  # Issue #480: commit 4653a66 was titled "add Dependabot and govulncheck to
+  # dependency management", but only the Dependabot half landed, so dependency
+  # CVEs went unreported. This is that missing half. govulncheck's default
+  # symbol scan fails the build (exit status 3) only when a known vulnerability
+  # is reachable from code the module actually builds, which keeps the check
+  # actionable instead of red on every unused transitive advisory.
+  #
+  # `go run ...@latest` keeps the scanner out of go.mod, so the module under
+  # scan is the project's own dependency set and nothing has to be reviewed and
+  # bumped to get a newer scanner. Two things follow from that. A future x/vuln
+  # release needing a newer Go than go.mod targets fails here as a `go run`
+  # error naming the version, which is the prompt to move go.mod forward rather
+  # than a silent hole. And because the standard library is scanned at the exact
+  # patch go.mod names, that directive has to stay on a patched 1.26.x; see the
+  # comment on the setup-go step below.
+  vulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        id: go
+        with:
+          go-version-file: go.mod
+          # setup-go installs the exact patch named by go.mod's `go` directive
+          # rather than the newest release of that minor, so the version pinned
+          # there is what gets scanned — including its standard library. Keeping
+          # the directive on the newest 1.26 patch is what keeps this job green;
+          # an older patch brings back reachable stdlib advisories that no
+          # dependency bump can fix. setup-go's own caching is off for the same
+          # reason as in the other jobs that compile (see `test-matrix`), and
+          # govulncheck type-checks the untagged module, so it shares the
+          # `plain` cache flavour.
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # Issue #550: docker-publish.yml only builds once a tag is pushed, so a
+  # Dockerfile change that broke the image was discovered on main, after the
+  # merge. The Dockerfile is multi-stage and cross-compiles, so it has ways
+  # to break that `go build ./...` in the test job will never catch. This job
+  # builds the same image on every PR — without pushing it.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      # Same action versions and platforms as the publish workflow so the two
+      # builds stay comparable. QEMU is only needed for the tiny final stage
+      # (apk + COPY): the build stage declares --platform=$BUILDPLATFORM and
+      # cross-compiles natively, so it does not run under emulation.
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      # No build args, tags or registry login: docker-publish.yml passes none
+      # either (the Dockerfile's ARGs default to "unknown" and the tags come
+      # from docker/metadata-action at publish time), so this build exercises
+      # the same defaults the published image gets.
+      - name: Build image (amd64 + arm64, nothing pushed)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          # Restore the cache the pushes to main populate. Cache *export* is
+          # restricted to push events on purpose: a pull request from a fork
+          # runs with a read-only token, and a denied cache upload fails the
+          # whole build instead of degrading to a cold one. Reading the base
+          # branch's cache is allowed for fork PRs, so they still build warm.
+          cache-from: type=gha
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
 
   helm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
         with:
           version: v3.15.0
-      - name: Helm lint
+      - name: Helm lint (defaults)
         run: helm lint deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db
-      - name: Helm template render
+      - name: Helm lint (invalid value — schema must reject)
+        run: |
+          if helm lint deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db --set replicaCount=not-a-number; then
+            echo "::error::Schema validation did not reject invalid replicaCount"
+            exit 1
+          fi
+      # A misspelled key is the failure mode the schema exists for and the
+      # one template syntax checks cannot see: helm silently ignores unknown
+      # values, so without this gate an operator's typo would deploy the
+      # chart with the default and the setting would never take effect.
+      - name: Helm lint (unknown value — schema must reject)
+        run: |
+          if helm lint deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db --set replicaCont=2; then
+            echo "::error::Schema validation did not reject unknown value replicaCont"
+            exit 1
+          fi
+      - name: Helm template render (defaults)
         run: helm template sorotrail deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db > /dev/null
 
   monitoring:
@@ -82,3 +548,31 @@ jobs:
       # instead of shipping as a silently dead alert or blank panel.
       - name: Validate Prometheus rules and Grafana dashboard
         run: make check-monitoring
+      - name: Helm template render (existing secret)
+        run: |
+          helm template sorotrail deploy/helm/sorotrail \
+            --set database.existingSecret=my-db-secret \
+            > /dev/null
+      - name: Helm template render (production values)
+        run: |
+          helm template sorotrail deploy/helm/sorotrail \
+            --set database.url=postgres://user:pass@host:5432/db \
+            --set replicaCount=3 \
+            --set pdb.enabled=true \
+            --set pdb.minAvailable=1 \
+            --set config.rpcUrl=https://soroban-mainnet.stellar.org \
+            --set config.logLevel=warn \
+            --set config.enableMetrics=true \
+            --set serviceMonitor.enabled=true \
+            --set resources.requests.cpu=250m \
+            --set resources.requests.memory=256Mi \
+            --set resources.limits.cpu=1000m \
+            --set resources.limits.memory=512Mi \
+            > /dev/null
+      - name: Helm template render (minimal overrides)
+        run: |
+          helm template sorotrail deploy/helm/sorotrail \
+            --set database.url=postgres://user:pass@host:5432/db \
+            --set image.tag=v1.2.3 \
+            --set config.watchedContracts=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
+            > /dev/null
