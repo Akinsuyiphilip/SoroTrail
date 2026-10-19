@@ -7,11 +7,15 @@ import (
 	"math"
 	"math/rand/v2"
 	"net"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
+
+	"github.com/sorotrail/sorotrail/internal/metrics"
+	"github.com/sorotrail/sorotrail/internal/requestid"
 )
 
 // ErrAllProvidersDown is returned when every provider is unhealthy and the
@@ -61,6 +65,10 @@ func (s ProviderState) String() string {
 type provider struct {
 	client Client
 	url    string
+	// label is the Prometheus-safe, credential-free identifier for this
+	// provider (its hostname). RPC URLs may carry basic-auth credentials,
+	// and raw URLs must never appear as metric labels.
+	label string
 
 	state    atomic.Int32 // ProviderState
 	errCount atomic.Int32 // consecutive errors (resets on success)
@@ -163,12 +171,39 @@ func NewFailoverClient(urls []string, rateLimitRPS float64, newClient func(url s
 		fc.providers[i] = &provider{
 			client:  newClient(u, rateLimitRPS),
 			url:     u,
+			label:   providerLabel(u),
 			limiter: rate.NewLimiter(rate.Limit(bucketRPS), burst),
 		}
 		// Start active.
-		fc.providers[i].state.Store(int32(StateActive))
+		fc.setProviderState(fc.providers[i], StateActive)
 	}
 	return fc
+}
+
+// providerLabel derives a bounded, credential-free Prometheus label from a
+// provider URL: scheme, userinfo (basic-auth credentials), path, and query
+// are stripped — only the hostname remains. Malformed or empty URLs fall
+// back to "unknown" so a label is always present and never leaks secrets.
+func providerLabel(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return "unknown"
+	}
+	return u.Hostname()
+}
+
+// setProviderState records a provider's health state and republishes the
+// per-provider state gauge (1 on the new state, 0 on every other) so
+// /metrics always reflects the live provider set.
+func (fc *FailoverClient) setProviderState(p *provider, s ProviderState) {
+	p.state.Store(int32(s))
+	for _, st := range []ProviderState{StateActive, StateDegraded, StateDown} {
+		v := 0.0
+		if st == s {
+			v = 1
+		}
+		metrics.RPCProviderState.WithLabelValues(p.label, st.String()).Set(v)
+	}
 }
 
 // getActive returns the highest-priority active provider, or -1 if none.
@@ -226,7 +261,8 @@ func (fc *FailoverClient) pickProvider(ctx context.Context) (*provider, int, err
 	// exponential backoff (capped at 30s) with jitter.
 	fc.allDownCount.Add(1)
 	fc.allDownUntil.Store(time.Now().Add(fc.allDownBackoff()).UnixNano())
-	fc.log.Error("all RPC providers are down", "backoff", fc.allDownBackoff())
+	fc.log.Error("all RPC providers are down",
+		append(requestid.Attrs(ctx), "backoff", fc.allDownBackoff())...)
 	return nil, -1, ErrAllProvidersDown
 }
 
@@ -258,6 +294,7 @@ func (fc *FailoverClient) recordSuccess(idx int) {
 
 	prev := fc.lastActive.Swap(int32(idx))
 	if prev != int32(idx) && prev != -1 {
+		metrics.RPCFailoversTotal.WithLabelValues("switch").Inc()
 		fc.log.Info("failover provider switched",
 			"from", fc.providers[prev].url,
 			"to", p.url)
@@ -268,14 +305,14 @@ func (fc *FailoverClient) recordSuccess(idx int) {
 	if s == StateDegraded || s == StateDown {
 		if p.okCount.Add(1) >= int32(fc.probationSuccesses) {
 			p.okCount.Store(0)
-			p.state.Store(int32(StateActive))
+			fc.setProviderState(p, StateActive)
 			p.errCount.Store(0)
 			fc.log.Info("provider promoted", "url", p.url, "state", "active")
 		}
 	}
 }
 
-func (fc *FailoverClient) recordError(idx int, err error) {
+func (fc *FailoverClient) recordError(ctx context.Context, idx int, err error) {
 	p := fc.providers[idx]
 
 	// Semantic errors do NOT demote. IsLedgerOutOfRange means the provider
@@ -295,14 +332,16 @@ func (fc *FailoverClient) recordError(idx int, err error) {
 	c := p.errCount.Add(1)
 	oldState := ProviderState(p.state.Load())
 
+	// A demotion is an RPC failure, so the line carries the correlation id
+	// of whichever request or job drove the call.
 	if oldState == StateActive && c >= int32(fc.maxConsecutiveErrors) {
-		p.state.Store(int32(StateDegraded))
-		fc.log.Warn("provider degraded", "url", p.url,
-			"consecutive_errors", c, "state", "degraded")
+		fc.setProviderState(p, StateDegraded)
+		fc.log.Warn("provider degraded",
+			append(requestid.Attrs(ctx), "url", p.url, "consecutive_errors", c, "state", "degraded")...)
 	} else if oldState == StateDegraded && c >= int32(fc.maxConsecutiveErrors*2) {
-		p.state.Store(int32(StateDown))
-		fc.log.Error("provider down", "url", p.url,
-			"consecutive_errors", c, "state", "down")
+		fc.setProviderState(p, StateDown)
+		fc.log.Error("provider down",
+			append(requestid.Attrs(ctx), "url", p.url, "consecutive_errors", c, "state", "down")...)
 	}
 }
 
@@ -384,6 +423,7 @@ func (fc *FailoverClient) GetEvents(ctx context.Context, req GetEventsRequest) (
 	// and we're about to use a different provider than the one that set
 	// the cursor, signal the caller to re-anchor from ledger position.
 	if hasCursor && fc.lastActive.Load() != -1 && fc.lastActive.Load() != int32(idx) {
+		metrics.RPCFailoversTotal.WithLabelValues("reanchor").Inc()
 		fc.log.Warn("provider switch with active cursor — re-anchor required",
 			"new_provider", p.url)
 		return GetEventsResponse{}, ErrFailoverReanchor
@@ -394,7 +434,7 @@ func (fc *FailoverClient) GetEvents(ctx context.Context, req GetEventsRequest) (
 	}
 	resp, err := p.client.GetEvents(ctx, req)
 	if err != nil {
-		fc.recordError(idx, err)
+		fc.recordError(ctx, idx, err)
 		return resp, err
 	}
 	fc.recordSuccess(idx)
@@ -411,7 +451,7 @@ func (fc *FailoverClient) GetLatestLedger(ctx context.Context) (LatestLedger, er
 	}
 	resp, err := p.client.GetLatestLedger(ctx)
 	if err != nil {
-		fc.recordError(idx, err)
+		fc.recordError(ctx, idx, err)
 		return resp, err
 	}
 	fc.recordSuccess(idx)
@@ -428,7 +468,7 @@ func (fc *FailoverClient) GetHealth(ctx context.Context) (Health, error) {
 	}
 	resp, err := p.client.GetHealth(ctx)
 	if err != nil {
-		fc.recordError(idx, err)
+		fc.recordError(ctx, idx, err)
 		return resp, err
 	}
 	fc.recordSuccess(idx)
@@ -445,7 +485,7 @@ func (fc *FailoverClient) GetLedgerEntries(ctx context.Context, req GetLedgerEnt
 	}
 	resp, err := p.client.GetLedgerEntries(ctx, req)
 	if err != nil {
-		fc.recordError(idx, err)
+		fc.recordError(ctx, idx, err)
 		return resp, err
 	}
 	fc.recordSuccess(idx)
@@ -462,7 +502,7 @@ func (fc *FailoverClient) SimulateTransaction(ctx context.Context, req SimulateT
 	}
 	resp, err := p.client.SimulateTransaction(ctx, req)
 	if err != nil {
-		fc.recordError(idx, err)
+		fc.recordError(ctx, idx, err)
 		return resp, err
 	}
 	fc.recordSuccess(idx)
@@ -506,14 +546,15 @@ func (fc *FailoverClient) probeDownProviders(ctx context.Context) {
 		}
 		_, err := p.client.GetHealth(ctx)
 		if err != nil {
-			fc.log.Debug("provider probe failed", "url", p.url, "error", err)
+			fc.log.Debug("provider probe failed",
+				append(requestid.Attrs(ctx), "url", p.url, "error", err)...)
 			continue
 		}
 		// Successful probe: advance probation counter.
 		if p.okCount.Add(1) >= int32(fc.probationSuccesses) {
 			p.okCount.Store(0)
 			p.errCount.Store(0)
-			p.state.Store(int32(StateActive))
+			fc.setProviderState(p, StateActive)
 			fc.log.Info("provider promoted after probe", "url", p.url, "state", "active")
 		} else {
 			fc.log.Debug("provider probation progress", "url", p.url,

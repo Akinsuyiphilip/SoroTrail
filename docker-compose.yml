@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
+    profiles: [dev, test, prod]
     environment:
       POSTGRES_USER: sorotrail
       POSTGRES_PASSWORD: sorotrail
@@ -20,6 +21,7 @@ services:
 
   indexer:
     build: .
+    profiles: [dev, prod]
     depends_on:
       postgres:
         # Real readiness gating: the indexer doesn't start until
@@ -33,10 +35,16 @@ services:
       POLL_INTERVAL: ${POLL_INTERVAL:-5s}
       HTTP_ADDR: ":8080"
       WATCHED_CONTRACTS: ${WATCHED_CONTRACTS:-}
+      RETENTION_AGE: ${RETENTION_AGE:-}
+      RETENTION_POLL_INTERVAL: ${RETENTION_POLL_INTERVAL:-1h}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Forwarded from the shell so traces reach the profile-gated Jaeger
+      # (e.g. OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318) without
+      # editing this file. Unset = tracing is a no-op.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     ports:
       - "8080:8080"
-    # Probe `/health` using the same binary already shipped in the
+    # Probe `/readyz` using the same binary already shipped in the
     # image (the docker HEALTHCHECK directive sets this; repeat it
     # here so users running against a published image — where the
     # Dockerfile is authoritative — see the same shape in compose).
@@ -51,13 +59,31 @@ services:
         - "sorotrail"
         - "healthcheck"
         - "--endpoint"
-        - "/health"
+        - "/readyz"
         - "--timeout"
         - "3s"
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 30s
+    restart: unless-stopped
+
+  # Jaeger all-in-one for viewing OpenTelemetry traces locally. Gated
+  # behind the `dev` profile so test and prod environments stay lean.
+  # SoroTrail's OTLP
+  # exporter (OTEL_EXPORTER_OTLP_ENDPOINT) sends spans here, and the UI
+  # is served from http://localhost:16686.
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    profiles:
+      - dev
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4318:4318" # OTLP over HTTP
+    environment:
+      # Enable the OTLP HTTP receiver so SoroTrail's otlptracehttp exporter
+      # (which talks plain HTTP, not gRPC) can reach it on port 4318.
+      COLLECTOR_OTLP_ENABLED: "true"
     restart: unless-stopped
 
 volumes:

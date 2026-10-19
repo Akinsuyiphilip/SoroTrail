@@ -4,10 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
-	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source"
-	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
 // MigrationStatus describes the state of the database migration set.
@@ -17,38 +16,33 @@ type MigrationStatus struct {
 	Pending []uint
 }
 
-// GetMigrationStatus reports the database's current migration version and
+// GetMigrationStatus reports the database's current migration version and the
 // migrations that have not yet been applied. It does not modify the database.
+//
+// It is the historical entry point for this information and now delegates to
+// MigrateStatus, which works for both the Postgres and SQLite series (the
+// previous implementation only handled a URL registered with the default
+// golang-migrate database drivers).
 func GetMigrationStatus(databaseURL string) (MigrationStatus, error) {
-	migrationSource, err := iofs.New(postgresMigrationsFS, "migrations")
+	return MigrateStatus(databaseURL)
+}
+
+// CountEmbeddedMigrations returns the total number of embedded migration
+// versions (the count of .up.sql files). This is used by the schema-inspect
+// command to compare the applied version against the embedded set without
+// opening a database connection.
+func CountEmbeddedMigrations() (int, error) {
+	entries, err := postgresMigrationsFS.ReadDir("migrations")
 	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("opening migrations: %w", err)
+		return 0, fmt.Errorf("reading embedded migrations: %w", err)
 	}
-
-	m, err := migrate.NewWithSourceInstance("iofs", migrationSource, databaseURL)
-	if err != nil {
-		_ = migrationSource.Close()
-		return MigrationStatus{}, fmt.Errorf("creating migration client: %w", err)
+	count := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".up.sql") {
+			count++
+		}
 	}
-	defer func() {
-		_, _ = m.Close()
-	}()
-
-	version, dirty, err := m.Version()
-	if err != nil && !errors.Is(err, migrate.ErrNilVersion) {
-		return MigrationStatus{}, fmt.Errorf("reading migration version: %w", err)
-	}
-	if errors.Is(err, migrate.ErrNilVersion) {
-		version = 0
-		dirty = false
-	}
-
-	pending, err := migrationVersions(migrationSource, version)
-	if err != nil {
-		return MigrationStatus{}, fmt.Errorf("reading available migrations: %w", err)
-	}
-
-	return MigrationStatus{Version: version, Dirty: dirty, Pending: pending}, nil
+	return count, nil
 }
 
 func migrationVersions(migrationSource source.Driver, current uint) ([]uint, error) {

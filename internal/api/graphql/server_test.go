@@ -1,13 +1,18 @@
 package graphql
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/api"
 )
 
 // Every failure on the /graphql and /graphiql surface answers through
@@ -41,6 +46,104 @@ func TestDisabledPlaygroundAnswersInTheEnvelope(t *testing.T) {
 	h.PlaygroundHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/graphiql", nil))
 
 	require.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assertGraphQLErrorEnvelope(t, rec)
+}
+
+func TestEnabledPlaygroundServesGraphiQL(t *testing.T) {
+	h, err := New(api.ServerDeps{Store: &stubStore{}}, slog.New(slog.NewTextHandler(io.Discard, nil)), true)
+	require.NoError(t, err)
+
+	rec := httptest.NewRecorder()
+	h.PlaygroundHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/graphiql", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Header().Get("Content-Type"), "text/html")
+	assert.Contains(t, rec.Body.String(), "GraphQL Playground")
+	// The served page is SoroTrail's own GraphQL Playground HTML rather
+	// than the upstream GraphiQL build, so assert on its distinguishing
+	// markers instead of the literal "GraphiQL" string.
+	assert.Contains(t, rec.Body.String(), "SoroTrail GraphQL Playground")
+	assert.Contains(t, rec.Body.String(), "graphql-playground-react")
+}
+
+func TestHandleGet_WithoutQueryReturnsBrowserHint(t *testing.T) {
+	h := newGraphQLTestServer(t, &stubStore{})
+
+	req := httptest.NewRequest(http.MethodGet, "/graphql", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assert.Contains(t, rec.Body.String(), "to this endpoint")
+	// handleGet writes its hint verbatim (not via JSON encoding), so the
+	// wire bytes carry literal backslashes before the embedded quotes.
+	assert.Contains(t, rec.Body.String(), `POST {\"query\":\"…\"} to this endpoint`)
+}
+
+func TestHandleGet_WithQueryExecutesOperation(t *testing.T) {
+	h := newGraphQLTestServer(t, &stubStore{})
+
+	req := httptest.NewRequest(http.MethodGet, "/graphql?query={contracts{edges{node{id}}}}", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	var env struct {
+		Data map[string]any `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+	assert.NotNil(t, env.Data)
+}
+
+func TestHandlePost_ValidApplicationJsonExecutes(t *testing.T) {
+	h := newGraphQLTestServer(t, &stubStore{})
+
+	body, err := json.Marshal(GraphQLRequest{Query: "{contracts{edges{node{id}}}}"})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/graphql", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	var env struct {
+		Data map[string]any `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+	assert.NotNil(t, env.Data)
+}
+
+func TestHandlePost_InvalidJSONReturnsGraphQLErrorEnvelope(t *testing.T) {
+	h := newGraphQLTestServer(t, &stubStore{})
+
+	req := httptest.NewRequest(http.MethodPost, "/graphql", bytes.NewBufferString("invalid-json"))
+	req.Header.Set(
+		"Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assertGraphQLErrorEnvelope(t, rec)
+}
+
+func TestHandleQuery_MalformedQueryReturnsGraphQLErrorDocument(t *testing.T) {
+	h := newGraphQLTestServer(t, &stubStore{})
+
+	body, err := json.Marshal(GraphQLRequest{Query: "malformed { query syntax }"})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/graphql", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// GraphQL specification / execution errors return HTTP 200 with errors in the payload, not a 500 or 400 status.
+	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
 	assertGraphQLErrorEnvelope(t, rec)
 }
