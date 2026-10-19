@@ -53,6 +53,8 @@ var conformanceTestNames = []string{
 	"Stats",
 	"RawXDRRoundTrip",
 	"ReplaceEventsInRangeKeepsRawXDR",
+	"AuditStateRoundTrip",
+	"AuditFindings",
 }
 
 // conformanceBackend is one Store implementation the shared suite runs
@@ -80,13 +82,22 @@ type conformanceBackend struct {
 // conformanceBackends is the single place a new Store implementation is
 // registered with the shared suite.
 func conformanceBackends() []conformanceBackend {
-	// ClickHouse is registered but currently declares the whole behavioural
-	// suite unsupported: its Store methods are stubs that return zero values
-	// rather than results (tracked separately). Wiring it in here is what
-	// makes those gaps visible and reviewable.
+	// ClickHouse starts from every behavioural test declared unsupported
+	// and then opts in the ones whose implementations now carry real
+	// behaviour, so a still-stubbed method can never be asserted against
+	// as if it returned results. WatchedContracts (#526) and the two
+	// audit tests (#525) are the operations those issues require: their
+	// methods issue real SQL rather than returning zero values, so the
+	// suite now runs them instead of skipping them under a registration
+	// that claimed the whole backend was stubbed. Everything else stays
+	// declared until its implementation lands; a new test name defaults
+	// to unsupported here, which is the safe direction to drift in.
 	unsupportedAll := make(map[string]bool, len(conformanceTestNames))
 	for _, name := range conformanceTestNames {
 		unsupportedAll[name] = true
+	}
+	for _, name := range []string{"WatchedContracts", "AuditStateRoundTrip", "AuditFindings"} {
+		delete(unsupportedAll, name)
 	}
 
 	return []conformanceBackend{
@@ -158,6 +169,8 @@ func runStoreTests(t *testing.T, backend conformanceBackend) {
 		{"Stats", testStats},
 		{"RawXDRRoundTrip", testRawXDRRoundTrip},
 		{"ReplaceEventsInRangeKeepsRawXDR", testReplaceEventsInRangeKeepsRawXDR},
+		{"AuditStateRoundTrip", testAuditStateRoundTrip},
+		{"AuditFindings", testAuditFindings},
 	}
 
 	for _, tc := range tests {
@@ -202,16 +215,16 @@ func newPostgresConformanceStore(t *testing.T) Store {
 		END $$;`)
 	require.NoError(t, err)
 
-	_, err = pool.Exec(ctx, `TRUNCATE events, ingestion_state, watched_contracts, audit_state`)
+	_, err = pool.Exec(ctx, `TRUNCATE events, ingestion_state, watched_contracts, audit_state, audit_findings`)
 	require.NoError(t, err)
 
 	return NewPostgres(pool)
 }
 
-// newClickHouseConformanceStore returns a fresh ClickHouse store when a server
-// is configured. The backend currently declares the behavioural suite
-// unsupported, so this is only reached once those stubs grow real
-// implementations; the gate keeps a missing server a skip, never a failure.
+// newClickHouseStoreForTests returns a migrated, empty ClickHouse store when
+// a server is configured. The backend opts into only part of the behavioural
+// suite (see conformanceBackends), and the gate keeps a missing server a
+// skip, never a failure.
 func newClickHouseStoreForTests(t *testing.T) (Store, error) {
 	t.Helper()
 	url := os.Getenv("TEST_CLICKHOUSE_URL")
@@ -227,6 +240,21 @@ func newClickHouseStoreForTests(t *testing.T) (Store, error) {
 	}
 	if err := st.Ping(context.Background()); err != nil {
 		return nil, err
+	}
+	chs, ok := st.(*ClickHouse)
+	if !ok {
+		return nil, fmt.Errorf("TEST_CLICKHOUSE_URL must start with clickhouse:// (got %q)", url)
+	}
+	// Clear the tables the behavioural suite reads and writes, the same
+	// way the Postgres factory truncates before every test: ClickHouse
+	// data outlives the process, so rows left behind by a previous run
+	// would turn the suite's exact-set assertions into flakes instead of
+	// signal. SQLite never needs this because it is fresh per test.
+	exec := newClickHouseExecutor(chs.cfg)
+	for _, table := range []string{"events", "ingestion_state", "watched_contracts", "audit_state", "audit_findings"} {
+		if err := exec.exec(context.Background(), chs.cfg.databaseOrDefault(), "TRUNCATE TABLE "+table); err != nil {
+			return nil, fmt.Errorf("truncating %s for a clean conformance run: %w", table, err)
+		}
 	}
 	return st, nil
 }
@@ -500,6 +528,165 @@ func testWatchedContracts(t *testing.T, st Store) {
 		ids = append(ids, wc.ContractID)
 	}
 	assert.Equal(t, []string{contractA, contractB}, ids)
+
+	// Removal is reflected by the very next list, a second removal
+	// reports ErrNotFound instead of pretending to succeed, and
+	// re-adding a removed contract brings it back — the three behaviours
+	// POST/DELETE /watched-contracts depend on (#526).
+	require.NoError(t, st.RemoveWatchedContract(ctx, WatchedContract{ContractID: contractA}))
+	require.ErrorIs(t, st.RemoveWatchedContract(ctx, WatchedContract{ContractID: contractA}), ErrNotFound,
+		"the entry is gone; a second remove must not read as success")
+
+	got, err = st.ListWatchedContracts(ctx)
+	require.NoError(t, err)
+	ids = ids[:0]
+	for _, wc := range got {
+		ids = append(ids, wc.ContractID)
+	}
+	assert.Equal(t, []string{contractB}, ids, "the removed contract must disappear from the list")
+
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}),
+		"re-adding a removed contract must bring it back")
+	got, err = st.ListWatchedContracts(ctx)
+	require.NoError(t, err)
+	ids = ids[:0]
+	for _, wc := range got {
+		ids = append(ids, wc.ContractID)
+	}
+	assert.Equal(t, []string{contractA, contractB}, ids, "re-adding must restore the entry in list order")
+}
+
+// testAuditStateRoundTrip pins the data-integrity auditor's high-water mark
+// semantics (#525): a network that has never been audited reads as
+// ErrNotFound rather than a zero state the auditor could mistake for
+// "verified through ledger 0", a save round-trips, SaveAuditStateIfGreater
+// never moves the marker backward, and its first write for a network
+// creates the row — the cold-start path every auditor run takes.
+func testAuditStateRoundTrip(t *testing.T, st Store) {
+	ctx := context.Background()
+	const network = "conformance-audit"
+
+	_, err := st.GetAuditState(ctx, network)
+	require.ErrorIs(t, err, ErrNotFound, "a never-audited network must not read as a zero state")
+
+	require.NoError(t, st.SaveAuditState(ctx, AuditState{Network: network, VerifiedThroughLedger: 100}))
+	got, err := st.GetAuditState(ctx, network)
+	require.NoError(t, err)
+	assert.Equal(t, network, got.Network)
+	assert.Equal(t, int64(100), got.VerifiedThroughLedger)
+	assert.False(t, got.UpdatedAt.IsZero(), "a save must record an UpdatedAt timestamp")
+
+	// Save fully replaces the per-network row rather than appending.
+	require.NoError(t, st.SaveAuditState(ctx, AuditState{Network: network, VerifiedThroughLedger: 150}))
+	got, err = st.GetAuditState(ctx, network)
+	require.NoError(t, err)
+	assert.Equal(t, int64(150), got.VerifiedThroughLedger)
+
+	// A lagging writer must not regress the marker: the stored value is
+	// answered back and the database keeps it.
+	regressed, err := st.SaveAuditStateIfGreater(ctx, network, 120)
+	require.NoError(t, err)
+	assert.Equal(t, int64(150), regressed.VerifiedThroughLedger,
+		"a lower candidate must be answered with the stored high-water mark")
+	got, err = st.GetAuditState(ctx, network)
+	require.NoError(t, err)
+	assert.Equal(t, int64(150), got.VerifiedThroughLedger,
+		"a lower candidate must leave the stored value alone")
+
+	// An advancing candidate must persist.
+	advanced, err := st.SaveAuditStateIfGreater(ctx, network, 200)
+	require.NoError(t, err)
+	assert.Equal(t, int64(200), advanced.VerifiedThroughLedger)
+	got, err = st.GetAuditState(ctx, network)
+	require.NoError(t, err)
+	assert.Equal(t, int64(200), got.VerifiedThroughLedger)
+
+	// The first advance for a network with no row yet has to create it.
+	const fresh = "conformance-audit-fresh"
+	first, err := st.SaveAuditStateIfGreater(ctx, fresh, 42)
+	require.NoError(t, err)
+	assert.Equal(t, int64(42), first.VerifiedThroughLedger)
+	got, err = st.GetAuditState(ctx, fresh)
+	require.NoError(t, err)
+	assert.Equal(t, int64(42), got.VerifiedThroughLedger)
+}
+
+// testAuditFindings pins the finding lifecycle the auditor drives through
+// the store (#525): a recorded finding is retrievable through the
+// open-findings lookup over its ledger range and invisible outside it, the
+// mutable fields an update carries persist, repairing a finding retires it
+// from that lookup, and updating an id that never existed stays a no-op —
+// mirroring Postgres's UPDATE matching zero rows — instead of inventing a
+// finding or erroring.
+func testAuditFindings(t *testing.T, st Store) {
+	ctx := context.Background()
+	const network = "conformance-findings"
+
+	_, err := st.ListOpenFindingsByRange(ctx, network, 100, 105)
+	require.ErrorIs(t, err, ErrNotFound, "nothing has been recorded yet")
+
+	missing := []string{eventID(7), eventID(9)}
+	rec, err := st.RecordAuditFinding(ctx, AuditFinding{
+		Network:       network,
+		FromLedger:    100,
+		ToLedger:      105,
+		ExpectedCount: 6,
+		ActualCount:   4,
+		MissingIDs:    missing,
+		Status:        FindingOpen,
+	})
+	require.NoError(t, err)
+	require.NotZero(t, rec.ID, "the writer mints the finding id")
+	assert.False(t, rec.CreatedAt.IsZero(), "the writer stamps the detection time")
+
+	got, err := st.ListOpenFindingsByRange(ctx, network, 100, 105)
+	require.NoError(t, err, "a recorded finding must be retrievable")
+	assert.Equal(t, rec.ID, got.ID)
+	assert.Equal(t, network, got.Network)
+	assert.Equal(t, int64(100), got.FromLedger)
+	assert.Equal(t, int64(105), got.ToLedger)
+	assert.Equal(t, 6, got.ExpectedCount)
+	assert.Equal(t, 4, got.ActualCount)
+	assert.Equal(t, FindingOpen, got.Status)
+	assert.Equal(t, missing, got.MissingIDs)
+	assert.Zero(t, got.Attempts, "a fresh finding has not been retried")
+
+	// The lookup answers only for the range the finding covers...
+	_, err = st.ListOpenFindingsByRange(ctx, network, 200, 300)
+	require.ErrorIs(t, err, ErrNotFound, "a finding outside the requested range must not match")
+	// ...and only for the network it was recorded on.
+	_, err = st.ListOpenFindingsByRange(ctx, "conformance-other", 100, 105)
+	require.ErrorIs(t, err, ErrNotFound, "findings are network-scoped")
+
+	// The auditor's retry bookkeeping rides on Update and must persist
+	// while the finding stays actionable.
+	attempted := time.Now().UTC().Truncate(time.Second)
+	updated := rec
+	updated.Status = FindingUnrecoverable
+	updated.Attempts = 2
+	updated.LastError = "rpc returned a different event set"
+	updated.LastAttemptedAt = attempted
+	require.NoError(t, st.UpdateAuditFinding(ctx, updated))
+
+	got, err = st.ListOpenFindingsByRange(ctx, network, 100, 105)
+	require.NoError(t, err, "an unrecoverable finding stays visible to the lookup")
+	assert.Equal(t, rec.ID, got.ID, "the update must amend the recorded finding, not mint a new one")
+	assert.Equal(t, FindingUnrecoverable, got.Status)
+	assert.Equal(t, 2, got.Attempts)
+	assert.Equal(t, "rpc returned a different event set", got.LastError)
+	assert.WithinDuration(t, attempted, got.LastAttemptedAt, time.Minute)
+
+	// Repairing the finding retires it from the open lookup.
+	updated.Status = FindingRepaired
+	require.NoError(t, st.UpdateAuditFinding(ctx, updated))
+	_, err = st.ListOpenFindingsByRange(ctx, network, 100, 105)
+	require.ErrorIs(t, err, ErrNotFound, "a repaired finding is no longer actionable")
+
+	// An id that was never recorded must be a silent no-op, mirroring the
+	// Postgres UPDATE that matches zero rows without an error.
+	require.NoError(t, st.UpdateAuditFinding(ctx, AuditFinding{ID: rec.ID + 1_000_000, Status: FindingOpen}))
+	_, err = st.ListOpenFindingsByRange(ctx, network, 100, 105)
+	require.ErrorIs(t, err, ErrNotFound, "a no-op update must not create a finding")
 }
 
 // testContractCursors pins the per-contract resume-cursor semantics the
@@ -788,6 +975,29 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 	// reach, so what it must not do is succeed or panic.
 	_, err = st.GetContractCursor(ctx, "test")
 	assert.Error(t, err, "GetContractCursor must report the failed lookup rather than a zero cursor")
+
+	// The audit-state and watched-contract methods behind issues #525
+	// and #526 are implemented too, so they all issue a request. On a
+	// zero-value ClickHouse with no server to reach the only acceptable
+	// outcome is an error: the silent-nil no-op those issues exist to
+	// prevent would read here as a successful write to an empty result.
+	_, err = st.GetAuditState(ctx, "test")
+	assert.Error(t, err, "GetAuditState must report the failed lookup rather than a zero state")
+
+	err = st.SaveAuditState(ctx, AuditState{Network: "test", VerifiedThroughLedger: 1})
+	assert.Error(t, err, "SaveAuditState must report the failed write rather than claiming success")
+
+	_, err = st.SaveAuditStateIfGreater(ctx, "test", 1)
+	assert.Error(t, err, "SaveAuditStateIfGreater must report the failed lookup rather than a zero state")
+
+	err = st.UpdateAuditFinding(ctx, AuditFinding{ID: 1, Status: FindingOpen})
+	assert.Error(t, err, "UpdateAuditFinding must report the failed write rather than claiming success")
+
+	err = st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA})
+	assert.Error(t, err, "AddWatchedContract must report the failed write rather than claiming success")
+
+	err = st.RemoveWatchedContract(ctx, WatchedContract{ContractID: contractA})
+	assert.Error(t, err, "RemoveWatchedContract must report the failed lookup rather than ErrNotFound")
 }
 
 // TestClickHouse_SuiteSkipsCleanly verifies that when no ClickHouse
