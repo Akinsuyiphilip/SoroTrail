@@ -482,7 +482,13 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
+	if f.Scope.DeniesAll() {
+		return []ContractSummary{}, "", nil
+	}
 	where := []string{}
+	if !f.Scope.IsWildcard() {
+		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
 	if f.ContractIDPrefix != "" {
 		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}
@@ -600,12 +606,18 @@ func (p *Postgres) ContractEventTypeCounts(ctx context.Context, contractID strin
 }
 
 func (p *Postgres) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
+	if f.Scope.DeniesAll() {
+		return 0, nil
+	}
 	args := []any{}
 	arg := func(v any) string {
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
 	where := []string{}
+	if !f.Scope.IsWildcard() {
+		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
 	if f.ContractIDPrefix != "" {
 		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}

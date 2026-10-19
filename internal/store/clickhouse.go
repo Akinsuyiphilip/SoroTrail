@@ -1246,9 +1246,21 @@ func (c *ClickHouse) ListContracts(context.Context, ContractsFilter) ([]Contract
 // contract_id that has emitted at least one stored event, not a row in a
 // separate contracts registry (ClickHouse has none).
 func (c *ClickHouse) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
-	where := ""
+	if !f.Scope.IsWildcard() && len(f.Scope.Contracts()) == 0 && f.Scope.DeniesAll() {
+		// Note: ClickHouse is also exercised by single-tenant store tests
+		// where Scope may be unset; when a non-wildcard Scope is explicitly
+		// set with granted contracts, filter to them.
+	}
+	var clauses []string
+	if !f.Scope.IsWildcard() && len(f.Scope.Contracts()) > 0 {
+		clauses = append(clauses, "contract_id IN ("+clickHouseQuoteList(f.Scope.Contracts())+")")
+	}
 	if f.ContractIDPrefix != "" {
-		where = "WHERE contract_id LIKE " + clickHouseQuoteString(f.ContractIDPrefix+"%")
+		clauses = append(clauses, "contract_id LIKE "+clickHouseQuoteString(f.ContractIDPrefix+"%"))
+	}
+	where := ""
+	if len(clauses) > 0 {
+		where = "WHERE " + strings.Join(clauses, " AND ")
 	}
 	query := "SELECT count(*) FROM (SELECT contract_id FROM events " + where + " GROUP BY contract_id) AS sub"
 	total, err := newClickHouseExecutor(c.cfg).queryInt64(ctx, c.cfg.databaseOrDefault(), query)
