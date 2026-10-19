@@ -4,6 +4,7 @@
 
 ### Added
 
+- [docs/metrics.md](docs/metrics.md) — the metrics catalogue: every Prometheus metric SoroTrail exports, with its type, its labels and their closed value sets, the help text `/metrics` serves, and what the number means to an operator. It is generated from a table in `internal/metrics` that is checked against `metrics.go`'s declarations and against what the registries actually serve, so renaming, removing or adding a metric without documenting it fails the test; the same table pins the Prometheus naming rules and the no-ids-in-labels rule, and drives a cardinality test proving client-shaped values never reach a label.
 - [docs/errors.md](docs/errors.md) — the API's error catalogue: every failure condition the server can produce, the status it answers with, the exact message a client sees, and the operations it can surface on. It is generated from `internal/api/error_catalogue_test.go`, which cross-checks it against the handlers' source and the shipped OpenAPI spec in both directions, so an undocumented new error — or a stale entry for one the server can no longer produce — fails the test. The spec gained the statuses it was missing along the way: 501 on the API-key and contract endpoints, 503 on the contract spec-override endpoints, 403 on the subscription create/update endpoints, and 426 for a refused websocket handshake.
 
 ### Changed
