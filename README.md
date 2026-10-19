@@ -673,6 +673,34 @@ operator overlay and cannot be removed by this command; unset the environment
 variable to stop those entries. The CLI never edits the environment or
 configuration file.
 
+### Managing watched contracts via the HTTP API
+
+When `API_KEY` is set, operators can inspect and mutate the watch list at
+runtime without restarting the process. Every watched contract is keyed by
+`(network, contract_id)`:
+
+| Method | Path | Network parameter | Description |
+| --- | --- | --- | --- |
+| `GET` | `/watched-contracts` | — | Lists all persisted `(network, contract_id)` entries (`source: "api"`) plus any `WATCHED_CONTRACTS` environment overlay (`source: "config"`, `from_config`). |
+| `POST` | `/watched-contracts` | Body `"network"` (optional; defaults to the server's `NETWORK`, or `"default"` if unset) | Adds a contract to the watch list for that network. Requires `"confirm": true` (or `?confirm=true`) when adding the first watched contract on that network, since ingestion transitions from indexing all contracts to only the watched set. |
+| `DELETE` | `/watched-contracts/{id}` | Query `?network=` (optional; defaults to the server's `NETWORK`, or `"default"` if unset) | Removes a persisted contract from that network's watch list. Requires `?confirm=true` when removing the last watched contract on that network. Returns `409 Conflict` if the contract is pinned via `WATCHED_CONTRACTS`. |
+
+```sh
+# Add a contract on the server's default NETWORK (or pass "network": "testnet" explicitly)
+curl -s -X POST localhost:8080/watched-contracts \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"contract_id":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC","network":"testnet","confirm":true}'
+
+# Remove a contract from a specific network's watch list
+curl -s -X DELETE 'localhost:8080/watched-contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC?network=testnet&confirm=true' \
+  -H "X-API-Key: $API_KEY"
+```
+
+See [The watch list and its network dimension](docs/architecture.md#the-watch-list-and-its-network-dimension)
+for how `buildFilterBatches` selects entries per network and how multi-network
+deployments share a single database.
+
 ### How to check who is behind
 
 `GET /stats` now includes a `contract_cursors` field — the number of
