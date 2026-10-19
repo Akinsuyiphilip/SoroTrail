@@ -28,6 +28,9 @@ for operators and developers.
 - [API Keys and Scopes](api-keys.md): Key generation, storage hashing, startup
   bootstrap behavior, CLI management, scope enforcement, rotation procedures,
   and the PostgreSQL requirement.
+- [Contract Spec Overrides](spec-overrides.md): Uploading, inspecting, and deleting
+  user-supplied contract event specs (`PUT|GET|DELETE /contracts/{id}/spec`), JSON
+  schema validation, precedence over on-chain Wasm specs, and cache invalidation behavior.
 
 ## Ingestion, Backfill, and Replay
 
