@@ -2,15 +2,75 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/sorotrail/sorotrail/internal/config"
 )
+
+var stdIOMu sync.Mutex
+
+// captureStdout captures os.Stdout output produced during fn.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	stdIOMu.Lock()
+	defer stdIOMu.Unlock()
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+
+	orig := os.Stdout
+	os.Stdout = w
+	defer func() {
+		os.Stdout = orig
+	}()
+
+	fn()
+	_ = w.Close()
+
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, r)
+	require.NoError(t, err)
+	_ = r.Close()
+	return buf.String()
+}
+
+// captureStderr captures os.Stderr output produced during fn.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	stdIOMu.Lock()
+	defer stdIOMu.Unlock()
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+
+	orig := os.Stderr
+	os.Stderr = w
+	defer func() {
+		os.Stderr = orig
+	}()
+
+	fn()
+	_ = w.Close()
+
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, r)
+	require.NoError(t, err)
+	_ = r.Close()
+	return buf.String()
+}
 
 func TestNewLoggerJSONOutput(t *testing.T) {
 	var buf bytes.Buffer
@@ -87,5 +147,314 @@ func TestNewLoggerUsesTextByDefault(t *testing.T) {
 	}
 	if !strings.Contains(output, "test") {
 		t.Errorf("expected log message in text output, got %q", output)
+	}
+}
+
+// TestDispatch_RoutesDocumentedSubcommands asserts that each documented
+// subcommand routes to its respective handler and forwards arguments.
+func TestDispatch_RoutesDocumentedSubcommands(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantErrMsg string
+	}{
+		{
+			name: "replay routes to runReplay and handles help flag cleanly",
+			args: []string{"replay", "--help"},
+		},
+		{
+			name:       "replay routes to runReplay and reports missing required flag",
+			args:       []string{"replay"},
+			wantErrMsg: "--from-ledger is required and must be positive",
+		},
+		{
+			name: "backfill routes to runBackfill and handles help flag cleanly",
+			args: []string{"backfill", "--help"},
+		},
+		{
+			name:       "backfill routes to runBackfill and reports missing required flag",
+			args:       []string{"backfill"},
+			wantErrMsg: "--contract is required",
+		},
+		{
+			name: "index-addresses routes to runIndexAddresses and handles help flag cleanly",
+			args: []string{"index-addresses", "--help"},
+		},
+		{
+			name:       "index-addresses routes to runIndexAddresses and validates arguments",
+			args:       []string{"index-addresses", "--batch-size", "0"},
+			wantErrMsg: "--batch-size must be in 1..1000, got 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := dispatch(tt.args)
+			if tt.wantErrMsg != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrMsg)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+
+	// Test healthcheck routing.
+	t.Run("healthcheck routes to runHealthcheck and returns nil on healthy probe", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/health" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"status":"ok"}`))
+			}
+		}))
+		defer srv.Close()
+
+		addr := strings.TrimPrefix(srv.URL, "http://")
+		err := dispatch([]string{"healthcheck", "--addr", addr, "--endpoint", "/health"})
+		assert.NoError(t, err)
+	})
+
+	// Test help variants.
+	for _, flag := range []string{"help", "-h", "--help"} {
+		t.Run(fmt.Sprintf("dispatch %s prints usage and exits cleanly", flag), func(t *testing.T) {
+			stderr := captureStderr(t, func() {
+				err := dispatch([]string{flag})
+				assert.NoError(t, err)
+			})
+			assert.Contains(t, stderr, "usage: sorotrail [subcommand]")
+		})
+	}
+}
+
+// TestDispatch_UnknownSubcommand asserts that an unknown subcommand prints
+// usage information to stderr and returns an error describing the unknown command.
+func TestDispatch_UnknownSubcommand(t *testing.T) {
+	tests := []struct {
+		name       string
+		subcommand string
+	}{
+		{"arbitrary command foo", "foo"},
+		{"unrecognized start", "start"},
+		{"unrecognized serve", "serve"},
+		{"typo of replay", "replaay"},
+		{"invalid leading dash", "--unknown-flag"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var err error
+			stderr := captureStderr(t, func() {
+				err = dispatch([]string{tt.subcommand})
+			})
+
+			require.Error(t, err)
+			assert.EqualError(t, err, fmt.Sprintf("unknown subcommand %q", tt.subcommand))
+			assert.Contains(t, stderr, "usage: sorotrail [subcommand]")
+		})
+	}
+}
+
+// TestDispatch_NoSubcommandRunsDefaultServerPath asserts that dispatch with
+// empty or nil arguments routes to run(), the default server path.
+func TestDispatch_NoSubcommandRunsDefaultServerPath(t *testing.T) {
+	// Set an invalid log level to verify config.Load() in run() is reached
+	// without actually spinning up postgres or background workers.
+	t.Setenv("LOG_LEVEL", "invalid_for_test")
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"nil slice", nil},
+		{"empty slice", []string{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := dispatch(tt.args)
+			require.Error(t, err)
+			// Proves that run() was called and config.Load() was reached.
+			assert.Contains(t, err.Error(), `LOG_LEVEL: "invalid_for_test" must be one of debug|info|warn|error`)
+		})
+	}
+
+	// In contrast, invoking a subcommand does not enter run().
+	t.Run("subcommand does not enter run path", func(t *testing.T) {
+		err := dispatch([]string{"replay", "--help"})
+		assert.NoError(t, err, "subcommands must not enter run() or fail on LOG_LEVEL")
+	})
+}
+
+// TestNewLogger_DocumentedFormats asserts that each documented log format
+// ("text" and "json") produces a functional *slog.Logger writing to os.Stdout.
+func TestNewLogger_DocumentedFormats(t *testing.T) {
+	tests := []struct {
+		name      string
+		format    string
+		assertOut func(t *testing.T, output string)
+	}{
+		{
+			name:   "text format produces structured key-value output",
+			format: "text",
+			assertOut: func(t *testing.T, output string) {
+				assert.Contains(t, output, "test text log message")
+				assert.Contains(t, output, "foo=bar")
+				assert.False(t, strings.HasPrefix(strings.TrimSpace(output), "{"), "text logger should not emit JSON")
+			},
+		},
+		{
+			name:   "json format produces valid parseable JSON output",
+			format: "json",
+			assertOut: func(t *testing.T, output string) {
+				var parsed map[string]any
+				err := json.Unmarshal([]byte(output), &parsed)
+				require.NoError(t, err, "json format must emit valid JSON, got: %s", output)
+				assert.Equal(t, "test json log message", parsed["msg"])
+				assert.Equal(t, "bar", parsed["foo"])
+				assert.Equal(t, "INFO", parsed["level"])
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output := captureStdout(t, func() {
+				logger := newLogger("info", tt.format)
+				require.NotNil(t, logger)
+				logger.Info(fmt.Sprintf("test %s log message", tt.format), "foo", "bar")
+			})
+
+			tt.assertOut(t, output)
+		})
+	}
+}
+
+// TestNewLogger_LogLevels asserts that newLogger configures the expected
+// slog level threshold for all valid log levels.
+func TestNewLogger_LogLevels(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		level     string
+		wantDebug bool
+		wantInfo  bool
+		wantWarn  bool
+		wantError bool
+	}{
+		{
+			name:      "debug level enables all levels",
+			level:     "debug",
+			wantDebug: true,
+			wantInfo:  true,
+			wantWarn:  true,
+			wantError: true,
+		},
+		{
+			name:      "info level disables debug",
+			level:     "info",
+			wantDebug: false,
+			wantInfo:  true,
+			wantWarn:  true,
+			wantError: true,
+		},
+		{
+			name:      "warn level disables debug and info",
+			level:     "warn",
+			wantDebug: false,
+			wantInfo:  false,
+			wantWarn:  true,
+			wantError: true,
+		},
+		{
+			name:      "error level enables only error",
+			level:     "error",
+			wantDebug: false,
+			wantInfo:  false,
+			wantWarn:  false,
+			wantError: true,
+		},
+		{
+			name:      "case-insensitive log level input",
+			level:     "DEBUG",
+			wantDebug: true,
+			wantInfo:  true,
+			wantWarn:  true,
+			wantError: true,
+		},
+		{
+			name:      "unspecified level defaults to info",
+			level:     "",
+			wantDebug: false,
+			wantInfo:  true,
+			wantWarn:  true,
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log := newLogger(tt.level, "text")
+			require.NotNil(t, log)
+
+			assert.Equal(t, tt.wantDebug, log.Enabled(ctx, slog.LevelDebug), "debug enabled check")
+			assert.Equal(t, tt.wantInfo, log.Enabled(ctx, slog.LevelInfo), "info enabled check")
+			assert.Equal(t, tt.wantWarn, log.Enabled(ctx, slog.LevelWarn), "warn enabled check")
+			assert.Equal(t, tt.wantError, log.Enabled(ctx, slog.LevelError), "error enabled check")
+		})
+	}
+}
+
+// TestLogLevel_InvalidRejectedWithClearMessage asserts that setting an invalid
+// LOG_LEVEL environment variable is rejected during startup with a clear error message.
+func TestLogLevel_InvalidRejectedWithClearMessage(t *testing.T) {
+	invalidLevels := []struct {
+		name  string
+		level string
+	}{
+		{"verbose", "verbose"},
+		{"trace", "trace"},
+		{"loud", "loud"},
+		{"warning typo", "warning"},
+		{"numeric string", "123"},
+		{"none", "none"},
+	}
+
+	for _, tt := range invalidLevels {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://localhost/dummy")
+			t.Setenv("LOG_LEVEL", tt.level)
+			err := dispatch(nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), fmt.Sprintf("LOG_LEVEL: %q must be one of debug|info|warn|error", tt.level))
+		})
+	}
+}
+
+// TestUsage_ListsEverySubcommand asserts that usage() lists all subcommands
+// that dispatch() knows how to route to.
+func TestUsage_ListsEverySubcommand(t *testing.T) {
+	stderr := captureStderr(t, func() {
+		usage()
+	})
+
+	assert.Contains(t, stderr, "usage: sorotrail [subcommand]")
+	assert.Contains(t, stderr, "With no subcommand, runs the indexer")
+
+	knownSubcommands := []struct {
+		subcommand  string
+		description string
+	}{
+		{"replay", "re-decode stored events"},
+		{"backfill", "ingest historical contract events"},
+		{"index-addresses", "rebuild the address→event inverted index"},
+		{"healthcheck", "probe /health and exit"},
+	}
+
+	for _, tt := range knownSubcommands {
+		t.Run(tt.subcommand, func(t *testing.T) {
+			assert.Contains(t, stderr, tt.subcommand, "usage must list subcommand %q", tt.subcommand)
+			assert.Contains(t, stderr, tt.description, "usage must describe subcommand %q", tt.subcommand)
+		})
 	}
 }
