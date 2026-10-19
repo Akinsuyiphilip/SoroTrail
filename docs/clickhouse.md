@@ -65,7 +65,7 @@ ones that still do not.
 | --- | --- | --- | --- |
 | Ingestion state | `GetIngestionState`, `SaveIngestionState` | **implemented** | ReplacingMergeTree rows read with `FINAL`; saves append a newer version. |
 | Audit state | `GetAuditState`, `SaveAuditState`, `SaveAuditStateIfGreater` | **implemented** | The "if greater" compare-and-set is a read-then-write, not atomic across instances. |
-| Watched contracts | `ListWatchedContracts`, `AddWatchedContract`, `RemoveWatchedContract` | **implemented** | Removal is a soft delete; `FINAL` collapses versions. |
+| Watched contracts | `ListWatchedContracts`, `ListWatchedContractsScoped`, `AddWatchedContract`, `RemoveWatchedContract` | **implemented** | Removal is a soft delete; `FINAL` collapses versions. `ListWatchedContractsScoped` filters to the caller's `Scope`. |
 | Per-contract cursors | `GetContractCursor`, `SaveContractCursor`, `DeleteContractCursor`, `ListContractCursors` | **implemented** | Delete is a synchronous ClickHouse mutation. |
 | Audit findings | `RecordAuditFinding`, `UpdateAuditFinding`, `ListOpenFindingsByRange` | **implemented** | IDs are minted in-process because the HTTP interface has no sequence or `RETURNING`. |
 
