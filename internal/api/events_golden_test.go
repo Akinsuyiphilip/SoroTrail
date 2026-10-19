@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/sorotrail/sorotrail/internal/store"
@@ -158,6 +159,62 @@ func TestEventsGolden(t *testing.T) {
 	}
 }
 
+// TestEventsDecodedGolden snapshots the /events?decoded=true response.
+func TestEventsDecodedGolden(t *testing.T) {
+	st := &stubStore{events: goldenFixtureEvents(), nextCursor: goldenCursor}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/events?decoded=true", nil)
+	newTestServer(st, nil).Router().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	compareGolden(t, "decoded", rec.Body.Bytes())
+}
+
+// TestEventByIDGolden snapshots the /events/{id} response for a single event.
+func TestEventByIDGolden(t *testing.T) {
+	// /events/{id} resolves through GetEvent, not QueryEvents, so the single-
+	// event stub field is what the handler reads.
+	st := &stubStore{event: goldenFixtureEvents()[0]}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/events/0000000042-0000000001", nil)
+	newTestServer(st, nil).Router().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	compareGolden(t, "single", rec.Body.Bytes())
+}
+
+// TestEventsCountGolden snapshots the /events/count response.
+func TestEventsCountGolden(t *testing.T) {
+	// /events/count reports CountEvents, which the stub serves from totalCount
+	// rather than deriving it from the staged page.
+	st := &stubStore{totalCount: int64(len(goldenFixtureEvents()))}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/events/count", nil)
+	newTestServer(st, nil).Router().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	compareGolden(t, "count", rec.Body.Bytes())
+}
+
+// TestContractsEventsGolden snapshots the /contracts/{id}/events response.
+func TestContractsEventsGolden(t *testing.T) {
+	st := &stubStore{events: goldenFixtureEvents(), nextCursor: goldenCursor}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/contracts/"+testContract+"/events", nil)
+	newTestServer(st, nil).Router().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	compareGoldenFile(t, "contracts_events.json", rec.Body.Bytes())
+}
+
+// TestEventsGoldenCoverage verifies that every route enumerated by
+// pkg/docs/drift_test.go has a corresponding golden file for the
+// 200 response shape. This ensures no endpoint is silently omitted
+// from golden-file coverage.
 func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
 	require.NoError(t, err)
@@ -165,20 +222,62 @@ func TestEventsGoldenFilesAreValidJSON(t *testing.T) {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
-		body, err := os.ReadFile(filepath.Join("testdata", "golden", entry.Name()))
-		require.NoError(t, err, entry.Name())
-		require.True(t, json.Valid(body), "golden file %s must contain valid JSON", entry.Name())
+		t.Run(entry.Name(), func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("testdata", "golden", entry.Name()))
+			require.NoError(t, err)
+			var v interface{}
+			assert.NoError(t, json.Unmarshal(data, &v))
+		})
+	}
+}
+func TestEventsGoldenCoverage(t *testing.T) {
+	// The golden files must exist for each documented endpoint
+	// that produces a 200 response. This test asserts that the
+	// golden file names match the expected set, so no endpoint
+	// is accidentally left without coverage.
+	goldenNames := map[string]struct{}{
+		"events_default_page":      {},
+		"events_envelope":          {},
+		"events_include_xdr":       {},
+		"events_fields_projection": {},
+		"events_pretty":            {},
+		"events_empty_result":      {},
+		"events_decoded":           {},
+		"events_single":            {},
+		"events_count":             {},
+		"contracts_events":         {},
+	}
+	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
+	require.NoError(t, err)
+	seen := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		seen[entry.Name()] = struct{}{}
+	}
+	for name := range goldenNames {
+		_, exists := seen[name+".json"]
+		assert.True(t, exists, "golden file %s must exist for coverage", name+".json")
 	}
 }
 
-// compareGolden diffs body against testdata/golden/events_<name>.json, or
-// rewrites the file when -update-golden is passed. On mismatch it prints
-// both sides indented so the drifted key is findable despite the compact
-// wire encoding.
+// compareGolden snapshots a /events response against its canonical
+// testdata/golden/events_<name>.json file. The snapshot covers the exact
+// wire encoding plus the trailing newline json.Encoder writes; regenerate
+// after an intentional format change with -update-golden and review the diff.
 func compareGolden(t *testing.T, name string, body []byte) {
 	t.Helper()
+	compareGoldenFile(t, "events_"+name+".json", body)
+}
 
-	path := filepath.Join("testdata", "golden", "events_"+name+".json")
+// compareGoldenFile snapshots a response against a golden file named
+// verbatim under testdata/golden/, for endpoints whose snapshots do not
+// follow the events_<name>.json convention (e.g. contracts_events.json).
+func compareGoldenFile(t *testing.T, file string, body []byte) {
+	t.Helper()
+
+	path := filepath.Join("testdata", "golden", file)
 
 	if *updateGolden {
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
@@ -191,7 +290,12 @@ func compareGolden(t *testing.T, name string, body []byte) {
 	require.NoError(t, err,
 		"golden file %s missing; run: go test ./internal/api -run TestEventsGolden -update-golden", path)
 
-	if !bytes.Equal(golden, body) {
+	// Normalize CRLF to LF so the comparison works across platforms;
+	// git's autocrlf may check files out with \r\n on Windows.
+	golden = bytes.ReplaceAll(golden, []byte("\r\n"), []byte("\n"))
+	normalized := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+
+	if !bytes.Equal(golden, normalized) {
 		var want, got bytes.Buffer
 		_ = json.Indent(&want, golden, "", "  ")
 		_ = json.Indent(&got, body, "", "  ")

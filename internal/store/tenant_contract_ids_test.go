@@ -15,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -57,6 +58,11 @@ func (f *fakeContractRows) RawValues() [][]byte                          { retur
 func (f *fakeContractRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
 func (f *fakeContractRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (f *fakeContractRows) Conn() *pgx.Conn                              { return nil }
+
+// TypeMap is new in pgx v5.8: the Rows interface grew it so a caller can
+// resolve OIDs without reaching for the connection. The projection only ever
+// calls Next and Scan, so nil is the same inert stub as the methods above.
+func (f *fakeContractRows) TypeMap() *pgtype.Map { return nil }
 
 func TestContractIDs(t *testing.T) {
 	tests := []struct {

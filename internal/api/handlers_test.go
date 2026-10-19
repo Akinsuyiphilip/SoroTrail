@@ -1,10 +1,19 @@
 package api
 
 import (
+	"context"
+	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // validAddr returns a 56-character string that starts with the given
@@ -185,6 +194,21 @@ func TestIngestLagLedgers(t *testing.T) {
 			lastIngested: 100,
 			want:         0,
 		},
+		{
+			// The helper reports raw distance; the readiness threshold is
+			// applied by its callers, so a lag of exactly the threshold
+			// must come back verbatim rather than clamped or rounded.
+			name:         "lag exactly at the readiness threshold is reported verbatim",
+			chainHead:    1000 + readinessLagThreshold,
+			lastIngested: 1000,
+			want:         readinessLagThreshold,
+		},
+		{
+			name:         "lag one past the readiness threshold is reported verbatim",
+			chainHead:    1000 + readinessLagThreshold + 1,
+			lastIngested: 1000,
+			want:         readinessLagThreshold + 1,
+		},
 	}
 
 	for _, tt := range tests {
@@ -192,5 +216,341 @@ func TestIngestLagLedgers(t *testing.T) {
 			got := ingestLagLedgers(tt.chainHead, tt.lastIngested)
 			assert.Equal(t, tt.want, got)
 		})
+	}
+}
+
+// TestAddStatsFreshness pins the freshness signal /stats carries. The
+// chain head and lag are pointers so that "unknown" (nil, JSON null) is
+// distinguishable from "caught up" (zero): a client must never read an
+// RPC outage as a fresh index, nor a cold instance as a stale one.
+func TestAddStatsFreshness(t *testing.T) {
+	tests := []struct {
+		name         string
+		rpcLatest    uint32
+		rpcErr       error
+		noRPC        bool
+		lastIngested int64
+		// wantHead and wantLag are nil when freshness must be unknown.
+		wantHead *int64
+		wantLag  *int64
+	}{
+		{
+			name:         "recent ingestion reports fresh",
+			rpcLatest:    1000,
+			lastIngested: 995,
+			wantHead:     ptr[int64](1000),
+			wantLag:      ptr[int64](5),
+		},
+		{
+			name:         "fully caught up reports zero lag",
+			rpcLatest:    1000,
+			lastIngested: 1000,
+			wantHead:     ptr[int64](1000),
+			wantLag:      ptr[int64](0),
+		},
+		{
+			// /stats reports raw distance and leaves the stale verdict to
+			// the reader (and to /readyz), so the boundary values must come
+			// through exactly; TestCheckIngestionLag pins the verdict.
+			name:         "lag exactly at the threshold is reported exactly",
+			rpcLatest:    1000,
+			lastIngested: 1000 - readinessLagThreshold,
+			wantHead:     ptr[int64](1000),
+			wantLag:      ptr[int64](readinessLagThreshold),
+		},
+		{
+			name:         "stale frontier one past the threshold is reported exactly",
+			rpcLatest:    1000,
+			lastIngested: 1000 - readinessLagThreshold - 1,
+			wantHead:     ptr[int64](1000),
+			wantLag:      ptr[int64](readinessLagThreshold + 1),
+		},
+		{
+			// A zero frontier means nothing has been ingested yet; the huge
+			// arithmetic distance to the chain head must not surface as lag.
+			name:         "zero frontier reports zero lag, not stale",
+			rpcLatest:    5000,
+			lastIngested: 0,
+			wantHead:     ptr[int64](5000),
+			wantLag:      ptr[int64](0),
+		},
+		{
+			name:         "frontier ahead of a lagging RPC node reports zero lag",
+			rpcLatest:    990,
+			lastIngested: 1000,
+			wantHead:     ptr[int64](990),
+			wantLag:      ptr[int64](0),
+		},
+		{
+			// Without a chain head there is nothing to measure against, so
+			// both fields stay nil rather than defaulting to a fake zero.
+			name:         "RPC error leaves freshness unknown",
+			rpcErr:       errors.New("rpc unreachable"),
+			lastIngested: 1000,
+		},
+		{
+			name:         "no RPC client leaves freshness unknown",
+			noRPC:        true,
+			lastIngested: 1000,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{}
+			if !tt.noRPC {
+				s.rpc = &stubRPC{
+					health:    rpc.Health{Status: "healthy", LatestLedger: tt.rpcLatest},
+					healthErr: tt.rpcErr,
+				}
+			}
+			stats := store.Stats{LastIngestedLedger: tt.lastIngested}
+
+			s.addStatsFreshness(context.Background(), &stats)
+
+			assert.Equal(t, tt.wantHead, stats.ChainHeadLedger, "chain_head_ledger")
+			assert.Equal(t, tt.wantLag, stats.IngestLagLedgers, "ingest_lag_ledgers")
+			assert.Equal(t, tt.lastIngested, stats.LastIngestedLedger,
+				"the frontier itself must not be rewritten by the freshness pass")
+		})
+	}
+}
+
+// TestCheckIngestionLag exercises the readiness probe directly, without
+// the HTTP envelope, so each threshold decision is pinned to the helper
+// that makes it rather than inferred from an aggregated status.
+func TestCheckIngestionLag(t *testing.T) {
+	tests := []struct {
+		name         string
+		rpcLatest    uint32
+		rpcErr       error
+		noRPC        bool
+		lastIngested int64
+		ingestionErr error
+		wantStatus   string
+		// wantDetail is a substring the detail must contain; empty means
+		// the detail must be empty, as an ok probe has nothing to explain.
+		wantDetail string
+	}{
+		{
+			name:         "recent ingestion is ok",
+			rpcLatest:    1000,
+			lastIngested: 995,
+			wantStatus:   healthOK,
+		},
+		{
+			name:         "lag exactly at the threshold stays ok",
+			rpcLatest:    1000,
+			lastIngested: 1000 - readinessLagThreshold,
+			wantStatus:   healthOK,
+		},
+		{
+			name:         "stale frontier one past the threshold is degraded",
+			rpcLatest:    1000,
+			lastIngested: 1000 - readinessLagThreshold - 1,
+			wantStatus:   healthDegraded,
+			wantDetail:   "101 ledgers behind (last ingested: 899, chain head: 1000)",
+		},
+		{
+			// A zeroed frontier is a cold instance, which must not be judged
+			// against a chain head it has not started following yet.
+			name:         "zero frontier is ok, not stale",
+			rpcLatest:    5000,
+			lastIngested: 0,
+			wantStatus:   healthOK,
+		},
+		{
+			name:         "unrecorded ingestion state is reported as a cold start",
+			rpcLatest:    1000,
+			ingestionErr: store.ErrNotFound,
+			wantStatus:   healthOK,
+			wantDetail:   "no ingestion state recorded yet",
+		},
+		{
+			name:         "missing RPC client reports the chain head as unknown",
+			noRPC:        true,
+			lastIngested: 1000,
+			wantStatus:   healthOK,
+			wantDetail:   "chain head unknown",
+		},
+		{
+			name:         "unreachable RPC is unready because the chain head is unavailable",
+			rpcErr:       errors.New("rpc unreachable"),
+			lastIngested: 1000,
+			wantStatus:   healthUnready,
+			wantDetail:   "chain head unavailable: rpc unreachable",
+		},
+		{
+			name:         "store error is unready",
+			rpcLatest:    1000,
+			ingestionErr: errors.New("disk on fire"),
+			wantStatus:   healthUnready,
+			wantDetail:   "disk on fire",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{store: &stubStore{
+				ingestion:    store.IngestionState{LastIngestedLedger: tt.lastIngested},
+				ingestionErr: tt.ingestionErr,
+			}}
+			if !tt.noRPC {
+				s.rpc = &stubRPC{
+					health:    rpc.Health{Status: "healthy", LatestLedger: tt.rpcLatest},
+					healthErr: tt.rpcErr,
+				}
+			}
+
+			status, detail := s.checkIngestionLag(context.Background())
+
+			assert.Equal(t, tt.wantStatus, status)
+			if tt.wantDetail == "" {
+				assert.Empty(t, detail)
+			} else {
+				assert.Contains(t, detail, tt.wantDetail)
+			}
+		})
+	}
+}
+
+// countingReader records how many bytes were pulled from the body so a test
+// can prove an oversized request was not buffered in full.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+// TestDecodeJSONBody pins the boundary every JSON request body crosses
+// first: the 4 KiB cap, the unknown-field policy, the empty-body message,
+// and that a rejected body neither half-populates dst nor echoes its
+// values back in the error.
+func TestDecodeJSONBody(t *testing.T) {
+	type target struct {
+		ContractID string   `json:"contract_id"`
+		Limit      int      `json:"limit"`
+		Tags       []string `json:"tags"`
+	}
+	// secret stands in for a credential a client might post. It must never
+	// appear in an error, which handlers pass straight to writeError.
+	const secret = "sk_live_DO_NOT_ECHO"
+	sentinel := target{ContractID: "untouched"}
+
+	valid := `{"contract_id":"` + secret + `","limit":5,"tags":["a","b"]}`
+	padTo := func(s string, n int) string { return s + strings.Repeat(" ", n-len(s)) }
+
+	tests := []struct {
+		name    string
+		body    string
+		nilBody bool
+		want    target
+		wantErr string
+	}{
+		{
+			name: "valid body decodes into the struct",
+			body: valid,
+			want: target{ContractID: secret, Limit: 5, Tags: []string{"a", "b"}},
+		},
+		{
+			// dst is replaced, not merged, so a field absent from the body
+			// cannot carry a stale value into the handler.
+			name: "fields absent from the body are zero, not carried over",
+			body: `{"limit":1}`,
+			want: target{Limit: 1},
+		},
+		{
+			name: "surrounding whitespace is allowed",
+			body: "\n\t " + valid + " \n",
+			want: target{ContractID: secret, Limit: 5, Tags: []string{"a", "b"}},
+		},
+		{
+			name: "body exactly at the limit is accepted",
+			body: padTo(`{"limit":7}`, maxJSONBodyBytes),
+			want: target{Limit: 7},
+		},
+
+		{name: "empty body", body: "", wantErr: "request body is empty"},
+		{name: "whitespace-only body", body: " \r\n\t ", wantErr: "request body is empty"},
+		{name: "nil body", nilBody: true, wantErr: "request body is empty"},
+
+		{name: "one byte over the limit", body: padTo(`{"limit":7}`, maxJSONBodyBytes+1), wantErr: "request body exceeds 4096 bytes"},
+		{name: "far over the limit", body: `{"contract_id":"` + strings.Repeat(secret, 1<<14) + `"}`, wantErr: "request body exceeds 4096 bytes"},
+
+		{name: "malformed JSON", body: `{"contract_id":"` + secret + `", limit}`, wantErr: "invalid JSON body"},
+		{name: "truncated JSON", body: `{"contract_id":"` + secret, wantErr: "invalid JSON body: unexpected EOF"},
+		{name: "not an object", body: `"` + secret + `"`, wantErr: "invalid JSON body: json: cannot unmarshal string"},
+		{
+			// encoding/json fills contract_id before reaching the bad limit;
+			// that partial value must not leak into dst.
+			name:    "wrongly typed field leaves dst untouched",
+			body:    `{"contract_id":"` + secret + `","limit":"` + secret + `"}`,
+			wantErr: "cannot unmarshal string into Go struct field",
+		},
+		{
+			// A typo in a field name is rejected rather than silently
+			// dropped, per the doc comment's policy.
+			name:    "unknown field is rejected",
+			body:    `{"contract_id":"` + secret + `","contractID":"` + secret + `"}`,
+			wantErr: `invalid JSON body: json: unknown field "contractID"`,
+		},
+		{name: "trailing garbage", body: valid + "garbage", wantErr: "unexpected data after the JSON value"},
+		{name: "second JSON value", body: valid + `{"limit":9}`, wantErr: "unexpected data after the JSON value"},
+		{name: "stray closing brace", body: valid + "}", wantErr: "unexpected data after the JSON value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tt.body))
+			if tt.nilBody {
+				r.Body = nil
+			}
+			got := sentinel
+
+			err := decodeJSONBody(r, &got)
+
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, got)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+			assert.NotContains(t, err.Error(), secret, "error must not echo body values")
+			assert.Equal(t, sentinel, got, "dst must be untouched when decoding fails")
+		})
+	}
+}
+
+// TestDecodeJSONBody_OversizedBodyIsNotBuffered proves the cap bounds how
+// much of a hostile body is read, not just whether it is accepted.
+func TestDecodeJSONBody_OversizedBodyIsNotBuffered(t *testing.T) {
+	src := &countingReader{r: strings.NewReader(`{"contract_id":"` + strings.Repeat("A", 1<<20) + `"}`)}
+	r := httptest.NewRequest(http.MethodPost, "/", src)
+
+	var dst struct {
+		ContractID string `json:"contract_id"`
+	}
+	err := decodeJSONBody(r, &dst)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "request body exceeds")
+	assert.LessOrEqual(t, src.n, maxJSONBodyBytes+1, "must stop reading one byte past the cap")
+}
+
+// TestDecodeJSONBody_RejectsNonPointerDst guards the scratch-value copy:
+// decoding needs somewhere addressable to publish the result.
+func TestDecodeJSONBody_RejectsNonPointerDst(t *testing.T) {
+	var nilPtr *struct{}
+	for _, dst := range []any{nil, struct{}{}, nilPtr} {
+		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+		err := decodeJSONBody(r, dst)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "dst must be a non-nil pointer")
 	}
 }

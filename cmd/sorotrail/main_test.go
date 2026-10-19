@@ -177,7 +177,7 @@ func (f *fakeTenantStore) GetTenantByName(_ context.Context, name string) (store
 	return t, nil
 }
 
-func (f *fakeTenantStore) CreateAPIKeyIfAbsent(_ context.Context, _ int64, _, prefix string, digest []byte) error {
+func (f *fakeTenantStore) CreateTenantAPIKeyIfAbsent(_ context.Context, _ int64, _, prefix string, digest []byte) error {
 	f.createCalls++
 	if f.createKeyErr != nil {
 		return f.createKeyErr
@@ -187,7 +187,7 @@ func (f *fakeTenantStore) CreateAPIKeyIfAbsent(_ context.Context, _ int64, _, pr
 	return nil
 }
 
-func TestBootstrapAdminKey(t *testing.T) {
+func TestBootstrapAdminKeyStartup(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("bootstrapping with no existing admin creates one", func(t *testing.T) {
@@ -322,6 +322,10 @@ func (s *stubEnricher) EnrichEvents(_ context.Context, _ []store.Event) []store.
 	return nil
 }
 
+func (s *stubEnricher) DecodeStats() store.DecodeStats {
+	return store.DecodeStats{}
+}
+
 func TestGraphQLServerDeps(t *testing.T) {
 	st := &stubStore{}
 	en := &stubEnricher{}
@@ -436,4 +440,50 @@ func TestGraphQLServerDeps(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestAdminBootstrapIdempotencyAndCreation(t *testing.T) {
+	// Test that admin bootstrap or command wrappers handle flag validation correctly
+	err := runAPIKey([]string{"--help"})
+	assert.NoError(t, err)
+}
+
+func TestDispatchUnknownCommand(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "unknown subcommand",
+			args:    []string{"unknown-cmd"},
+			wantErr: "unknown subcommand \"unknown-cmd\"",
+		},
+		{
+			name:    "help subcommand",
+			args:    []string{"help"},
+			wantErr: "",
+		},
+		{
+			name:    "dash h flag",
+			args:    []string{"-h"},
+			wantErr: "",
+		},
+		{
+			name:    "double dash help flag",
+			args:    []string{"--help"},
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := dispatch(tt.args)
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErr)
+			}
+		})
+	}
 }

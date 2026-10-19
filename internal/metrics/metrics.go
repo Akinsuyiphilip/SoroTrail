@@ -36,12 +36,62 @@ var (
 	})
 
 	// RPCCallLatency records the wall-clock duration of a single
-	// JSON-RPC call (HTTP round trip + body read + unmarshal).
-	RPCCallLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+	// JSON-RPC call (HTTP round trip + body read + unmarshal), labelled
+	// by method (a fixed enum: getEvents, getLatestLedger, getHealth,
+	// getLedgerEntries, simulateTransaction) and outcome (success |
+	// error). The histogram's _count for a (method, outcome) pair is the
+	// call total, so this single metric answers both "how slow" and
+	// "how many, and how many failed".
+	RPCCallLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "sorotrail_rpc_call_duration_seconds",
-		Help:    "RPC call latency in seconds (HTTP round trip + body read + parse).",
+		Help:    "RPC call latency in seconds (HTTP round trip + body read + parse), labelled by method and outcome.",
 		Buckets: prometheus.DefBuckets,
-	})
+	}, []string{"method", "outcome"})
+
+	// RPCRetriesTotal counts every retry attempt issued by RetryClient
+	// (attempts after the first). reason is where the wait came from:
+	// "backoff" for the computed exponential schedule, "retry_after"
+	// for a provider-supplied 429 Retry-After hint.
+	RPCRetriesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_rpc_retries_total",
+		Help: "Total number of RPC retry attempts, labelled by method and reason (backoff | retry_after).",
+	}, []string{"method", "reason"})
+
+	// RPCBackoffSeconds is the cumulative wall-clock time spent sleeping
+	// between retries. A long tail here means the provider (or our own
+	// rate limiter) is throttling us, which is cheap to spot next to the
+	// retry count.
+	RPCBackoffSeconds = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_rpc_backoff_seconds_total",
+		Help: "Total seconds spent sleeping between RPC retries, labelled by method.",
+	}, []string{"method"})
+
+	// RPCFailoversTotal counts failover events in the multi-provider
+	// client: "switch" when traffic moved to a different provider,
+	// "reanchor" when a cursor request hit ErrFailoverReanchor and the
+	// caller had to discard its cursor.
+	RPCFailoversTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_rpc_failovers_total",
+		Help: "Total number of RPC provider failover events, labelled by reason (switch | reanchor).",
+	}, []string{"reason"})
+
+	// RPCCircuitBreakerState exposes the circuit breaker's current state
+	// as a 0/1 gauge per state (closed | open | half-open), so a stuck
+	// breaker is visible at a glance and PromQL can alert on
+	// sorotrail_rpc_circuit_breaker_state{state="open"} == 1.
+	RPCCircuitBreakerState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sorotrail_rpc_circuit_breaker_state",
+		Help: "Circuit breaker state as a 0/1 gauge per state (closed | open | half-open).",
+	}, []string{"state"})
+
+	// RPCProviderState exposes each failover provider's health state as
+	// a 0/1 gauge per (provider, state) pair (active | degraded | down).
+	// The provider label is the URL's hostname only — credentials and
+	// scheme are never exposed (see rpc.providerLabel).
+	RPCProviderState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sorotrail_rpc_provider_state",
+		Help: "Per-provider failover health state as a 0/1 gauge per state (active | degraded | down).",
+	}, []string{"provider", "state"})
 
 	// DBWriteLatency records the wall-clock duration of a database write
 	// operation (batch upsert, replace-in-range, etc.).
@@ -51,14 +101,25 @@ var (
 		Buckets: prometheus.DefBuckets,
 	})
 
-	// DBQueryDuration records the wall-clock duration of a database query
-	// (SELECT operations). Labelled by operation (e.g. "list_events",
-	// "count_events", "get_contract").
+	// DBQueryDuration records the wall-clock duration of a store operation.
+	// It is labelled by operation (the Store method name, a bounded set) and
+	// covers reads and writes alike, so a slow database is attributable to a
+	// specific operation rather than showing up only as a slow API.
 	DBQueryDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "sorotrail_db_query_duration_seconds",
-		Help:    "Database query duration in seconds, labelled by operation.",
+		Help:    "Store operation duration in seconds, labelled by operation.",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"operation"})
+
+	// DBOperationsTotal counts every store operation by method name and
+	// outcome. The operation label is a fixed enum of Store method names and
+	// never a contract id, so cardinality is bounded. Errors are counted
+	// separately from successes so a failing backend is a direct query rather
+	// than something inferred by subtracting histograms.
+	DBOperationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sorotrail_db_operations_total",
+		Help: "Total store operations, labelled by operation and outcome (success | error).",
+	}, []string{"operation", "outcome"})
 
 	// IngestionLag is the number of ledgers the indexer is behind the
 	// Stellar RPC chain head. Updated after every ingestion pass that
@@ -121,11 +182,17 @@ func init() {
 		RPCCallLatency,
 		DBWriteLatency,
 		DBQueryDuration,
+		DBOperationsTotal,
 		IngestionLag,
 		EventBatchWrites,
 		EventBatchSize,
 		EventBackpressure,
 		EventBackpressureSeconds,
+		RPCRetriesTotal,
+		RPCBackoffSeconds,
+		RPCFailoversTotal,
+		RPCCircuitBreakerState,
+		RPCProviderState,
 	)
 }
 
