@@ -160,7 +160,7 @@ type fakeTenants struct {
 	tenants map[int64]store.Tenant
 	grants  map[int64][]string
 	keys    map[string]keyRecord
-	watched map[int64][]string
+	watched map[int64]map[string][]string
 
 	usage map[int64][]store.TenantUsage
 }
@@ -179,7 +179,7 @@ func newFakeTenants() *fakeTenants {
 		tenants: map[int64]store.Tenant{},
 		grants:  map[int64][]string{},
 		keys:    map[string]keyRecord{},
-		watched: map[int64][]string{},
+		watched: map[int64]map[string][]string{},
 		usage:   map[int64][]store.TenantUsage{},
 	}
 }
@@ -239,22 +239,39 @@ func (f *fakeTenants) ListTenantAPIKeys(_ context.Context, tenantID int64) ([]st
 	}
 	return out, nil
 }
-func (f *fakeTenants) ListTenantWatchedContracts(_ context.Context, tenantID int64) ([]string, error) {
-	return f.watched[tenantID], nil
+func (f *fakeTenants) ListTenantWatchedContracts(_ context.Context, tenantID int64, network string) ([]string, error) {
+	network = defaultNetworkLabel(network)
+	if f.watched[tenantID] == nil {
+		return nil, nil
+	}
+	return f.watched[tenantID][network], nil
 }
-func (f *fakeTenants) AddTenantWatchedContract(_ context.Context, t store.Tenant, contractID string, _ int) error {
-	f.watched[t.ID] = append(f.watched[t.ID], contractID)
+func (f *fakeTenants) AddTenantWatchedContract(_ context.Context, t store.Tenant, network, contractID string, _ int) error {
+	network = defaultNetworkLabel(network)
+	if f.watched[t.ID] == nil {
+		f.watched[t.ID] = map[string][]string{}
+	}
+	for _, c := range f.watched[t.ID][network] {
+		if c == contractID {
+			return nil
+		}
+	}
+	f.watched[t.ID][network] = append(f.watched[t.ID][network], contractID)
 	return nil
 }
-func (f *fakeTenants) RemoveTenantWatchedContract(_ context.Context, tenantID int64, contractID string) error {
-	list := f.watched[tenantID]
+func (f *fakeTenants) RemoveTenantWatchedContract(_ context.Context, tenantID int64, network, contractID string) error {
+	network = defaultNetworkLabel(network)
+	if f.watched[tenantID] == nil {
+		return nil
+	}
+	list := f.watched[tenantID][network]
 	out := list[:0]
 	for _, c := range list {
 		if c != contractID {
 			out = append(out, c)
 		}
 	}
-	f.watched[tenantID] = out
+	f.watched[tenantID][network] = out
 	return nil
 }
 func (f *fakeTenants) TouchTenantAPIKey(context.Context, int64) error { return nil }
@@ -322,6 +339,7 @@ func newTenantFixtureWithStatsTTL(t *testing.T, ttl time.Duration) *tenantFixtur
 	srv := New(st, &stubRPC{health: rpc.Health{Status: "healthy"}},
 		slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key").
 		WithMultiTenancy(tenants, MultiTenantOptions{MaxWatchedContracts: 10})
+	srv.SetHTTPRequestBodyLimit(1 << 20)
 	srv.SetStatsTTL(ttl)
 	f.srv = srv.Router()
 	return f
@@ -1286,11 +1304,54 @@ func TestTenantListEndpoints_TotalCountHeader(t *testing.T) {
 
 	t.Run("tenant watch list reports the number of watched contracts", func(t *testing.T) {
 		// Seed two claims directly, then read them back through the API.
-		f.tenants.watched[1] = []string{contractA, contractB}
+		f.tenants.watched[1] = map[string][]string{"default": {contractA, contractB}}
 		rec := f.get(t, f.keyA, "/tenant/watch")
 		require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
 		assert.Equal(t, "2", rec.Header().Get("X-Total-Count"))
 	})
+}
+
+func TestTenantWatch_MultiNetwork(t *testing.T) {
+	f := newTenantFixture(t)
+
+	// Watch contractA on default network (omitting network).
+	rec := f.post(t, f.keyA, "/tenant/watch", fmt.Sprintf(`{"contract_id":%q}`, contractA))
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+
+	// Watch the same contractA on testnet, plus contractB on testnet.
+	rec = f.post(t, f.keyA, "/tenant/watch", fmt.Sprintf(`{"contract_id":%q,"network":"testnet"}`, contractA))
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+	rec = f.post(t, f.keyA, "/tenant/watch", fmt.Sprintf(`{"contract_id":%q,"network":"testnet"}`, contractB))
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+
+	// Default network list contains only contractA.
+	rec = f.get(t, f.keyA, "/tenant/watch")
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+	var defaultWatched struct {
+		ContractIDs []string `json:"contract_ids"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &defaultWatched))
+	assert.Equal(t, []string{contractA}, defaultWatched.ContractIDs)
+
+	// Testnet list contains both contractA and contractB.
+	rec = f.get(t, f.keyA, "/tenant/watch?network=testnet")
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+	var testnetWatched struct {
+		ContractIDs []string `json:"contract_ids"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &testnetWatched))
+	assert.Equal(t, []string{contractA, contractB}, testnetWatched.ContractIDs)
+
+	// Removing contractA on testnet leaves contractA on default intact.
+	rec = f.do(t, http.MethodDelete, f.keyA, "/tenant/watch/"+contractA+"?network=testnet", "")
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &testnetWatched))
+	assert.Equal(t, []string{contractB}, testnetWatched.ContractIDs)
+
+	rec = f.get(t, f.keyA, "/tenant/watch")
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &defaultWatched))
+	assert.Equal(t, []string{contractA}, defaultWatched.ContractIDs)
 }
 
 // TestGrantAndRevokeTakeEffectImmediately verifies that adding or
