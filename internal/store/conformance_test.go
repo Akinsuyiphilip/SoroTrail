@@ -20,6 +20,10 @@ import (
 const (
 	contractA = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	contractB = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	// contractInventoryC is the third fixture contract in the shared
+	// inventory test. It is named separately from the integration-tagged
+	// suite's contractC so the two build flavours can coexist.
+	contractInventoryC = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
 )
 
 func eventID(n int) string {
@@ -53,6 +57,7 @@ var conformanceTestNames = []string{
 	"Stats",
 	"RawXDRRoundTrip",
 	"ReplaceEventsInRangeKeepsRawXDR",
+	"ContractInventory",
 }
 
 // conformanceBackend is one Store implementation the shared suite runs
@@ -158,6 +163,7 @@ func runStoreTests(t *testing.T, backend conformanceBackend) {
 		{"Stats", testStats},
 		{"RawXDRRoundTrip", testRawXDRRoundTrip},
 		{"ReplaceEventsInRangeKeepsRawXDR", testReplaceEventsInRangeKeepsRawXDR},
+		{"ContractInventory", testContractInventory},
 	}
 
 	for _, tc := range tests {
@@ -592,6 +598,184 @@ func testRawXDRRoundTrip(t *testing.T, st Store) {
 	assert.Empty(t, gotLegacy.RawValueXDR)
 }
 
+// testContractInventory is the backend-agnostic contract-inventory test.
+// ListContracts, GetContractSummary and ContractEventTypeCounts are easy to
+// implement three slightly different ways — different tiebreaks, different
+// cursor normalization, different zero values — so the same fixture is run
+// against every backend that claims to support them.
+func testContractInventory(t *testing.T, st Store) {
+	ctx := context.Background()
+
+	// A has the widest activity; B is the single-event edge case; C sits
+	// between them. Last-seen times are distinct so ordering the last_seen
+	// sort is deterministic without relying on the contract_id tiebreak.
+	aTime := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	bTime := time.Date(2026, 8, 1, 12, 1, 0, 0, time.UTC)
+	cTime := time.Date(2026, 8, 1, 12, 2, 0, 0, time.UTC)
+
+	a1 := testEvent(eventID(1), 100, contractA)
+	a2 := testEvent(eventID(2), 101, contractA)
+	a2.Type = "system"
+	a3 := testEvent(eventID(3), 102, contractA)
+	a1.CreatedAt, a2.CreatedAt, a3.CreatedAt = aTime, aTime, aTime
+
+	b1 := testEvent(eventID(4), 200, contractB)
+	b1.CreatedAt = bTime
+
+	c1 := testEvent(eventID(5), 300, contractInventoryC)
+	c2 := testEvent(eventID(6), 301, contractInventoryC)
+	c1.CreatedAt, c2.CreatedAt = cTime, cTime
+
+	_, err := st.UpsertEvents(ctx, []Event{a1, a2, a3, b1, c1, c2})
+	require.NoError(t, err)
+
+	t.Run("default listing groups counts and ledger ranges", func(t *testing.T) {
+		got, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 10})
+		require.NoError(t, err)
+		assert.Empty(t, cursor, "no next page when everything fits")
+
+		require.Len(t, got, 3)
+		assert.Equal(t, contractA, got[0].ContractID)
+		assert.Equal(t, int64(3), got[0].EventCount)
+		assert.Equal(t, int64(100), got[0].FirstLedger)
+		assert.Equal(t, int64(102), got[0].LastLedger)
+		assert.True(t, got[0].LastSeen.Equal(aTime), "last_seen = %v, want %v", got[0].LastSeen, aTime)
+
+		assert.Equal(t, contractB, got[1].ContractID)
+		assert.Equal(t, int64(1), got[1].EventCount, "a one-event contract is not dropped or double-counted")
+		assert.Equal(t, int64(200), got[1].FirstLedger)
+		assert.Equal(t, int64(200), got[1].LastLedger)
+
+		assert.Equal(t, contractInventoryC, got[2].ContractID)
+		assert.Equal(t, int64(2), got[2].EventCount)
+		assert.Equal(t, int64(300), got[2].FirstLedger)
+		assert.Equal(t, int64(301), got[2].LastLedger)
+	})
+
+	t.Run("cursor paging walks every contract exactly once", func(t *testing.T) {
+		page1, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 2})
+		require.NoError(t, err)
+		require.Len(t, page1, 2)
+		require.NotEmpty(t, cursor, "a full page means more rows follow")
+		assert.Equal(t, []string{contractA, contractB}, []string{page1[0].ContractID, page1[1].ContractID})
+
+		page2, cursor2, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Cursor: cursor})
+		require.NoError(t, err)
+		require.Len(t, page2, 1)
+		assert.Empty(t, cursor2, "cursor omitted on the last page")
+		assert.Equal(t, contractInventoryC, page2[0].ContractID)
+	})
+
+	t.Run("invalid cursor is reported as ErrInvalidContractsCursor", func(t *testing.T) {
+		_, _, err := st.ListContracts(ctx, ContractsFilter{Cursor: "!!!not-base64!!!"})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidContractsCursor)
+	})
+
+	t.Run("prefix filter narrows to matching contracts", func(t *testing.T) {
+		got, _, err := st.ListContracts(ctx, ContractsFilter{ContractIDPrefix: "CB", Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, contractB, got[0].ContractID)
+	})
+
+	t.Run("activity sort ranks busiest first", func(t *testing.T) {
+		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, got, 3)
+		assert.Equal(t, []string{contractA, contractInventoryC, contractB},
+			[]string{got[0].ContractID, got[1].ContractID, got[2].ContractID})
+	})
+
+	t.Run("ledger and last-seen sort orders", func(t *testing.T) {
+		cases := []struct {
+			sortKey string
+			want    []string
+		}{
+			{SortByFirstLedger, []string{contractInventoryC, contractB, contractA}},
+			{SortByLastLedger, []string{contractInventoryC, contractB, contractA}},
+			{SortByLastSeen, []string{contractInventoryC, contractB, contractA}},
+		}
+		for _, tc := range cases {
+			got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: tc.sortKey, Limit: 10})
+			require.NoError(t, err)
+			require.Len(t, got, len(tc.want), "sort %s", tc.sortKey)
+			assert.Equal(t, tc.want,
+				[]string{got[0].ContractID, got[1].ContractID, got[2].ContractID},
+				"sort %s", tc.sortKey)
+		}
+	})
+
+	t.Run("summary matches the listing", func(t *testing.T) {
+		got, err := st.GetContractSummary(ctx, contractA)
+		require.NoError(t, err)
+		assert.Equal(t, contractA, got.ContractID)
+		assert.Equal(t, int64(3), got.EventCount)
+		assert.Equal(t, int64(100), got.FirstLedger)
+		assert.Equal(t, int64(102), got.LastLedger)
+		assert.True(t, got.LastSeen.Equal(aTime), "last_seen = %v, want %v", got.LastSeen, aTime)
+
+		single, err := st.GetContractSummary(ctx, contractB)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), single.EventCount)
+		assert.Equal(t, int64(200), single.FirstLedger)
+		assert.Equal(t, int64(200), single.LastLedger)
+	})
+
+	t.Run("summary of an unknown contract is ErrNotFound", func(t *testing.T) {
+		_, err := st.GetContractSummary(ctx, "CDOESNOTEXIST")
+		assert.ErrorIs(t, err, ErrNotFound)
+	})
+
+	t.Run("event type breakdown counts each type", func(t *testing.T) {
+		got, err := st.ContractEventTypeCounts(ctx, contractA)
+		require.NoError(t, err)
+		require.Len(t, got, 2)
+		assert.Equal(t, "contract", got[0].Type)
+		assert.Equal(t, int64(2), got[0].Count)
+		assert.Equal(t, "system", got[1].Type)
+		assert.Equal(t, int64(1), got[1].Count)
+
+		empty, err := st.ContractEventTypeCounts(ctx, "CDOESNOTEXIST")
+		require.NoError(t, err)
+		assert.NotNil(t, empty, "an empty breakdown must not be nil")
+		assert.Empty(t, empty)
+	})
+
+	// Ties are the case a sort can silently lose rows on: two contracts
+	// with the same event count must still have a total order, or a page
+	// boundary inside the tie can repeat or skip one. This runs last
+	// because it adds rows the earlier assertions do not know about.
+	t.Run("ties break by contract_id descending", func(t *testing.T) {
+		const (
+			tieD = "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+			tieE = "CEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+		)
+		tieTime := time.Date(2026, 8, 1, 12, 3, 0, 0, time.UTC)
+		d1 := testEvent(eventID(10), 400, tieD)
+		d2 := testEvent(eventID(11), 401, tieD)
+		e1 := testEvent(eventID(12), 400, tieE)
+		e2 := testEvent(eventID(13), 401, tieE)
+		for _, e := range []*Event{&d1, &d2, &e1, &e2} {
+			e.CreatedAt = tieTime
+		}
+		_, err := st.UpsertEvents(ctx, []Event{d1, d2, e1, e2})
+		require.NoError(t, err)
+
+		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, got, 5)
+		assert.Equal(t, []string{contractA, tieE, tieD, contractInventoryC, contractB},
+			[]string{got[0].ContractID, got[1].ContractID, got[2].ContractID, got[3].ContractID, got[4].ContractID})
+
+		got, _, err = st.ListContracts(ctx, ContractsFilter{SortKey: SortByLastSeen, Limit: 10})
+		require.NoError(t, err)
+		require.Len(t, got, 5)
+		assert.Equal(t, []string{tieE, tieD, contractInventoryC, contractB, contractA},
+			[]string{got[0].ContractID, got[1].ContractID, got[2].ContractID, got[3].ContractID, got[4].ContractID})
+	})
+}
+
 // TestStoreUnsupportedOperations asserts that operations a backend does not
 // implement fail loudly with ErrUnsupported rather than returning a zero
 // value that reads as success. The behavioural suite above exercises what a
@@ -608,18 +792,6 @@ func TestStoreUnsupportedOperations(t *testing.T) {
 		name  string
 		probe func() error
 	}{
-		{"ListContracts", func() error {
-			_, _, err := st.ListContracts(ctx, ContractsFilter{})
-			return err
-		}},
-		{"GetContractSummary", func() error {
-			_, err := st.GetContractSummary(ctx, contractA)
-			return err
-		}},
-		{"ContractEventTypeCounts", func() error {
-			_, err := st.ContractEventTypeCounts(ctx, contractA)
-			return err
-		}},
 		{"CreateAPIKey", func() error {
 			_, err := st.CreateAPIKey(ctx, APIKey{})
 			return err
@@ -775,13 +947,13 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 	assert.NoError(t, err, "ListContracts is a zero-value stub on the clickhouse backend")
 
 	_, err = st.GetContractSummary(ctx, "test")
-	assert.ErrorContains(t, err, "not yet implemented",
-		"GetContractSummary should return an explicit unimplemented error")
+	assert.Error(t, err,
+		"GetContractSummary must surface the failed ClickHouse request rather than a zero-value summary")
 
 	// ContractEventTypeCounts should return an explicit error.
 	_, err = st.ContractEventTypeCounts(ctx, "test")
-	assert.ErrorContains(t, err, "not yet implemented for ClickHouse",
-		"ContractEventTypeCounts should return an explicit unsupported error")
+	assert.Error(t, err,
+		"ContractEventTypeCounts must surface the failed ClickHouse request")
 
 	// GetContractCursor is implemented on this backend, not stubbed: it
 	// issues a request. On a zero-value ClickHouse there is no server to
