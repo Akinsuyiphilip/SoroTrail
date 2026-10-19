@@ -660,8 +660,23 @@ func (c *ClickHouse) SaveAuditStateIfGreater(ctx context.Context, network string
 // removed_at set), so FINAL is what turns the append-only table back into
 // the presence list ingestion reads.
 func (c *ClickHouse) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
+	return c.ListWatchedContractsScoped(ctx, WildcardScope())
+}
+
+func (c *ClickHouse) ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error) {
+	if sc.DeniesAll() {
+		return []WatchedContract{}, nil
+	}
+	where := "removed_at IS NULL"
+	if !sc.IsWildcard() {
+		ids := sc.Contracts()
+		if len(ids) == 0 {
+			return []WatchedContract{}, nil
+		}
+		where += " AND contract_id IN (" + clickHouseQuoteList(ids) + ")"
+	}
 	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
-		"SELECT network, contract_id, added_at FROM watched_contracts FINAL WHERE removed_at IS NULL ORDER BY network, contract_id")
+		"SELECT network, contract_id, added_at FROM watched_contracts FINAL WHERE "+where+" ORDER BY network, contract_id")
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}

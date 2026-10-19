@@ -333,6 +333,22 @@ func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContra
 	return s.watchedList, s.watchedListErr
 }
 
+func (s *stubStore) ListWatchedContractsScoped(_ context.Context, sc store.Scope) ([]store.WatchedContract, error) {
+	if s.watchedListErr != nil {
+		return nil, s.watchedListErr
+	}
+	if sc.DeniesAll() {
+		return []store.WatchedContract{}, nil
+	}
+	out := make([]store.WatchedContract, 0, len(s.watchedList))
+	for _, wc := range s.watchedList {
+		if sc.Allows(wc.ContractID) {
+			out = append(out, wc)
+		}
+	}
+	return out, nil
+}
+
 func (s *stubStore) AddWatchedContract(_ context.Context, w store.WatchedContract) error {
 	s.added = append(s.added, w.ContractID)
 	return s.addErr

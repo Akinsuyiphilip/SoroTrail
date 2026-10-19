@@ -958,6 +958,10 @@ type Store interface {
 	// Removal is implicit per network — an entry disappears from the
 	// union when the last row naming it on that network is gone.
 	ListWatchedContracts(ctx context.Context) ([]WatchedContract, error)
+	// ListWatchedContractsScoped returns the watched contracts restricted to
+	// the caller's Scope (used by the GraphQL contracts query so a tenant
+	// cannot enumerate another tenant's watched contracts).
+	ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error)
 	AddWatchedContract(ctx context.Context, w WatchedContract) error
 	// RemoveWatchedContract stops future ingestion for the given
 	// contract on the given network by removing its row from
