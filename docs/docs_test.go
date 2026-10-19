@@ -174,6 +174,7 @@ func TestRequiredSections(t *testing.T) {
 				"## RPC errors",
 				"## Database errors",
 				"## API errors",
+				"### A contract is watched but no events are ingested",
 				"## Replay errors",
 				"## First things to check",
 			},
@@ -187,6 +188,7 @@ func TestRequiredSections(t *testing.T) {
 				"### Request and ingest lifecycle",
 				"### Replay lifecycle",
 				"## Components",
+				"#### The watch list and its network dimension",
 			},
 		},
 		{
