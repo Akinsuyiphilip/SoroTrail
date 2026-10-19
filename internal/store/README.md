@@ -18,13 +18,30 @@ The shared conformance suite in `conformance_test.go` runs the same assertions a
 
 | Capability | Postgres | SQLite | ClickHouse |
 | --- | --- | --- | --- |
-| Events, queries, pagination | yes | yes | declared unsupported |
-| Ingestion/audit state, watched contracts | yes | yes | declared unsupported |
-| Per-contract cursors | yes | `ErrUnsupported` | declared unsupported |
-| Contract inventory (`ListContracts`, summaries, metadata) | yes | `ErrUnsupported` | declared unsupported |
-| API keys | yes | `ErrUnsupported` | `ErrUnsupported` |
+| Events, queries, pagination | yes | yes | implemented, but declared unsupported in conformance |
+| Ingestion/audit state, watched contracts | yes | yes | yes |
+| Per-contract cursors | yes | yes | yes |
+| Contract inventory (`ListContracts`, summary, type counts) | yes | yes | summary and type counts yes; `ListContracts` is a silent empty page |
+| Contract metadata (enrichment) | yes | `ErrUnsupported` | silent empty results |
+| API keys | yes | `ErrUnsupported` | plain errors (not `ErrUnsupported`) |
 | Server required for tests | `TEST_DATABASE_URL` | no | `TEST_CLICKHOUSE_URL` |
 
-SQLite deliberately stays a single-node backend: per-contract resume positions and the contract inventory endpoints are Postgres-only, and both now refuse explicitly rather than returning an empty result.
+SQLite is the single-node backend, but its read surface is no longer a
+second-class one: contract inventory, summaries and the per-type event
+breakdown are implemented against the same aggregate shape as Postgres.
+Contract metadata enrichment remains Postgres-only and refuses explicitly.
 
-ClickHouse now implements the event read path, ingestion/audit state, watched contracts, per-contract cursors, subscriptions and the dead-letter queue, but the conformance registration above still declares it unsupported wholesale: the suite truncates between tests on shared backends, which this backend cannot do over its HTTP interface yet, and topic-filtered event queries return `ErrUnsupported` (the schema stores `topics` as an opaque JSON string, so jsonb containment cannot be expressed). Those tests are therefore skipped until a live `TEST_CLICKHOUSE_URL` server can be used to verify and narrow the declaration.
+ClickHouse implements the event read path, ingestion/audit state, watched
+contracts, per-contract cursors, subscriptions, the dead-letter queue and the
+contract summary/type-count reads, but its conformance registration above
+still declares the behavioural suite unsupported wholesale: the suite
+truncates between tests on shared backends, which this backend cannot do over
+its HTTP interface yet, and topic-filtered event queries return
+`ErrUnsupported` (the schema stores `topics` as an opaque JSON string, so
+jsonb containment cannot be expressed). Those tests are therefore skipped
+until a live `TEST_CLICKHOUSE_URL` server can be used to verify and narrow the
+declaration.
+
+The full ClickHouse support matrix — including the methods that silently
+return zero values rather than refusing — lives in
+[docs/clickhouse.md](../../docs/clickhouse.md).

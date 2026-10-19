@@ -13,12 +13,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // readDoc loads a markdown file from this directory.
@@ -293,5 +296,75 @@ func TestTroubleshootingEntriesAreActionable(t *testing.T) {
 					"entry %q must state %s", title, field)
 			}
 		})
+	}
+}
+
+// TestClickHouseSupportMatrixMatchesStoreInterface keeps the ClickHouse
+// support matrix honest in both directions: every method it names must still
+// exist on store.Store, and every Store method must be named somewhere in the
+// matrix. The state column stays a human judgement, but adding a method to the
+// interface now fails CI until its ClickHouse behaviour is documented too.
+func TestClickHouseSupportMatrixMatchesStoreInterface(t *testing.T) {
+	doc := readDoc(t, "clickhouse.md")
+
+	// Scope the scan to the matrix section so examples and prose cannot
+	// satisfy the coverage check by accident.
+	_, section, ok := strings.Cut(doc, "## Support matrix")
+	require.True(t, ok, "clickhouse.md must have a ## Support matrix section")
+	if end := strings.Index(section, "\n## "); end >= 0 {
+		section = section[:end]
+	}
+
+	// Non-method identifiers are allowed in table cells; anything else
+	// backticked and capitalised is treated as a Store method name.
+	nonMethods := map[string]bool{
+		"ErrUnsupported": true,
+		"ErrNotFound":    true,
+	}
+
+	backtick := regexp.MustCompile("`([^`]+)`")
+	named := map[string]bool{}
+	for _, line := range strings.Split(section, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "|") {
+			continue
+		}
+		// The matrix layout is | Capability | Methods | State | Notes |,
+		// so only the Methods cell contributes method names. Restricting
+		// the scan here keeps SQL keywords and notes from being mistaken
+		// for interface methods.
+		cells := strings.Split(line, "|")
+		if len(cells) < 3 {
+			continue
+		}
+		methodCell := cells[2]
+		if strings.TrimSpace(methodCell) == "Methods" {
+			continue // header row
+		}
+		for _, m := range backtick.FindAllStringSubmatch(methodCell, -1) {
+			token := m[1]
+			if token == "" || nonMethods[token] {
+				continue
+			}
+			// Exported Go identifiers start uppercase; prose identifiers
+			// are not methods.
+			if token[0] < 'A' || token[0] > 'Z' {
+				continue
+			}
+			named[token] = true
+		}
+	}
+	require.NotEmpty(t, named, "the support matrix must name Store methods")
+
+	storeType := reflect.TypeOf((*store.Store)(nil)).Elem()
+	for name := range named {
+		_, ok := storeType.MethodByName(name)
+		assert.Truef(t, ok,
+			"clickhouse.md names %q as a Store method, but store.Store no longer has it", name)
+	}
+	for i := 0; i < storeType.NumMethod(); i++ {
+		name := storeType.Method(i).Name
+		assert.Truef(t, named[name],
+			"store.Store.%s is not named in the ClickHouse support matrix; document whether it is implemented, refuses, or silently does nothing", name)
 	}
 }

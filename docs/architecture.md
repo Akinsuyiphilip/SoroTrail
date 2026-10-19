@@ -279,11 +279,19 @@ enables alternative storage backends without changing any consumer.
 | `Stats` | Aggregate statistics for `/stats` |
 | `Ping` | Dependency health check |
 
-#### Postgres backend (`store.Postgres`)
+#### Backend implementations
 
-The only backend implemented today. Uses `pgx` (plain SQL, no ORM) with a
-connection pool. Schema changes are managed via numbered migration pairs in
-`internal/store/migrations/`.
+- **Postgres** (`store.Postgres`) is the reference backend. It uses `pgx`
+  (plain SQL, no ORM) with a connection pool, and schema changes are managed
+  via numbered migration pairs in `internal/store/migrations/`.
+- **SQLite** (`store.SQLite`) is the single-node backend selected with a
+  `sqlite:` URL. It implements the event path and contract inventory; token
+  metadata enrichment remains Postgres-only and refuses explicitly.
+- **ClickHouse** (`store.ClickHouse`) is an optional analytical backend
+  selected with a `clickhouse:` URL. It is not a drop-in replacement for
+  Postgres: some methods refuse and others silently return zero values. Its
+  capability matrix is documented in
+  [ClickHouse backend support](clickhouse.md).
 
 **Schema highlights:**
 
@@ -451,14 +459,20 @@ ingest rather than silently producing incorrect results:
 The `store.Store` interface is the persistence boundary. It is designed so
 that each method is independently testable and replaceable:
 
-- **Postgres** (`store.Postgres`): the only backend implemented today.
-  Uses `pgx` with plain SQL. Migrations are numbered pairs in
+- **Postgres** (`store.Postgres`) is the reference backend. It uses `pgx`
+  with plain SQL. Migrations are numbered pairs in
   `internal/store/migrations/`.
 
-- **Alternative backends**: the interface is intentionally minimal. A
-  contributor can implement `Store` for SQLite, DynamoDB, or any other
-  persistence layer. The contract requires `QueryEvents` to return events
-  in ascending ID order for cursor pagination to work.
+- **SQLite and ClickHouse** are the alternative backends selected by
+  `DATABASE_URL`. SQLite implements the event path and contract inventory for
+  single-node deployments; ClickHouse is an optional analytical backend whose
+  support matrix — including the methods that silently do nothing — is in
+  [ClickHouse backend support](clickhouse.md).
+
+- **Further backends**: the interface is intentionally minimal. A contributor
+  can implement `Store` for DynamoDB or another persistence layer. The
+  contract requires `QueryEvents` to return events in ascending ID order for
+  cursor pagination to work.
 
 Replay-specific persistence (`store.ReplayLock`, `GetReplayState`, etc.) is
 deliberately **not** part of the `Store` interface. It lives on
@@ -473,6 +487,8 @@ forced to implement one.
 | Stellar RPC client | ✅ Complete — `getEvents`, `getLatestLedger`, `getHealth` |
 | XDR decoder | ✅ Complete — all ScVal types handled, lossless fallback |
 | Postgres store | ✅ Complete — full `Store` interface implemented |
+| SQLite store | ✅ Event path + contract inventory; token metadata enrichment refuses explicitly |
+| ClickHouse store | ⚠️ Optional analytical backend with documented gaps — see [ClickHouse backend support](clickhouse.md) |
 | Ingester | ✅ Complete — cold/warm start, filter batching, backoff |
 | HTTP API | ✅ Complete — events, health, stats, contract queries |
 | Auditor | ✅ Complete — verification, auto-repair, finding lifecycle |
