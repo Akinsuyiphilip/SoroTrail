@@ -15,7 +15,7 @@
 //
 // Never point TEST_DATABASE_URL at a database you care about — the
 // shared path truncates the events / ingestion_state / watched_contracts
-// / replay_state / audit_* tables.
+// / replay_state / dead_letters / audit_* tables.
 //
 // The cycle that this helper would otherwise create — package store
 // tests importing testdb while testdb imports store for store.Migrate —
@@ -33,13 +33,12 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
 // Setup returns a migrated *pgxpool.Pool scoped to the test. If migrate is
 // nil the caller accepts responsibility for having migrated the database;
-// if it's set, run it before the (optional) troncation.
+// if it's set, run it before the (optional) truncation.
 //
 // On hosts without Docker / testcontainers support, t.Skip is called.
 func Setup(t *testing.T, migrate func(url string) error) *pgxpool.Pool {
@@ -82,14 +81,22 @@ func setupShared(t *testing.T, ctx context.Context, url string, migrate func(url
 	return pool
 }
 
+// runPostgresContainer is a seam for tests. Without a live Docker daemon
+// there is no way to make testcontainers return the "Docker unavailable"
+// error shape, so the skip path in setupContainer is otherwise untestable.
+// Production always points this at tcpostgres.Run.
+var runPostgresContainer = tcpostgres.Run
+
 // setupContainer brings up an ephemeral Postgres 16-alpine container with
-// a fresh database. The postgres module ships its own default readiness
-// wait strategy; we don't redeclare it here so a startup failure surfaces
-// the underlying error rather than masking it behind a duplicate probe.
+// a fresh database. testcontainers-go v0.44 no longer applies a default
+// readiness wait strategy in the postgres module, so declare the module's
+// own BasicWaitStrategies: it waits for the initdb restart to finish and
+// for the mapped port to accept connections. Without it, migrate() races
+// Postgres startup and fails with "connection refused".
 func setupContainer(t *testing.T, ctx context.Context, migrate func(url string) error) *pgxpool.Pool {
 	t.Helper()
-	pgC, err := tcpostgres.RunContainer(ctx,
-		testcontainers.WithImage("postgres:16-alpine"),
+	pgC, err := runPostgresContainer(ctx, "postgres:16-alpine",
+		tcpostgres.BasicWaitStrategies(),
 	)
 	if err != nil {
 		if isDockerUnavailable(err) {
@@ -144,6 +151,18 @@ func isDockerUnavailable(err error) bool {
 
 // truncateAll wipes the tables every package's tests touch. New tables
 // added in later migrations belong here.
+//
+// It also drops every non-default events partition: range partitions are
+// DDL, so TRUNCATE clears their rows but leaves them behind, and the
+// store package's partition-span experiments (e.g. span=10) can leave a
+// narrow child that a later package's default-span (120960) partition
+// would overlap ("partition would overlap partition", SQLSTATE 42P17).
+// Dropping them here keeps every package's DB-backed tests starting from
+// the clean layout Migrate produced, regardless of what a previous
+// package did. Those experiments also drop the default partition itself
+// when they rebuild the partition set, so recreate it when missing;
+// otherwise a later insert outside the leftover range children fails
+// with "no partition of relation events found for row".
 func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 	_, err := pool.Exec(ctx, `TRUNCATE
 		events,
@@ -151,10 +170,56 @@ func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 		audit_state,
 		audit_findings,
 		watched_contracts,
-		replay_state
-		RESTART IDENTITY`)
+		replay_state,
+		dead_letters,
+		api_keys,
+		subscriptions,
+		delivery_attempts,
+		backfill_state,
+		contract_cursors,
+		contract_meta,
+		contract_specs,
+		contract_spec_overrides,
+		event_addresses,
+		token_balances,
+		token_balance_state,
+		archive_chunks,
+		tenant_usage,
+		tenant_api_keys,
+		tenant_watched_contracts,
+		tenant_contract_grants,
+		tenants
+		RESTART IDENTITY CASCADE`)
 	if err != nil {
 		return fmt.Errorf("truncating tables: %w", err)
+	}
+	_, err = pool.Exec(ctx, `
+		INSERT INTO tenants (name, wildcard, is_admin, enabled)
+		VALUES ('default', true, true, true)
+		ON CONFLICT (name) DO NOTHING;`)
+	if err != nil {
+		return fmt.Errorf("re-seeding default tenant: %w", err)
+	}
+	_, err = pool.Exec(ctx, `
+		DO $$
+		DECLARE
+		    child text;
+		BEGIN
+		    FOR child IN
+		        SELECT c.relname
+		        FROM pg_inherits i
+		        JOIN pg_class c ON c.oid = i.inhrelid
+		        JOIN pg_class p ON p.oid = i.inhparent
+		        WHERE p.relname = 'events' AND c.relname <> 'events_default'
+		    LOOP
+		        EXECUTE format('DROP TABLE IF EXISTS %I', child);
+		    END LOOP;
+		    IF to_regclass('public.events_default') IS NULL THEN
+		        CREATE TABLE events_default PARTITION OF events DEFAULT;
+		    END IF;
+		END $$;`)
+	if err != nil {
+		return fmt.Errorf("resetting event partitions: %w", err)
 	}
 	return nil
 }

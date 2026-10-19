@@ -28,7 +28,7 @@ when it is switched on.
 | Concept | Meaning |
 | --- | --- |
 | **Tenant** | One consumer of the deployment. Owns keys, grants, a watch list and quotas. |
-| **API key** | A credential belonging to exactly one tenant. Only its SHA-256 digest is stored. |
+| **API key** | A credential belonging to exactly one tenant (see [API Keys](api-keys.md)). Only its SHA-256 digest is stored. |
 | **Grant** | A contract ID a tenant may *read*. |
 | **Watch-list entry** | A contract a tenant has asked to have *ingested*. |
 | **Wildcard** | A tenant that reads every contract, granted or not. |
@@ -231,7 +231,8 @@ explicitly.
 
 `GET /events/ws` is scoped at subscribe time **and** on every dispatch, and
 the filter cannot widen it — authorization is evaluated before, and
-independently of, the user's filter.
+independently of, the user's filter. See [Live Subscriptions](subscriptions.md)
+for protocol details, delivery guarantees, and client catch-up patterns.
 
 Grants change while a stream is open, so the subscription re-resolves them
 every `MULTI_TENANT_STREAM_SCOPE_SYNC` (default 30s):

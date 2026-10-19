@@ -8,9 +8,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
+	"github.com/sorotrail/sorotrail/internal/tracing/tracingtest"
 ) // stubReingest is a stand-in for ingester.Ingester. It records filter-batches
 // and reingest-range calls so tests can verify the auditor's path.
 type stubReingest struct {
@@ -18,9 +20,19 @@ type stubReingest struct {
 	ranges   []struct{ From, To uint32 }
 	filters  []rpc.EventFilter
 	reingest func(ctx context.Context, client rpc.Client, from, to uint32) (int, error)
+
+	// filtersErr, when set, is returned by BuildFilterBatches so tests
+	// can exercise the batch-construction failure path.
+	filtersErr error
+	// pageLimit overrides PageLimit() so tests can force small getEvents
+	// pages and drive the pagination loop through multiple round-trips.
+	pageLimit uint
 }
 
 func (s *stubReingest) BuildFilterBatches(context.Context) ([][]rpc.EventFilter, error) {
+	if s.filtersErr != nil {
+		return nil, s.filtersErr
+	}
 	return [][]rpc.EventFilter{s.filters}, nil
 }
 
@@ -34,9 +46,14 @@ func (s *stubReingest) ReingestRange(ctx context.Context, client rpc.Client, fro
 	return 0, nil
 }
 
-// PageLimit satisfies the audit.Reingester interface; tests don't
-// observe it directly.
-func (s *stubReingest) PageLimit() uint { return 1000 }
+// PageLimit satisfies the audit.Reingester interface; tests override the
+// value via stubReingest.pageLimit to exercise pagination.
+func (s *stubReingest) PageLimit() uint {
+	if s.pageLimit != 0 {
+		return s.pageLimit
+	}
+	return 1000
+}
 
 // Network returns the network name for the reingester.
 func (s *stubReingest) Network() string { return "default" }
@@ -425,4 +442,64 @@ func TestSaveAuditStateIfGreater_RaceConditionFree(t *testing.T) {
 // DeleteEventsBefore satisfies store.Store; this mock never prunes.
 func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
 	return 0, nil
+}
+
+func TestPassOnce_SpanHierarchy(t *testing.T) {
+	exp := tracingtest.Setup(t)
+	a, cli, st, _ := setup(t, Options{FindingMaxLedgers: 100})
+	ctx := context.Background()
+
+	const contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	for l := uint32(100); l <= 104; l++ {
+		st.seedLedgers([]int{int(l)}, contract)
+	}
+	cli.extraResponses = func(callIdx int) (rpc.GetEventsResponse, error) {
+		st.mu.Lock()
+		var evs []rpc.Event
+		for _, e := range st.events {
+			evs = append(evs, rpc.Event{
+				ID:         e.ID,
+				ContractID: e.ContractID,
+				Ledger:     uint32(e.Ledger),
+				Type:       e.Type,
+				TxHash:     "deadbeef",
+			})
+		}
+		st.mu.Unlock()
+		return rpc.GetEventsResponse{Events: evs, LatestLedger: 1_000}, nil
+	}
+
+	primeIngest(st, 104)
+
+	_, err := a.PassOnce(ctx)
+	require.NoError(t, err)
+
+	spans := exp.GetSpans()
+	require.GreaterOrEqual(t, len(spans), 2, "audit pass should emit pass + reconcile_range spans")
+
+	var passSpan *tracetest.SpanStub
+	for i := range spans {
+		if spans[i].Name == "audit.pass" {
+			passSpan = &spans[i]
+			break
+		}
+	}
+	require.NotNil(t, passSpan, "audit.pass span must be present")
+	// A span must not end before it starts. Equality is legitimate: on a
+	// platform with a coarse monotonic clock (Windows' is ~0.5ms) a fast
+	// pass can begin and end inside one tick, so asserting strictly-after
+	// makes this test flaky rather than stricter.
+	assert.False(t, passSpan.EndTime.Before(passSpan.StartTime),
+		"audit.pass span ends before it starts")
+
+	var reconcileSpan *tracetest.SpanStub
+	for i := range spans {
+		if spans[i].Name == "audit.reconcile_range" {
+			reconcileSpan = &spans[i]
+			break
+		}
+	}
+	require.NotNil(t, reconcileSpan, "audit.reconcile_range span must be present")
+	assert.Equal(t, passSpan.SpanContext.SpanID(), reconcileSpan.Parent.SpanID(),
+		"reconcile_range must be a child of audit.pass")
 }

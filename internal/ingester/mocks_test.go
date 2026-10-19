@@ -151,6 +151,12 @@ type mockStore struct {
 	upsertDelay time.Duration
 	// contractCursors backs the per-contract cursor methods.
 	contractCursors []store.ContractCursor
+
+	// Write counters make dry-run guarantees explicit in tests without
+	// inferring them from the resulting event map.
+	stateSaves     int
+	addressUpserts int
+	replaceCalls   int
 }
 
 func newMockStore() *mockStore {
@@ -186,9 +192,14 @@ func (m *mockStore) UpsertEvents(ctx context.Context, events []store.Event) (int
 	return inserted, nil
 }
 
+func (m *mockStore) PruneEventsBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
+
 func (m *mockStore) ReplaceEventsInRange(_ context.Context, events []store.Event, fromLedger, toLedger int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.replaceCalls++
 	for id, e := range m.events {
 		if e.Ledger >= fromLedger && e.Ledger <= toLedger {
 			delete(m.events, id)
@@ -286,6 +297,7 @@ func (m *mockStore) GetIngestionState(_ context.Context) (store.IngestionState, 
 func (m *mockStore) SaveIngestionState(_ context.Context, s store.IngestionState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.stateSaves++
 	m.state = &s
 	return nil
 }
@@ -336,14 +348,14 @@ func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContra
 	return m.watched, nil
 }
 
-func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
-	m.watched = append(m.watched, store.WatchedContract{ContractID: id})
+func (m *mockStore) AddWatchedContract(_ context.Context, w store.WatchedContract) error {
+	m.watched = append(m.watched, w)
 	return nil
 }
 
-func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
+func (m *mockStore) RemoveWatchedContract(_ context.Context, w store.WatchedContract) error {
 	for i, wc := range m.watched {
-		if wc.ContractID == id {
+		if wc.ContractID == w.ContractID {
 			m.watched = append(m.watched[:i], m.watched[i+1:]...)
 			return nil
 		}
@@ -414,6 +426,21 @@ func (m *mockStore) ListDeliveryAttempts(context.Context, int64, int, store.Subs
 	return nil, nil
 }
 
+// API key stubs for the auth feature — unused by ingester tests.
+func (m *mockStore) CreateAPIKey(_ context.Context, k store.APIKey) (store.APIKey, error) {
+	k.ID = 1
+	return k, nil
+}
+func (m *mockStore) GetAPIKey(context.Context, int64) (store.APIKey, error) {
+	return store.APIKey{}, store.ErrNotFound
+}
+func (m *mockStore) LookupAPIKeyByPrefix(context.Context, string) (store.APIKey, error) {
+	return store.APIKey{}, store.ErrNotFound
+}
+func (m *mockStore) ListAPIKeys(context.Context) ([]store.APIKey, error) {
+	return nil, nil
+}
+func (m *mockStore) RevokeAPIKey(context.Context, int64) error { return nil }
 func (m *mockStore) ListContracts(context.Context, store.ContractsFilter) ([]store.ContractSummary, string, error) {
 	return nil, "", nil
 }
@@ -446,11 +473,20 @@ func (m *mockStore) DeleteEventsBefore(context.Context, int64, time.Time, int) (
 	return 0, nil
 }
 
-func (m *mockStore) UpsertAddressRefs(context.Context, []store.AddressRef) error { return nil }
+func (m *mockStore) UpsertAddressRefs(context.Context, []store.AddressRef) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.addressUpserts++
+	return nil
+}
 func (m *mockStore) QueryAddressEvents(context.Context, string, store.EventFilter) ([]store.Event, string, error) {
 	return nil, "", nil
 }
 func (m *mockStore) CountAddressEvents(context.Context, string) (int64, error) { return 0, nil }
 func (m *mockStore) GetAddressSummary(context.Context, string) (store.AddressSummary, error) {
 	return store.AddressSummary{}, nil
+}
+
+func (m *mockStore) CountEventsBefore(context.Context, int64, time.Time, int) (int64, error) {
+	return 0, nil
 }
