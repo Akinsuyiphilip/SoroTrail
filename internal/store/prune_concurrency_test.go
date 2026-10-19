@@ -228,7 +228,7 @@ func TestPruneCountsAndStatsStayConsistent(t *testing.T) {
 	assert.Equal(t, int64(150), stats.OldestStoredLedger)
 
 	// Per-contract counts sum to the same total and match CountEvents.
-	contracts, _, err := st.ListContracts(ctx, ContractsFilter{Limit: 10})
+	contracts, _, err := st.ListContracts(ctx, ContractsFilter{Limit: 10, Scope: WildcardScope()})
 	require.NoError(t, err)
 	var sum int64
 	for _, c := range contracts {

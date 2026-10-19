@@ -1365,7 +1365,10 @@ triggers a reload; the one-shot subcommands (`replay`, `backfill`,
 Read-only GraphQL endpoint at `POST /graphql`, schema-first with
 Shared query-builder helpers in `internal/api/queries` so REST and
 GraphQL validate filters identically. Same `EventFilter` shape,
-same `Cursor` semantics, no drift between transports.
+same `Cursor` semantics, no drift between transports. See the
+[GraphQL API Guide](docs/graphql.md) for the full reference, including
+example queries for every top-level field, complexity calculation, and
+multi-tenant scope behavior.
 
 #### Endpoints
 

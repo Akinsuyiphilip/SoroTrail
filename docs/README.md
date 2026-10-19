@@ -19,6 +19,9 @@ for operators and developers.
 
 ## Real-Time and Authentication APIs
 
+- [GraphQL API Guide](graphql.md): Read-only GraphQL endpoint (`/graphql`) and GraphiQL
+  playground, top-level query fields, Relay cursor pagination, depth/complexity limits,
+  filter parity with `GET /events`, and multi-tenant scope behavior.
 - [Live Subscriptions](subscriptions.md): Real-time event streaming over WebSocket,
   pub-sub broker architecture, at-most-once delivery semantics, backpressure handling,
   and the cursor catch-up pattern.

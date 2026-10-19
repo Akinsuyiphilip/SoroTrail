@@ -191,6 +191,19 @@ func TestRequiredSections(t *testing.T) {
 				"#### The watch list and its network dimension",
 			},
 		},
+		{
+			doc: "graphql.md",
+			headings: []string{
+				"## Enabling the endpoint and the playground",
+				"## Authentication",
+				"## Top-level query fields",
+				"## Pagination",
+				"## Limits: depth and complexity",
+				"## Filter parity with `GET /events`",
+				"## Multi-tenant behaviour by query field",
+				"## When to use GraphQL instead of REST",
+			},
+		},
 	}
 
 	for _, tt := range tests {
