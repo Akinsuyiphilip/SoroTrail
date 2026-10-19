@@ -164,6 +164,25 @@ func (s *guardedStore) GetIngestionState(ctx context.Context) (IngestionState, e
 	return state, err
 }
 
+func (s *guardedStore) GetIngestionStateForNetwork(ctx context.Context, network string) (IngestionState, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetIngestionStateForNetwork")
+	defer cancel()
+	start := time.Now()
+	var state IngestionState
+	var err error
+	if r, ok := s.Store.(interface {
+		GetIngestionStateForNetwork(context.Context, string) (IngestionState, error)
+	}); ok {
+		state, err = r.GetIngestionStateForNetwork(ctx, network)
+	} else if defaultNetwork(network) == "default" {
+		state, err = s.Store.GetIngestionState(ctx)
+	} else {
+		err = ErrNotFound
+	}
+	s.logSlowQuery(ctx, "store.GetIngestionStateForNetwork", start, err)
+	return state, err
+}
+
 func (s *guardedStore) SaveIngestionState(ctx context.Context, state IngestionState) error {
 	ctx, cancel := s.wrapContext(ctx, "store.SaveIngestionState")
 	defer cancel()

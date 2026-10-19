@@ -108,13 +108,13 @@ type TenantStore interface {
 	// the ingestion union. instanceCap bounds the size of the union across
 	// all tenants; 0 means no instance cap. Returns ErrQuotaExceeded when
 	// either the tenant's own cap or the instance cap would be exceeded.
-	AddTenantWatchedContract(ctx context.Context, t Tenant, contractID string, instanceCap int) error
+	AddTenantWatchedContract(ctx context.Context, t Tenant, network, contractID string, instanceCap int) error
 	// RemoveTenantWatchedContract drops one tenant's claim on a contract.
 	// The contract remains ingested while any other tenant, or the global
 	// watched_contracts list, still names it.
-	RemoveTenantWatchedContract(ctx context.Context, tenantID int64, contractID string) error
-	// ListTenantWatchedContracts returns just this tenant's claims.
-	ListTenantWatchedContracts(ctx context.Context, tenantID int64) ([]string, error)
+	RemoveTenantWatchedContract(ctx context.Context, tenantID int64, network, contractID string) error
+	// ListTenantWatchedContracts returns just this tenant's claims on network.
+	ListTenantWatchedContracts(ctx context.Context, tenantID int64, network string) ([]string, error)
 
 	// CreateTenantAPIKey stores the digest of secret and returns the key record.
 	CreateTenantAPIKey(ctx context.Context, tenantID int64, name, prefix string, digest []byte) (TenantAPIKey, error)

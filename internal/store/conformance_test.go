@@ -817,7 +817,7 @@ func testContractInventory(t *testing.T, st Store) {
 	require.NoError(t, err)
 
 	t.Run("default listing groups counts and ledger ranges", func(t *testing.T) {
-		got, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 10})
+		got, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		assert.Empty(t, cursor, "no next page when everything fits")
 
@@ -840,13 +840,13 @@ func testContractInventory(t *testing.T, st Store) {
 	})
 
 	t.Run("cursor paging walks every contract exactly once", func(t *testing.T) {
-		page1, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 2})
+		page1, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, page1, 2)
 		require.NotEmpty(t, cursor, "a full page means more rows follow")
 		assert.Equal(t, []string{contractA, contractB}, []string{page1[0].ContractID, page1[1].ContractID})
 
-		page2, cursor2, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Cursor: cursor})
+		page2, cursor2, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Cursor: cursor, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, page2, 1)
 		assert.Empty(t, cursor2, "cursor omitted on the last page")
@@ -854,20 +854,20 @@ func testContractInventory(t *testing.T, st Store) {
 	})
 
 	t.Run("invalid cursor is reported as ErrInvalidContractsCursor", func(t *testing.T) {
-		_, _, err := st.ListContracts(ctx, ContractsFilter{Cursor: "!!!not-base64!!!"})
+		_, _, err := st.ListContracts(ctx, ContractsFilter{Cursor: "!!!not-base64!!!", Scope: WildcardScope()})
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrInvalidContractsCursor)
 	})
 
 	t.Run("prefix filter narrows to matching contracts", func(t *testing.T) {
-		got, _, err := st.ListContracts(ctx, ContractsFilter{ContractIDPrefix: "CB", Limit: 10})
+		got, _, err := st.ListContracts(ctx, ContractsFilter{ContractIDPrefix: "CB", Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.Equal(t, contractB, got[0].ContractID)
 	})
 
 	t.Run("activity sort ranks busiest first", func(t *testing.T) {
-		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10})
+		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 3)
 		assert.Equal(t, []string{contractA, contractInventoryC, contractB},
@@ -884,7 +884,7 @@ func testContractInventory(t *testing.T, st Store) {
 			{SortByLastSeen, []string{contractInventoryC, contractB, contractA}},
 		}
 		for _, tc := range cases {
-			got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: tc.sortKey, Limit: 10})
+			got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: tc.sortKey, Limit: 10, Scope: WildcardScope()})
 			require.NoError(t, err)
 			require.Len(t, got, len(tc.want), "sort %s", tc.sortKey)
 			assert.Equal(t, tc.want,
@@ -949,13 +949,13 @@ func testContractInventory(t *testing.T, st Store) {
 		_, err := st.UpsertEvents(ctx, []Event{d1, d2, e1, e2})
 		require.NoError(t, err)
 
-		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10})
+		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 5)
 		assert.Equal(t, []string{contractA, tieE, tieD, contractInventoryC, contractB},
 			[]string{got[0].ContractID, got[1].ContractID, got[2].ContractID, got[3].ContractID, got[4].ContractID})
 
-		got, _, err = st.ListContracts(ctx, ContractsFilter{SortKey: SortByLastSeen, Limit: 10})
+		got, _, err = st.ListContracts(ctx, ContractsFilter{SortKey: SortByLastSeen, Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 5)
 		assert.Equal(t, []string{tieE, tieD, contractInventoryC, contractB, contractA},

@@ -430,6 +430,9 @@ type ContractsFilter struct {
 	Order            string // "asc" | "desc"; "" defaults to "asc" for contract_id and "desc" otherwise
 	Cursor           string
 	Limit            int
+	// Scope restricts the listing and count to contracts the caller is
+	// granted. Like EventFilter.Scope, a zero Scope denies all.
+	Scope Scope
 }
 
 // SortKey constants for ContractsFilter.SortKey. The zero value

@@ -482,15 +482,25 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
+	var sortValue, cursorContractID string
+	if f.Cursor != "" {
+		var err error
+		sortValue, cursorContractID, err = DecodeContractsCursor(f.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	if f.Scope.DeniesAll() {
+		return []ContractSummary{}, "", nil
+	}
 	where := []string{}
+	if !f.Scope.IsWildcard() {
+		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
 	if f.ContractIDPrefix != "" {
 		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}
 	if f.Cursor != "" {
-		sortValue, contractID, err := DecodeContractsCursor(f.Cursor)
-		if err != nil {
-			return nil, "", err
-		}
 		typed := arg(sortValue)
 		switch sortType {
 		case "bigint":
@@ -500,7 +510,7 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 		}
 		where = append(where,
 			fmt.Sprintf("(%s, contract_id) %s (%s, %s)",
-				sortCol, cursorOp, typed, arg(contractID)))
+				sortCol, cursorOp, typed, arg(cursorContractID)))
 	}
 	query := fmt.Sprintf(`
 		SELECT contract_id, count(*) AS event_count,
@@ -600,12 +610,18 @@ func (p *Postgres) ContractEventTypeCounts(ctx context.Context, contractID strin
 }
 
 func (p *Postgres) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
+	if f.Scope.DeniesAll() {
+		return 0, nil
+	}
 	args := []any{}
 	arg := func(v any) string {
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
 	where := []string{}
+	if !f.Scope.IsWildcard() {
+		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
 	if f.ContractIDPrefix != "" {
 		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}

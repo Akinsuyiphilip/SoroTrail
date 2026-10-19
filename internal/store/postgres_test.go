@@ -748,7 +748,7 @@ func TestListContracts(t *testing.T) {
 	wantIDs := []string{contractA, contractB, contractC} // ascending
 
 	t.Run("groups counts and ledger ranges ordered by contract_id", func(t *testing.T) {
-		got, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 10})
+		got, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, len(wantIDs))
 		assert.Empty(t, cursor, "no next page when everything fits")
@@ -771,13 +771,13 @@ func TestListContracts(t *testing.T) {
 	})
 
 	t.Run("keyset pagination walks every contract exactly once", func(t *testing.T) {
-		page1, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 2})
+		page1, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, page1, 2)
 		require.NotEmpty(t, cursor, "a full page means more rows follow")
 		assert.Equal(t, wantIDs[:2], []string{page1[0].ContractID, page1[1].ContractID})
 
-		page2, cursor2, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Cursor: cursor})
+		page2, cursor2, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Cursor: cursor, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, page2, 1)
 		assert.Empty(t, cursor2, "cursor omitted on the last page")
@@ -785,14 +785,14 @@ func TestListContracts(t *testing.T) {
 	})
 
 	t.Run("prefix filter narrows to matching contracts", func(t *testing.T) {
-		got, _, err := st.ListContracts(ctx, ContractsFilter{ContractIDPrefix: "CB", Limit: 10})
+		got, _, err := st.ListContracts(ctx, ContractsFilter{ContractIDPrefix: "CB", Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.Equal(t, contractB, got[0].ContractID)
 	})
 
 	t.Run("activity sort ranks busiest first", func(t *testing.T) {
-		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10})
+		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, len(wantIDs))
 		assert.Equal(t, contractA, got[0].ContractID) // 3 events
@@ -801,11 +801,11 @@ func TestListContracts(t *testing.T) {
 	})
 
 	t.Run("count matches the listing and honors the prefix", func(t *testing.T) {
-		total, err := st.CountContracts(ctx, ContractsFilter{})
+		total, err := st.CountContracts(ctx, ContractsFilter{Scope: WildcardScope()})
 		require.NoError(t, err)
 		assert.Equal(t, int64(len(wantIDs)), total)
 
-		narrowed, err := st.CountContracts(ctx, ContractsFilter{ContractIDPrefix: "CB"})
+		narrowed, err := st.CountContracts(ctx, ContractsFilter{ContractIDPrefix: "CB", Scope: WildcardScope()})
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), narrowed)
 	})
