@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -552,5 +555,432 @@ func TestDecodeJSONBody_RejectsNonPointerDst(t *testing.T) {
 		err := decodeJSONBody(r, dst)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "dst must be a non-nil pointer")
+	}
+}
+
+// TestDecodeJSON covers decodeJSON directly: valid payload decoding,
+// malformed JSON yielding 400 with a writeError response, unknown field rejection,
+// and ensuring sensitive values are not echoed in the error output.
+func TestDecodeJSON(t *testing.T) {
+	type target struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	}
+	const secret = "sk_live_TENANT_SECRET"
+
+	tests := []struct {
+		name       string
+		body       string
+		maxBody    int64
+		want       target
+		wantErr    bool
+		wantStatus int
+		errSubstr  string
+	}{
+		{
+			name:       "valid body decodes into target struct",
+			body:       `{"name":"tenant-alpha","count":3}`,
+			maxBody:    1024,
+			want:       target{Name: "tenant-alpha", Count: 3},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "surrounding whitespace is tolerated",
+			body:       " \r\n\t " + `{"name":"tenant-alpha","count":3}` + " \n ",
+			maxBody:    1024,
+			want:       target{Name: "tenant-alpha", Count: 3},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "malformed JSON yields 400 never 500",
+			body:       `{"name":"tenant-alpha", count:`,
+			maxBody:    1024,
+			wantErr:    true,
+			wantStatus: http.StatusBadRequest,
+			errSubstr:  "invalid JSON body",
+		},
+		{
+			name:       "truncated JSON yields 400",
+			body:       `{"name":"tenant-alpha"`,
+			maxBody:    1024,
+			wantErr:    true,
+			wantStatus: http.StatusBadRequest,
+			errSubstr:  "unexpected EOF",
+		},
+		{
+			name:       "unknown field is rejected with 400",
+			body:       `{"name":"tenant-alpha","unexpected":true}`,
+			maxBody:    1024,
+			wantErr:    true,
+			wantStatus: http.StatusBadRequest,
+			errSubstr:  `unknown field "unexpected"`,
+		},
+		{
+			name:       "field type mismatch yields 400",
+			body:       `{"name":"tenant-alpha","count":"three"}`,
+			maxBody:    1024,
+			wantErr:    true,
+			wantStatus: http.StatusBadRequest,
+			errSubstr:  "cannot unmarshal string into Go struct field",
+		},
+		{
+			name:       "oversized body exceeding maxBody yields 400 without 500",
+			body:       `{"name":"` + strings.Repeat("x", 200) + `"}`,
+			maxBody:    50,
+			wantErr:    true,
+			wantStatus: http.StatusBadRequest,
+			errSubstr:  "http: request body too large",
+		},
+		{
+			name:       "malformed JSON containing secret does not echo secret back",
+			body:       `{"name":"` + secret + `", malformed`,
+			maxBody:    1024,
+			wantErr:    true,
+			wantStatus: http.StatusBadRequest,
+			errSubstr:  "invalid JSON body",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tt.body))
+			var got target
+
+			err := decodeJSON(rec, req, &got, tt.maxBody)
+
+			if !tt.wantErr {
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, got)
+				assert.Equal(t, http.StatusOK, rec.Code)
+				return
+			}
+
+			require.Error(t, err)
+			assert.Equal(t, tt.wantStatus, rec.Code, "malformed JSON must yield 400, never 500")
+			var env errorResponse
+			unmarshalErr := json.Unmarshal(rec.Body.Bytes(), &env)
+			require.NoError(t, unmarshalErr)
+			if tt.errSubstr != "" {
+				assert.Contains(t, env.Error, tt.errSubstr)
+			}
+			assert.NotContains(t, rec.Body.String(), secret, "error response must never echo sensitive input values")
+			assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+			assert.Contains(t, rec.Header().Get("Cache-Control"), "no-store")
+		})
+	}
+}
+
+// TestDecodeJSON_OversizedBodyIsNotBuffered asserts that decodeJSON stops reading
+// without buffering an oversized body into memory.
+func TestDecodeJSON_OversizedBodyIsNotBuffered(t *testing.T) {
+	const limit = 512
+	src := &countingReader{r: strings.NewReader(`{"name":"` + strings.Repeat("A", 1<<20) + `"}`)}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", src)
+
+	var dst struct {
+		Name string `json:"name"`
+	}
+	err := decodeJSON(rec, req, &dst, limit)
+
+	require.Error(t, err)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "http: request body too large")
+	assert.Less(t, src.n, 1<<20, "must stop reading without buffering the full 1MB body")
+}
+
+// TestWriteError verifies the error envelope format, status code, and no-store caching headers.
+func TestWriteError(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeError(rec, http.StatusNotFound, errors.New("item not found"))
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assert.Contains(t, rec.Header().Get("Cache-Control"), "no-store")
+
+	var env errorResponse
+	err := json.Unmarshal(rec.Body.Bytes(), &env)
+	require.NoError(t, err)
+	assert.Equal(t, "item not found", env.Error)
+}
+
+// TestStoreErrorMapping_NotFoundMapsTo404 asserts that store.ErrNotFound maps
+// to HTTP 404 across handlers.
+func TestStoreErrorMapping_NotFoundMapsTo404(t *testing.T) {
+	validC := validAddr('C')
+	validG := validAddr('G')
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		needsAuth  bool
+		setupStore func(st *stubStore)
+		wantSubstr string
+	}{
+		{
+			name:      "DELETE /watched-contracts/{id} returns 404 on store.ErrNotFound",
+			method:    http.MethodDelete,
+			path:      "/watched-contracts/" + validC,
+			needsAuth: true,
+			setupStore: func(st *stubStore) {
+				st.removeErr = store.ErrNotFound
+			},
+			wantSubstr: "is not in the watch list",
+		},
+		{
+			name:   "GET /events/{id} returns 404 on store.ErrNotFound",
+			method: http.MethodGet,
+			path:   "/events/0001099511627776-0000000001",
+			setupStore: func(st *stubStore) {
+				st.eventErr = store.ErrNotFound
+			},
+			wantSubstr: "not found",
+		},
+		{
+			name:   "GET /events/{id}/raw returns 404 on store.ErrNotFound",
+			method: http.MethodGet,
+			path:   "/events/0001099511627776-0000000001/raw",
+			setupStore: func(st *stubStore) {
+				st.eventErr = store.ErrNotFound
+			},
+			wantSubstr: "not found",
+		},
+		{
+			name:      "DELETE /dead-letters/{id} returns 404 on store.ErrNotFound",
+			method:    http.MethodDelete,
+			path:      "/dead-letters/101",
+			needsAuth: true,
+			setupStore: func(st *stubStore) {
+				st.deleteDeadLetterErr = store.ErrNotFound
+			},
+			wantSubstr: "dead letter 101 not found",
+		},
+		{
+			name:   "GET /addresses/{address}/summary returns 404 on store.ErrNotFound",
+			method: http.MethodGet,
+			path:   "/addresses/" + validG + "/summary",
+			setupStore: func(st *stubStore) {
+				st.addressSummaryErr = store.ErrNotFound
+			},
+			wantSubstr: "not found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			if tt.setupStore != nil {
+				tt.setupStore(st)
+			}
+			srv := newTestServer(st, nil)
+
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			if tt.needsAuth {
+				req.Header.Set("X-API-Key", "test-key")
+			}
+			rec := httptest.NewRecorder()
+
+			srv.Router().ServeHTTP(rec, req)
+
+			assert.Equal(t, http.StatusNotFound, rec.Code)
+			assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+			assert.Contains(t, rec.Header().Get("Cache-Control"), "no-store")
+
+			var env errorResponse
+			err := json.Unmarshal(rec.Body.Bytes(), &env)
+			require.NoError(t, err)
+			assert.Contains(t, env.Error, tt.wantSubstr)
+		})
+	}
+}
+
+// TestStoreErrorMapping_UnexpectedErrorMapsTo500AndLogsCause asserts that
+// an unexpected store error maps to 500, logs the underlying failure cause,
+// and ensures no internal details or database errors leak to the client response.
+func TestStoreErrorMapping_UnexpectedErrorMapsTo500AndLogsCause(t *testing.T) {
+	validC := validAddr('C')
+
+	const internalErrMsg = "database connection lost: fatal socket I/O timeout"
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		needsAuth  bool
+		setupStore func(st *stubStore)
+		wantMsg    string
+	}{
+		{
+			name:      "POST /watched-contracts store add failure maps to 500",
+			method:    http.MethodPost,
+			path:      "/watched-contracts?confirm=true",
+			body:      `{"contract_id":"` + validC + `"}`,
+			needsAuth: true,
+			setupStore: func(st *stubStore) {
+				st.watchedList = []store.WatchedContract{{ContractID: validC, Network: "testnet"}}
+				st.addErr = errors.New(internalErrMsg)
+			},
+			wantMsg: "adding watched contract failed",
+		},
+		{
+			name:      "DELETE /watched-contracts/{id} store remove failure maps to 500",
+			method:    http.MethodDelete,
+			path:      "/watched-contracts/" + validC,
+			needsAuth: true,
+			setupStore: func(st *stubStore) {
+				st.removeErr = errors.New(internalErrMsg)
+			},
+			wantMsg: "removing watched contract failed",
+		},
+		{
+			name:   "GET /events/{id} store get failure maps to 500",
+			method: http.MethodGet,
+			path:   "/events/0001099511627776-0000000001",
+			setupStore: func(st *stubStore) {
+				st.eventErr = errors.New(internalErrMsg)
+			},
+			wantMsg: "loading event failed",
+		},
+		{
+			name:   "GET /events store query failure maps to 500",
+			method: http.MethodGet,
+			path:   "/events",
+			setupStore: func(st *stubStore) {
+				st.queryErr = errors.New(internalErrMsg)
+			},
+			wantMsg: "querying events failed",
+		},
+		{
+			name:      "DELETE /dead-letters/{id} store delete failure maps to 500",
+			method:    http.MethodDelete,
+			path:      "/dead-letters/88",
+			needsAuth: true,
+			setupStore: func(st *stubStore) {
+				st.deleteDeadLetterErr = errors.New(internalErrMsg)
+			},
+			wantMsg: "deleting dead letter failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			if tt.setupStore != nil {
+				tt.setupStore(st)
+			}
+
+			var logBuf bytes.Buffer
+			logHandler := slog.NewTextHandler(&logBuf, nil)
+			srv := New(st, &stubRPC{health: rpc.Health{Status: "healthy"}}, slog.New(logHandler), "test-key")
+
+			var bodyReader io.Reader
+			if tt.body != "" {
+				bodyReader = strings.NewReader(tt.body)
+			}
+			req := httptest.NewRequest(tt.method, tt.path, bodyReader)
+			if tt.needsAuth {
+				req.Header.Set("X-API-Key", "test-key")
+			}
+			rec := httptest.NewRecorder()
+
+			srv.Router().ServeHTTP(rec, req)
+
+			assert.Equal(t, http.StatusInternalServerError, rec.Code)
+			assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+
+			var env errorResponse
+			err := json.Unmarshal(rec.Body.Bytes(), &env)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantMsg, env.Error)
+
+			// The response must never echo the raw internal store error:
+			assert.NotContains(t, rec.Body.String(), internalErrMsg,
+				"internal error detail must never be echoed to client response body")
+
+			// But the logger MUST have logged the cause:
+			assert.Contains(t, logBuf.String(), internalErrMsg,
+				"the cause of the internal store failure must be recorded in the logger")
+		})
+	}
+}
+
+// TestWriteEndpoints_JSONRequestDecoding proves that write endpoints funneling
+// their bodies through JSON decoding reject malformed, oversized, or unknown fields
+// with 400 (never 500), and never echo sensitive input values.
+func TestWriteEndpoints_JSONRequestDecoding(t *testing.T) {
+	validC := validAddr('C')
+	const secret = "sk_live_UNTRUSTED_INPUT_SECRET"
+
+	tests := []struct {
+		name       string
+		body       string
+		makeBody   func() io.Reader
+		wantStatus int
+		wantSubstr string
+	}{
+		{
+			name:       "valid body is accepted and processed",
+			body:       `{"contract_id":"` + validC + `"}`,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "malformed JSON yields 400 never 500",
+			body:       `{"contract_id": ` + secret,
+			wantStatus: http.StatusBadRequest,
+			wantSubstr: "invalid JSON body",
+		},
+		{
+			name:       "unknown field is rejected with 400",
+			body:       `{"contract_id":"` + validC + `","unexpected_field":true}`,
+			wantStatus: http.StatusBadRequest,
+			wantSubstr: "unknown field",
+		},
+		{
+			name:       "empty body is rejected with 400",
+			body:       "",
+			wantStatus: http.StatusBadRequest,
+			wantSubstr: "request body is empty",
+		},
+		{
+			name: "oversized body is rejected with 400 without being buffered",
+			makeBody: func() io.Reader {
+				return &countingReader{r: strings.NewReader(`{"contract_id":"` + strings.Repeat("A", 1<<20) + `"}`)}
+			},
+			wantStatus: http.StatusBadRequest,
+			wantSubstr: "request body exceeds",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{
+				watchedList: []store.WatchedContract{{ContractID: validC, Network: "testnet"}},
+			}
+			srv := newTestServer(st, nil)
+
+			var r io.Reader
+			if tt.makeBody != nil {
+				r = tt.makeBody()
+			} else {
+				r = strings.NewReader(tt.body)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/watched-contracts?confirm=true", r)
+			req.Header.Set("X-API-Key", "test-key")
+			rec := httptest.NewRecorder()
+
+			srv.Router().ServeHTTP(rec, req)
+
+			assert.Equal(t, tt.wantStatus, rec.Code)
+			assert.NotEqual(t, http.StatusInternalServerError, rec.Code, "decoding failure must never yield 500")
+
+			if tt.wantSubstr != "" {
+				assert.Contains(t, rec.Body.String(), tt.wantSubstr)
+			}
+			assert.NotContains(t, rec.Body.String(), secret, "response must never echo sensitive input values")
+		})
 	}
 }
