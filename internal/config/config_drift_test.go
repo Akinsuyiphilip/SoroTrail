@@ -34,8 +34,11 @@ func envVarsFromConfig() map[string]string {
 }
 
 // configTableRows parses the README's "## Configuration" section tables and
-// returns each documented variable's cells: [Type, Default, Description].
-func configTableRows(t *testing.T) map[string][3]string {
+// returns each documented variable's cells: [Type, Default, Description,
+// Reload]. The description is every cell between Default and the final
+// one, re-joined with "|" so descriptions that contain an (escaped)
+// pipe survive; Reload is always the last cell.
+func configTableRows(t *testing.T) map[string][4]string {
 	t.Helper()
 
 	readme, err := os.ReadFile("../../README.md")
@@ -55,7 +58,7 @@ func configTableRows(t *testing.T) map[string][3]string {
 	}
 
 	rowRe := regexp.MustCompile("`([A-Z][A-Z0-9_]+)`")
-	rows := make(map[string][3]string)
+	rows := make(map[string][4]string)
 	lines := strings.Split(section, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -63,7 +66,7 @@ func configTableRows(t *testing.T) map[string][3]string {
 			continue
 		}
 		cells := strings.Split(strings.Trim(line, "|"), "|")
-		if len(cells) < 4 {
+		if len(cells) < 5 {
 			continue
 		}
 		for i := range cells {
@@ -76,7 +79,7 @@ func configTableRows(t *testing.T) map[string][3]string {
 		if matches == nil {
 			continue
 		}
-		rows[matches[1]] = [3]string{cells[1], cells[2], strings.Join(cells[3:], "|")}
+		rows[matches[1]] = [4]string{cells[1], cells[2], strings.Join(cells[3:len(cells)-1], "|"), cells[len(cells)-1]}
 	}
 	return rows
 }
@@ -110,7 +113,7 @@ func TestConfigEnvVarsDocumented(t *testing.T) {
 			for _, cell := range row {
 				if strings.TrimSpace(cell) == "" {
 					malformed = append(malformed, env)
-					t.Errorf("env var %s has an empty Type/Default/Description cell in the Configuration table", env)
+					t.Errorf("env var %s has an empty Type/Default/Description/Reload cell in the Configuration table", env)
 					return
 				}
 			}
