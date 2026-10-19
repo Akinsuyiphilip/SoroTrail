@@ -1115,6 +1115,11 @@ func TestWindowSweep_MultiBatch(t *testing.T) {
 	state, _ := st.GetIngestionState(context.Background())
 	assert.Equal(t, int64(1_099), state.LastIngestedLedger)
 	assert.Empty(t, state.LastCursor)
+
+	cursors, err := st.ListContractCursors(context.Background())
+	require.NoError(t, err)
+	assert.NotEmpty(t, cursors, "per-contract cursors should be set after a window sweep")
+	assert.Len(t, cursors, 27)
 }
 
 func TestReclamp_WhenResumePointAgedOut(t *testing.T) {
@@ -2338,4 +2343,203 @@ func TestRunOnce_CycleSummaryOnError(t *testing.T) {
 	require.Len(t, recs, 1)
 	assert.Contains(t, recs[0]["error"], "rpc unavailable")
 	assert.Equal(t, float64(0), recs[0]["fetched"])
+}
+
+func TestIngester_LateContractBackfillsWhileOthersContinue(t *testing.T) {
+	contractA := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+	// Contract A is already being watched (has a cursor at ledger 500).
+	st := newMockStore()
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
+		ContractID:         contractA,
+		LastIngestedLedger: 500,
+		LastCursor:         "cursor-a",
+	}))
+
+	client := &mockRPC{
+		health: rpc.Health{Status: "healthy", LatestLedger: 100_000, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{
+			// Contract A gets its next page of events.
+			{
+				Events:       []rpc.Event{rpcEvent("e-a", 501)},
+				LatestLedger: 100_000,
+			},
+		},
+	}
+
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	// Contract A's cursor advanced to the latest event it received.
+	ccA, err := st.GetContractCursor(context.Background(), contractA)
+	require.NoError(t, err)
+	assert.Equal(t, int64(501), ccA.LastIngestedLedger)
+	assert.Equal(t, "e-a", ccA.LastCursor,
+		"cursor is derived from the last event the contract received in this batch")
+}
+
+// Each contract's cursor advances independently; a contract that has already
+// caught up is not forced to re-process events from a lagging contract's range.
+func TestIngester_PerContractCursorsAdvanceIndependently(t *testing.T) {
+	contractA := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	contractB := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+	st := newMockStore()
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractB))
+
+	// Contract A is behind (at ledger 100), contract B is already caught up (at ledger 500).
+	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
+		ContractID:         contractA,
+		LastIngestedLedger: 100,
+	}))
+	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
+		ContractID:         contractB,
+		LastIngestedLedger: 500,
+		LastCursor:         "cursor-b",
+	}))
+
+	client := &mockRPC{
+		health: rpc.Health{Status: "healthy", LatestLedger: 100_000, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{
+			// Only contract A gets new events (contract B is already ahead).
+			{
+				Events:       []rpc.Event{rpcEvent("ea-new", 101)},
+				LatestLedger: 100_000,
+			},
+		},
+	}
+
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	// Contract A advanced.
+	ccA, err := st.GetContractCursor(context.Background(), contractA)
+	require.NoError(t, err)
+	assert.Equal(t, int64(101), ccA.LastIngestedLedger)
+
+	// Contract B kept its existing cursor (no new events for it).
+	ccB, err := st.GetContractCursor(context.Background(), contractB)
+	require.NoError(t, err)
+	assert.Equal(t, int64(500), ccB.LastIngestedLedger)
+	assert.Equal(t, "cursor-b", ccB.LastCursor)
+}
+
+// When IsLedgerOutOfRange fires on a shared filter batch,
+// ALL contracts in that batch are clamped to oldest_retained − 1.
+// This is safe (idempotent upserts handle re-duping) and correct:
+// every contract in the batch used the same (too-low) startLedger.
+func TestIngester_ReclampAffectsAllInSharedBatch(t *testing.T) {
+	contractA := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	contractB := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+	st := newMockStore()
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractB))
+
+	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
+		ContractID:         contractA,
+		LastIngestedLedger: 100,
+	}))
+	require.NoError(t, st.SaveContractCursor(context.Background(), store.ContractCursor{
+		ContractID:         contractB,
+		LastIngestedLedger: 50_000,
+		LastCursor:         "cursor-b",
+	}))
+
+	client := &mockRPC{
+		health:     rpc.Health{Status: "healthy", LatestLedger: 50_000, OldestLedger: 40_000},
+		eventsErrs: []error{fmt.Errorf("getEvents: %w", &rpc.Error{Code: -32600, Message: "startLedger must be within the ledger range: 40000 - 50000"})},
+	}
+
+	ing := newTestIngester(client, st, Options{StartLedger: 100, PageLimit: 100})
+	_, err := ing.runOnce(context.Background())
+	require.NoError(t, err)
+
+	// Both contracts in the shared batch were clamped because the
+	// batch's shared startLedger (101) fell outside RPC retention.
+	for _, id := range []string{contractA, contractB} {
+		cc, err := st.GetContractCursor(context.Background(), id)
+		require.NoError(t, err, "contract %s should have a cursor", id)
+		assert.Equal(t, int64(39_999), cc.LastIngestedLedger,
+			"contract %s was clamped to oldest_retained − 1", id)
+		assert.Empty(t, cc.LastCursor, "cursor reset after reclamp")
+	}
+}
+
+// TestIngester_WatchedCursorResumeAcrossRestart simulates an ingester restart
+// with watched contracts: ingester 1 ingests events and persists per-contract cursors;
+// ingester 2 (restarted) resumes from the per-contract cursor positions.
+func TestIngester_WatchedCursorResumeAcrossRestart(t *testing.T) {
+	contractA := "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	contractB := "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+	st := newMockStore()
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractA))
+	require.NoError(t, st.AddWatchedContract(context.Background(), contractB))
+
+	evA1 := rpcEvent("ea-1", 100)
+	evA1.ContractID = contractA
+	evB1 := rpcEvent("eb-1", 200)
+	evB1.ContractID = contractB
+
+	client1 := &mockRPC{
+		health: rpc.Health{Status: "healthy", LatestLedger: 1_000, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{{
+			Events:       []rpc.Event{evA1, evB1},
+			LatestLedger: 1_000,
+		}},
+	}
+
+	ing1 := newTestIngester(client1, st, Options{StartLedger: 50, PageLimit: 100})
+	caughtUp, err := ing1.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.True(t, caughtUp)
+
+	// Verify both contract cursors were saved by ingester 1.
+	ccA, err := st.GetContractCursor(context.Background(), contractA)
+	require.NoError(t, err)
+	assert.Equal(t, int64(100), ccA.LastIngestedLedger)
+	assert.Equal(t, "ea-1", ccA.LastCursor)
+
+	ccB, err := st.GetContractCursor(context.Background(), contractB)
+	require.NoError(t, err)
+	assert.Equal(t, int64(200), ccB.LastIngestedLedger)
+	assert.Equal(t, "eb-1", ccB.LastCursor)
+
+	// Simulate restart: create ing2 with a fresh mockRPC.
+	// Ingester 2 should resolve startLedger as min(100+1, 200+1) = 101.
+	evA2 := rpcEvent("ea-2", 101)
+	evA2.ContractID = contractA
+
+	client2 := &mockRPC{
+		health: rpc.Health{Status: "healthy", LatestLedger: 1_000, OldestLedger: 10},
+		eventsResps: []rpc.GetEventsResponse{{
+			Events:       []rpc.Event{evA2},
+			LatestLedger: 1_000,
+		}},
+	}
+
+	ing2 := newTestIngester(client2, st, Options{PageLimit: 100})
+	caughtUp, err = ing2.runOnce(context.Background())
+	require.NoError(t, err)
+	assert.True(t, caughtUp)
+
+	require.Len(t, client2.eventsRequests, 1)
+	assert.Equal(t, uint32(101), client2.eventsRequests[0].StartLedger,
+		"restarted ingester must resume from min(contract cursors) + 1")
+
+	// Verify contractA cursor advanced to 101, contractB cursor stayed at 200.
+	ccA2, err := st.GetContractCursor(context.Background(), contractA)
+	require.NoError(t, err)
+	assert.Equal(t, int64(101), ccA2.LastIngestedLedger)
+	assert.Equal(t, "ea-2", ccA2.LastCursor)
+
+	ccB2, err := st.GetContractCursor(context.Background(), contractB)
+	require.NoError(t, err)
+	assert.Equal(t, int64(200), ccB2.LastIngestedLedger)
+	assert.Equal(t, "eb-1", ccB2.LastCursor)
 }
