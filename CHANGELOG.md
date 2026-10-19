@@ -4,6 +4,8 @@
 
 ### Added
 
+- [docs/errors.md](docs/errors.md) — the API's error catalogue: every failure condition the server can produce, the status it answers with, the exact message a client sees, and the operations it can surface on. It is generated from `internal/api/error_catalogue_test.go`, which cross-checks it against the handlers' source and the shipped OpenAPI spec in both directions, so an undocumented new error — or a stale entry for one the server can no longer produce — fails the test. The spec gained the statuses it was missing along the way: 501 on the API-key and contract endpoints, 503 on the contract spec-override endpoints, 403 on the subscription create/update endpoints, and 426 for a refused websocket handshake.
+
 ### Changed
 
 - CI caches Go modules and build output with an explicit key that includes the Go version, `go.sum` and the build-tag flavour, so the `-tags=integration` job no longer shares a single cache slot with the untagged jobs.
