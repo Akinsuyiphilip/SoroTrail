@@ -452,7 +452,12 @@ once. A single process still ingests one network — the one named by
 
 With `ENABLE_METRICS=true`, the Prometheus `/metrics` endpoint exposes the
 pipeline metrics (`sorotrail_*`) in addition to the per-server HTTP
-histogram. The RPC metrics answer the first question when ingestion falls
+histogram. The full catalogue — every metric the build exports, with its
+type, labels and meaning — is [docs/metrics.md](docs/metrics.md);
+it is generated from a table the metrics package's tests check against
+the code, so a renamed, removed or undocumented metric fails the build.
+
+The RPC metrics answer the first question when ingestion falls
 behind — is the upstream slow, failing, or being throttled by our own
 breaker:
 
