@@ -255,7 +255,7 @@ func TestWatchedContracts_UnionAndRefcounting(t *testing.T) {
 	two := mustTenant(t, p, "two")
 
 	// The operator's global list still counts.
-	require.NoError(t, p.AddWatchedContract(ctx, contractC))
+	require.NoError(t, p.AddWatchedContract(ctx, WatchedContract{ContractID: contractC}))
 
 	require.NoError(t, p.AddTenantWatchedContract(ctx, one, contractA, 0))
 	require.NoError(t, p.AddTenantWatchedContract(ctx, two, contractA, 0))

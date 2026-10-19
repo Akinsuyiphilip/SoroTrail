@@ -49,6 +49,7 @@ var conformanceTestNames = []string{
 	"QueryEvents_TimeRange",
 	"IngestionStateRoundTrip",
 	"WatchedContracts",
+	"ContractCursors",
 	"Stats",
 	"RawXDRRoundTrip",
 	"ReplaceEventsInRangeKeepsRawXDR",
@@ -153,6 +154,7 @@ func runStoreTests(t *testing.T, backend conformanceBackend) {
 		{"QueryEvents_TimeRange", testQueryEventsTimeRange},
 		{"IngestionStateRoundTrip", testIngestionStateRoundTrip},
 		{"WatchedContracts", testWatchedContracts},
+		{"ContractCursors", testContractCursors},
 		{"Stats", testStats},
 		{"RawXDRRoundTrip", testRawXDRRoundTrip},
 		{"ReplaceEventsInRangeKeepsRawXDR", testReplaceEventsInRangeKeepsRawXDR},
@@ -484,17 +486,67 @@ func testIngestionStateRoundTrip(t *testing.T, st Store) {
 func testWatchedContracts(t *testing.T, st Store) {
 	ctx := context.Background()
 
-	require.NoError(t, st.AddWatchedContract(ctx, contractA))
-	require.NoError(t, st.AddWatchedContract(ctx, contractA), "re-adding is a no-op")
-	require.NoError(t, st.AddWatchedContract(ctx, contractB))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}), "re-adding is a no-op")
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractB}))
 
 	got, err := st.ListWatchedContracts(ctx)
 	require.NoError(t, err)
 	ids := make([]string, 0, len(got))
 	for _, wc := range got {
+		// The backend is required to report the network each entry was
+		// added on, defaulting an empty add to "default".
+		assert.Equal(t, "default", wc.Network)
 		ids = append(ids, wc.ContractID)
 	}
 	assert.Equal(t, []string{contractA, contractB}, ids)
+}
+
+// testContractCursors pins the per-contract resume-cursor semantics the
+// watched-contract ingester depends on: an absent cursor reads as
+// ErrNotFound (not a zero cursor that would silently resume from ledger
+// 0), a save upserts, a delete is synchronous, and List reflects exactly
+// the rows that exist.
+func testContractCursors(t *testing.T, st Store) {
+	ctx := context.Background()
+
+	_, err := st.GetContractCursor(ctx, contractA)
+	require.ErrorIs(t, err, ErrNotFound,
+		"a contract with no cursor row must read as ErrNotFound, not a zero cursor")
+
+	saved := ContractCursor{ContractID: contractA, LastIngestedLedger: 100, LastCursor: "cur-1"}
+	require.NoError(t, st.SaveContractCursor(ctx, saved))
+
+	got, err := st.GetContractCursor(ctx, contractA)
+	require.NoError(t, err)
+	assert.Equal(t, contractA, got.ContractID)
+	assert.Equal(t, int64(100), got.LastIngestedLedger)
+	assert.Equal(t, "cur-1", got.LastCursor)
+
+	// Saving again is an upsert, not a duplicate-key error.
+	updated := ContractCursor{ContractID: contractA, LastIngestedLedger: 120, LastCursor: "cur-2"}
+	require.NoError(t, st.SaveContractCursor(ctx, updated))
+
+	got, err = st.GetContractCursor(ctx, contractA)
+	require.NoError(t, err)
+	assert.Equal(t, int64(120), got.LastIngestedLedger)
+	assert.Equal(t, "cur-2", got.LastCursor)
+	assert.False(t, got.UpdatedAt.IsZero(), "Save must record an UpdatedAt timestamp")
+
+	require.NoError(t, st.SaveContractCursor(ctx, ContractCursor{ContractID: contractB, LastIngestedLedger: 5}))
+
+	listed, err := st.ListContractCursors(ctx)
+	require.NoError(t, err)
+	require.Len(t, listed, 2, "List must reflect exactly the stored cursors")
+
+	require.NoError(t, st.DeleteContractCursor(ctx, contractA))
+	require.ErrorIs(t, st.DeleteContractCursor(ctx, contractA), ErrNotFound,
+		"deleting an already-absent cursor must read as ErrNotFound")
+
+	listed, err = st.ListContractCursors(ctx)
+	require.NoError(t, err)
+	require.Len(t, listed, 1, "Delete must be synchronous: the next List reflects it")
+	assert.Equal(t, contractB, listed[0].ContractID)
 }
 
 func testStats(t *testing.T, st Store) {
@@ -506,7 +558,7 @@ func testStats(t *testing.T, st Store) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, st.SaveIngestionState(ctx, IngestionState{LastIngestedLedger: 101}))
-	require.NoError(t, st.AddWatchedContract(ctx, contractA))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA}))
 
 	stats, err := st.Stats(ctx, WildcardScope())
 	require.NoError(t, err)
@@ -604,20 +656,6 @@ func TestStoreUnsupportedOperations(t *testing.T) {
 		}},
 		{"ListContractsNeedingRefresh", func() error {
 			_, err := st.ListContractsNeedingRefresh(ctx, time.Now())
-			return err
-		}},
-		{"GetContractCursor", func() error {
-			_, err := st.GetContractCursor(ctx, contractA)
-			return err
-		}},
-		{"SaveContractCursor", func() error {
-			return st.SaveContractCursor(ctx, ContractCursor{ContractID: contractA})
-		}},
-		{"DeleteContractCursor", func() error {
-			return st.DeleteContractCursor(ctx, contractA)
-		}},
-		{"ListContractCursors", func() error {
-			_, err := st.ListContractCursors(ctx)
 			return err
 		}},
 	}

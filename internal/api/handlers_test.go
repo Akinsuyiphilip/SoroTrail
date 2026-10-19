@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +11,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/rpc"
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // validAddr returns a 56-character string that starts with the given
@@ -189,12 +194,222 @@ func TestIngestLagLedgers(t *testing.T) {
 			lastIngested: 100,
 			want:         0,
 		},
+		{
+			// The helper reports raw distance; the readiness threshold is
+			// applied by its callers, so a lag of exactly the threshold
+			// must come back verbatim rather than clamped or rounded.
+			name:         "lag exactly at the readiness threshold is reported verbatim",
+			chainHead:    1000 + readinessLagThreshold,
+			lastIngested: 1000,
+			want:         readinessLagThreshold,
+		},
+		{
+			name:         "lag one past the readiness threshold is reported verbatim",
+			chainHead:    1000 + readinessLagThreshold + 1,
+			lastIngested: 1000,
+			want:         readinessLagThreshold + 1,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := ingestLagLedgers(tt.chainHead, tt.lastIngested)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestAddStatsFreshness pins the freshness signal /stats carries. The
+// chain head and lag are pointers so that "unknown" (nil, JSON null) is
+// distinguishable from "caught up" (zero): a client must never read an
+// RPC outage as a fresh index, nor a cold instance as a stale one.
+func TestAddStatsFreshness(t *testing.T) {
+	tests := []struct {
+		name         string
+		rpcLatest    uint32
+		rpcErr       error
+		noRPC        bool
+		lastIngested int64
+		// wantHead and wantLag are nil when freshness must be unknown.
+		wantHead *int64
+		wantLag  *int64
+	}{
+		{
+			name:         "recent ingestion reports fresh",
+			rpcLatest:    1000,
+			lastIngested: 995,
+			wantHead:     ptr[int64](1000),
+			wantLag:      ptr[int64](5),
+		},
+		{
+			name:         "fully caught up reports zero lag",
+			rpcLatest:    1000,
+			lastIngested: 1000,
+			wantHead:     ptr[int64](1000),
+			wantLag:      ptr[int64](0),
+		},
+		{
+			// /stats reports raw distance and leaves the stale verdict to
+			// the reader (and to /readyz), so the boundary values must come
+			// through exactly; TestCheckIngestionLag pins the verdict.
+			name:         "lag exactly at the threshold is reported exactly",
+			rpcLatest:    1000,
+			lastIngested: 1000 - readinessLagThreshold,
+			wantHead:     ptr[int64](1000),
+			wantLag:      ptr[int64](readinessLagThreshold),
+		},
+		{
+			name:         "stale frontier one past the threshold is reported exactly",
+			rpcLatest:    1000,
+			lastIngested: 1000 - readinessLagThreshold - 1,
+			wantHead:     ptr[int64](1000),
+			wantLag:      ptr[int64](readinessLagThreshold + 1),
+		},
+		{
+			// A zero frontier means nothing has been ingested yet; the huge
+			// arithmetic distance to the chain head must not surface as lag.
+			name:         "zero frontier reports zero lag, not stale",
+			rpcLatest:    5000,
+			lastIngested: 0,
+			wantHead:     ptr[int64](5000),
+			wantLag:      ptr[int64](0),
+		},
+		{
+			name:         "frontier ahead of a lagging RPC node reports zero lag",
+			rpcLatest:    990,
+			lastIngested: 1000,
+			wantHead:     ptr[int64](990),
+			wantLag:      ptr[int64](0),
+		},
+		{
+			// Without a chain head there is nothing to measure against, so
+			// both fields stay nil rather than defaulting to a fake zero.
+			name:         "RPC error leaves freshness unknown",
+			rpcErr:       errors.New("rpc unreachable"),
+			lastIngested: 1000,
+		},
+		{
+			name:         "no RPC client leaves freshness unknown",
+			noRPC:        true,
+			lastIngested: 1000,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{}
+			if !tt.noRPC {
+				s.rpc = &stubRPC{
+					health:    rpc.Health{Status: "healthy", LatestLedger: tt.rpcLatest},
+					healthErr: tt.rpcErr,
+				}
+			}
+			stats := store.Stats{LastIngestedLedger: tt.lastIngested}
+
+			s.addStatsFreshness(context.Background(), &stats)
+
+			assert.Equal(t, tt.wantHead, stats.ChainHeadLedger, "chain_head_ledger")
+			assert.Equal(t, tt.wantLag, stats.IngestLagLedgers, "ingest_lag_ledgers")
+			assert.Equal(t, tt.lastIngested, stats.LastIngestedLedger,
+				"the frontier itself must not be rewritten by the freshness pass")
+		})
+	}
+}
+
+// TestCheckIngestionLag exercises the readiness probe directly, without
+// the HTTP envelope, so each threshold decision is pinned to the helper
+// that makes it rather than inferred from an aggregated status.
+func TestCheckIngestionLag(t *testing.T) {
+	tests := []struct {
+		name         string
+		rpcLatest    uint32
+		rpcErr       error
+		noRPC        bool
+		lastIngested int64
+		ingestionErr error
+		wantStatus   string
+		// wantDetail is a substring the detail must contain; empty means
+		// the detail must be empty, as an ok probe has nothing to explain.
+		wantDetail string
+	}{
+		{
+			name:         "recent ingestion is ok",
+			rpcLatest:    1000,
+			lastIngested: 995,
+			wantStatus:   healthOK,
+		},
+		{
+			name:         "lag exactly at the threshold stays ok",
+			rpcLatest:    1000,
+			lastIngested: 1000 - readinessLagThreshold,
+			wantStatus:   healthOK,
+		},
+		{
+			name:         "stale frontier one past the threshold is degraded",
+			rpcLatest:    1000,
+			lastIngested: 1000 - readinessLagThreshold - 1,
+			wantStatus:   healthDegraded,
+			wantDetail:   "101 ledgers behind (last ingested: 899, chain head: 1000)",
+		},
+		{
+			// A zeroed frontier is a cold instance, which must not be judged
+			// against a chain head it has not started following yet.
+			name:         "zero frontier is ok, not stale",
+			rpcLatest:    5000,
+			lastIngested: 0,
+			wantStatus:   healthOK,
+		},
+		{
+			name:         "unrecorded ingestion state is reported as a cold start",
+			rpcLatest:    1000,
+			ingestionErr: store.ErrNotFound,
+			wantStatus:   healthOK,
+			wantDetail:   "no ingestion state recorded yet",
+		},
+		{
+			name:         "missing RPC client reports the chain head as unknown",
+			noRPC:        true,
+			lastIngested: 1000,
+			wantStatus:   healthOK,
+			wantDetail:   "chain head unknown",
+		},
+		{
+			name:         "unreachable RPC is unready because the chain head is unavailable",
+			rpcErr:       errors.New("rpc unreachable"),
+			lastIngested: 1000,
+			wantStatus:   healthUnready,
+			wantDetail:   "chain head unavailable: rpc unreachable",
+		},
+		{
+			name:         "store error is unready",
+			rpcLatest:    1000,
+			ingestionErr: errors.New("disk on fire"),
+			wantStatus:   healthUnready,
+			wantDetail:   "disk on fire",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{store: &stubStore{
+				ingestion:    store.IngestionState{LastIngestedLedger: tt.lastIngested},
+				ingestionErr: tt.ingestionErr,
+			}}
+			if !tt.noRPC {
+				s.rpc = &stubRPC{
+					health:    rpc.Health{Status: "healthy", LatestLedger: tt.rpcLatest},
+					healthErr: tt.rpcErr,
+				}
+			}
+
+			status, detail := s.checkIngestionLag(context.Background())
+
+			assert.Equal(t, tt.wantStatus, status)
+			if tt.wantDetail == "" {
+				assert.Empty(t, detail)
+			} else {
+				assert.Contains(t, detail, tt.wantDetail)
+			}
 		})
 	}
 }

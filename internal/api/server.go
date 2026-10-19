@@ -174,6 +174,12 @@ type Server struct {
 	tracer           trace.Tracer
 	retentionLedgers uint32
 
+	// defaultNetwork is the deployment's configured NETWORK. Watch-list
+	// writes that omit the network field land here instead of the
+	// store's "default", so a testnet deployment's API and ingester
+	// agree on which network the entry belongs to.
+	defaultNetwork string
+
 	// apiKeyAuth turns on API key authentication for the write,
 	// streaming, subscription-management, and key-management routes.
 	// Off by default: the API behaves exactly as before.
@@ -218,6 +224,11 @@ type Server struct {
 	// cors is the CORS middleware config. Wired via SetCORS from main so
 	// the API does not import the config package.
 	cors CORSConfig
+
+	// checkTimeout bounds EACH dependency probe behind /health and
+	// /readyz. The zero value means healthCheckTimeout; only tests set it,
+	// so the timeout paths don't sleep through the production budget.
+	checkTimeout time.Duration
 }
 
 // SetHTTPRequestBodyLimit sets the request body size limit, in bytes, for all handlers accepting a body.
@@ -355,6 +366,22 @@ func (s *Server) SetExportMaxRange(n int64) { s.exportMaxRange = n }
 // used to compute history_from_ledger when a new watched contract is added.
 // Zero falls back to the ingester's default of 17280 (~24h at 5s/ledger).
 func (s *Server) SetRetentionLedgers(n uint32) { s.retentionLedgers = n }
+
+// SetDefaultNetwork records the deployment's configured NETWORK so
+// watch-list writes that omit the network land on the network this
+// process actually ingests, rather than on the store's "default".
+// Empty falls back to the store's defaultNetwork ("default").
+func (s *Server) SetDefaultNetwork(name string) { s.defaultNetwork = name }
+
+// effectiveNetwork renders the network a watch-list write should target:
+// the request's own network when given, otherwise the deployment's
+// configured network, otherwise the store's default.
+func (s *Server) effectiveNetwork(requested string) string {
+	if requested != "" {
+		return requested
+	}
+	return s.defaultNetwork
+}
 
 // retentionLedgers reports the configured cold-start reach-back in ledgers.
 func (s *Server) retentionWindow() uint32 {

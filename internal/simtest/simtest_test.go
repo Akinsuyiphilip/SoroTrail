@@ -137,10 +137,10 @@ func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContra
 	return out, nil
 }
 
-func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
+func (m *mockStore) AddWatchedContract(_ context.Context, w store.WatchedContract) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.watched = append(m.watched, id)
+	m.watched = append(m.watched, w.ContractID)
 	return nil
 }
 

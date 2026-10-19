@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
+	"os"
 	"testing"
 	"time"
 
@@ -172,4 +176,157 @@ func TestStatsUsageMentionsReadOnly(t *testing.T) {
 	assert.Contains(t, statsUsage, "usage: sorotrail stats")
 	assert.Contains(t, statsUsage, "Read-only")
 	assert.Contains(t, statsUsage, "/stats endpoint")
+}
+
+type stubStatsStore struct {
+	stats store.Stats
+	err   error
+}
+
+func (s *stubStatsStore) Stats(context.Context, store.Scope) (store.Stats, error) {
+	return s.stats, s.err
+}
+
+// TestRunStats_KnownContents verifies that runStats against a database with known
+// contents outputs the exact fixture numbers.
+func TestRunStats_KnownContents(t *testing.T) {
+	orig := openStatsStore
+	defer func() { openStatsStore = orig }()
+
+	fixedTime := time.Date(2026, 10, 15, 14, 0, 0, 0, time.UTC)
+	stub := &stubStatsStore{
+		stats: store.Stats{
+			TotalEvents:           54321,
+			LastIngestedLedger:    123456,
+			VerifiedThroughLedger: 123400,
+			OldestStoredLedger:    1000,
+			ChainHeadLedger:       int64p(123460),
+			IngestLagLedgers:      int64p(4),
+			LastSuccessfulPoll:    &fixedTime,
+			ContractCount:         8,
+			WatchedContracts:      3,
+			TableSizeBytes:        1048576, // 1.0 MiB
+		},
+	}
+	openStatsStore = func(context.Context) (statsStore, func(), error) {
+		return stub, func() {}, nil
+	}
+
+	var buf bytes.Buffer
+	err := runStatsTo(&buf, nil)
+	require.NoError(t, err)
+
+	out := buf.String()
+	assert.Contains(t, out, "METRIC")
+	assert.Contains(t, out, "VALUE")
+	assert.Regexp(t, `total events\s+54321`, out)
+	assert.Regexp(t, `last ingested ledger\s+123456`, out)
+	assert.Regexp(t, `verified through ledger\s+123400`, out)
+	assert.Regexp(t, `oldest stored ledger\s+1000`, out)
+	assert.Regexp(t, `chain head ledger\s+123460`, out)
+	assert.Regexp(t, `ingest lag\s+4 ledgers`, out)
+	assert.Regexp(t, `last successful poll\s+2026-10-15 14:00:00`, out)
+	assert.Regexp(t, `contracts\s+8`, out)
+	assert.Regexp(t, `watched contracts\s+3`, out)
+	assert.Regexp(t, `events table size\s+1.0 MiB`, out)
+}
+
+// TestRunStats_EmptyDatabase verifies that an empty database reports zeroes clearly
+// and exits 0 rather than erroring or printing a partial report.
+func TestRunStats_EmptyDatabase(t *testing.T) {
+	orig := openStatsStore
+	defer func() { openStatsStore = orig }()
+
+	stub := &stubStatsStore{
+		stats: store.Stats{},
+	}
+	openStatsStore = func(context.Context) (statsStore, func(), error) {
+		return stub, func() {}, nil
+	}
+
+	var buf bytes.Buffer
+	err := runStatsTo(&buf, nil)
+	require.NoError(t, err)
+
+	out := buf.String()
+	assert.Contains(t, out, "METRIC")
+	assert.Contains(t, out, "VALUE")
+	assert.Regexp(t, `total events\s+0`, out)
+	assert.Regexp(t, `last ingested ledger\s+0`, out)
+	assert.Regexp(t, `verified through ledger\s+0`, out)
+	assert.Regexp(t, `oldest stored ledger\s+0`, out)
+	assert.Regexp(t, `chain head ledger\s+-`, out)
+	assert.Regexp(t, `ingest lag\s+-`, out)
+	assert.Regexp(t, `last successful poll\s+never`, out)
+	assert.Regexp(t, `contracts\s+0`, out)
+	assert.Regexp(t, `watched contracts\s+0`, out)
+	assert.Regexp(t, `events table size\s+0 B`, out)
+}
+
+// TestRunStats_DatabaseUnreachable verifies that failing to open the store
+// exits non-zero, distinguishable from a successful report of zero rows.
+func TestRunStats_DatabaseUnreachable(t *testing.T) {
+	orig := openStatsStore
+	defer func() { openStatsStore = orig }()
+
+	dbErr := errors.New("connection to postgres refused")
+	openStatsStore = func(context.Context) (statsStore, func(), error) {
+		return nil, nil, dbErr
+	}
+
+	var buf bytes.Buffer
+	err := runStatsTo(&buf, nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, dbErr)
+	assert.Equal(t, 1, exitCode(err), "database unreachable must map to exit code 1")
+	assert.Empty(t, buf.String(), "no stats table should be rendered on connection failure")
+}
+
+// TestRunStats_StatsQueryError verifies that an error reading stats from the
+// store returns an error and maps to non-zero exit code.
+func TestRunStats_StatsQueryError(t *testing.T) {
+	orig := openStatsStore
+	defer func() { openStatsStore = orig }()
+
+	queryErr := errors.New("relation events does not exist")
+	stub := &stubStatsStore{err: queryErr}
+	openStatsStore = func(context.Context) (statsStore, func(), error) {
+		return stub, func() {}, nil
+	}
+
+	var buf bytes.Buffer
+	err := runStatsTo(&buf, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reading store stats: relation events does not exist")
+	assert.Equal(t, 1, exitCode(err))
+}
+
+// TestRunStatsDirect verifies that calling runStats directly writes to stdout
+// and completes without error.
+func TestRunStatsDirect(t *testing.T) {
+	orig := openStatsStore
+	defer func() { openStatsStore = orig }()
+
+	stub := &stubStatsStore{
+		stats: store.Stats{TotalEvents: 99},
+	}
+	openStatsStore = func(context.Context) (statsStore, func(), error) {
+		return stub, func() {}, nil
+	}
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	oldStdout := os.Stdout
+	os.Stdout = w
+
+	runErr := runStats(nil)
+	w.Close()
+	os.Stdout = oldStdout
+
+	require.NoError(t, runErr)
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	assert.Contains(t, buf.String(), "METRIC")
+	assert.Contains(t, buf.String(), "total events")
+	assert.Contains(t, buf.String(), "99")
 }

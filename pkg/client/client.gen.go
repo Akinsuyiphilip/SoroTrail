@@ -16,7 +16,7 @@ import (
 // SpecVersion is the api/openapi.yaml info.version this client was
 // generated from. A client built against a different spec version may
 // not be wire-compatible with a running server.
-const SpecVersion = "0.1.0"
+const SpecVersion = "0.2.0"
 
 // SpecRoute is one (method, path) pair documented in the spec.
 type SpecRoute struct {
@@ -230,6 +230,16 @@ type DeliveryEnvelopeResponse struct {
 	NextCursor string            `json:"next_cursor,omitempty"`
 }
 
+// DependencyCheck One dependency's state inside a health envelope: what state it is in, why it isn't ok, and how long its own probe took.
+type DependencyCheck struct {
+	// Detail Human-readable cause, present only when status is not ok.
+	Detail string `json:"detail,omitempty"`
+	// LatencyMs Wall time of this check alone, in milliseconds.
+	LatencyMs int64 `json:"latency_ms"`
+	// Status `ok` — answered within its budget and healthy. `degraded` — answered, but reports a suboptimal state (a non-healthy RPC, or ingestion past the lag threshold). `unready` — did not answer at all: it errored or exceeded its per-check timeout.
+	Status string `json:"status"`
+}
+
 // EnrichedEvent API schema used by the SoroTrail client.
 type EnrichedEvent map[string]any
 
@@ -305,8 +315,9 @@ type GrantList struct {
 	ContractIds []string `json:"contract_ids"`
 }
 
-// HealthResponse API schema used by the SoroTrail client.
+// HealthResponse Envelope shared by /health, /livez and /readyz. status aggregates the checks: unready dominates degraded, which dominates ok.
 type HealthResponse struct {
+	// Checks One entry per dependency the endpoint consulted; empty of dependency entries on /livez, which reports only `process`.
 	Checks map[string]any `json:"checks"`
 	Status string         `json:"status"`
 }
@@ -490,6 +501,8 @@ type WatchedContract struct {
 	// AddedAt When the contract was added to the watch list.
 	AddedAt    string `json:"added_at"`
 	ContractID string `json:"contract_id"`
+	// Network The network this entry is watched on. Always present in responses; entries written without a network are reported as "default".
+	Network string `json:"network,omitempty"`
 }
 
 // WatchedContractAdded Result of adding a contract to the global watch list.
@@ -498,6 +511,8 @@ type WatchedContractAdded struct {
 	ContractID        string `json:"contract_id"`
 	HistoryFromLedger int64  `json:"history_from_ledger"`
 	ModeTransition    string `json:"mode_transition,omitempty"`
+	// Network The network the entry was filed on (echoes the request's network or the deployment default).
+	Network string `json:"network"`
 }
 
 // WatchedContractRemoved Result of removing a contract from the global watch list.
@@ -505,13 +520,17 @@ type WatchedContractRemoved struct {
 	ContractID       string `json:"contract_id"`
 	HistoryPreserved bool   `json:"history_preserved"`
 	ModeTransition   string `json:"mode_transition,omitempty"`
-	RemovedAt        string `json:"removed_at"`
+	// Network The network the entry was removed from.
+	Network   string `json:"network"`
+	RemovedAt string `json:"removed_at"`
 }
 
 // WatchedContractRequest JSON body used to add a contract to a watch list.
 type WatchedContractRequest struct {
 	// ContractID Stellar contract ID to add to the watch list.
 	ContractID string `json:"contract_id"`
+	// Network The Stellar network this entry is watched on. Omit to file the contract on the deployment's configured NETWORK (falling back to "default" when that is unset). The same contract watched on two networks is two independent watch-list entries.
+	Network string `json:"network,omitempty"`
 }
 
 // WatchedContractsPage The complete global contract watch list.
@@ -1921,6 +1940,7 @@ func (c *Client) RemoveWatchedContract(ctx context.Context, id string, params Re
 // RemoveWatchedContractParams are the query parameters for RemoveWatchedContract.
 type RemoveWatchedContractParams struct {
 	Confirm string
+	Network string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -1929,6 +1949,9 @@ func (p RemoveWatchedContractParams) values() url.Values {
 	v := url.Values{}
 	if p.Confirm != "" {
 		v.Set("confirm", p.Confirm)
+	}
+	if p.Network != "" {
+		v.Set("network", p.Network)
 	}
 	return v
 }

@@ -1981,11 +1981,34 @@ func (ing *Ingester) checkLag(ctx context.Context) {
 // filters per request, so ≤25 watched contracts fit in one request. Larger
 // lists spill into additional batches, each requiring its own request chain.
 // An empty watch list means one type-only filter, i.e. all contract events.
+//
+// The watch list is keyed by (network, contract); only this ingester's own
+// network's entries become filters. A contract watched on testnet but not
+// on this ingester's network must not be fetched here — its RPC points at
+// one network, and fetching foreign-network contracts would fail the
+// ledger checks (or worse, silently index another chain's events under
+// this network's name). Entries carrying an empty network are treated as
+// "default", matching the store's normalization.
 func (ing *Ingester) buildFilterBatches(ctx context.Context) ([][]rpc.EventFilter, error) {
 	watched, err := ing.store.ListWatchedContracts(ctx)
 	if err != nil {
 		return nil, err
 	}
+	ingNetwork := ing.opts.Network
+	if ingNetwork == "" {
+		ingNetwork = "default"
+	}
+	kept := watched[:0:0]
+	for _, wc := range watched {
+		network := wc.Network
+		if network == "" {
+			network = "default"
+		}
+		if network == ingNetwork {
+			kept = append(kept, wc)
+		}
+	}
+	watched = kept
 	if len(watched) == 0 {
 		return [][]rpc.EventFilter{{{Type: "contract"}}}, nil
 	}

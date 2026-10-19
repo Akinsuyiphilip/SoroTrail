@@ -400,7 +400,7 @@ func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContra
 	return nil, nil
 }
 
-func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
+func (m *mockStore) AddWatchedContract(_ context.Context, _ store.WatchedContract) error {
 	return nil
 }
 

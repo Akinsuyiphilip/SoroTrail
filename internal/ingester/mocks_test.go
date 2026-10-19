@@ -348,14 +348,14 @@ func (m *mockStore) ListWatchedContracts(context.Context) ([]store.WatchedContra
 	return m.watched, nil
 }
 
-func (m *mockStore) AddWatchedContract(_ context.Context, id string) error {
-	m.watched = append(m.watched, store.WatchedContract{ContractID: id})
+func (m *mockStore) AddWatchedContract(_ context.Context, w store.WatchedContract) error {
+	m.watched = append(m.watched, w)
 	return nil
 }
 
-func (m *mockStore) RemoveWatchedContract(_ context.Context, id string) error {
+func (m *mockStore) RemoveWatchedContract(_ context.Context, w store.WatchedContract) error {
 	for i, wc := range m.watched {
-		if wc.ContractID == id {
+		if wc.ContractID == w.ContractID {
 			m.watched = append(m.watched[:i], m.watched[i+1:]...)
 			return nil
 		}

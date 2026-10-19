@@ -723,7 +723,8 @@ silently evicted to prevent back-pressure on the ingester.
 - `SubscriberCount()` — observable metric for operators.
 
 The broadcaster is wired in `main.go` and consumed by the WebSocket
-handler (`GET /events/ws`).
+handler (`GET /events/ws`). See [Live Subscriptions](subscriptions.md) for
+the delivery guarantees, reconnection guidance, and the catch-up pattern.
 
 ### [`internal/webhook`](../internal/webhook/) — Async delivery
 

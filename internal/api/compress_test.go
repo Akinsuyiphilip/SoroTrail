@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,7 +12,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -1111,4 +1114,125 @@ func TestAddVaryAcceptEncoding(t *testing.T) {
 			assert.Equal(t, tt.expected, h.Get("Vary"))
 		})
 	}
+}
+
+// TestCompress_HijackSuccess asserts that http.Hijacker is forwarded through
+// compressWriter, the returned net.Conn is usable, and the middleware does not
+// attempt to write headers or trailers to a connection it no longer owns after return.
+func TestCompress_HijackSuccess(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		require.True(t, ok, "compressWriter must implement http.Hijacker")
+
+		conn, rw, err := hj.Hijack()
+		require.NoError(t, err)
+		defer conn.Close()
+
+		// Write raw HTTP response directly through hijacked connection
+		respText := "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"
+		_, err = rw.WriteString(respText)
+		require.NoError(t, err)
+		require.NoError(t, rw.Flush())
+	})
+
+	srv := httptest.NewServer(Compress(0)(handler))
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(body))
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// TestCompress_HijackNotSupported asserts that if the underlying ResponseWriter
+// does not implement http.Hijacker (such as httptest.ResponseRecorder),
+// Hijack returns http.ErrNotSupported rather than panicking on a type assertion.
+func TestCompress_HijackNotSupported(t *testing.T) {
+	rec := httptest.NewRecorder()
+	cw := &compressWriter{
+		ResponseWriter: rec,
+		encoding:       "gzip",
+		minSize:        100,
+	}
+
+	conn, rw, err := cw.Hijack()
+	assert.Nil(t, conn)
+	assert.Nil(t, rw)
+	assert.ErrorIs(t, err, http.ErrNotSupported)
+}
+
+// TestCompress_WebSocketUpgrade asserts that a WebSocket upgrade succeeds
+// with the Compress middleware in the handler chain.
+func TestCompress_WebSocketUpgrade(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Logf("websocket accept failed: %v", err)
+			return
+		}
+		defer c.CloseNow()
+
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+
+		err = c.Write(ctx, websocket.MessageText, []byte("ws-payload"))
+		assert.NoError(t, err)
+		c.Close(websocket.StatusNormalClosure, "")
+	})
+
+	srv := httptest.NewServer(Compress(0)(handler))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.Dial(ctx, wsURL, nil)
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close()
+	}
+	require.NoError(t, err, "WebSocket upgrade must succeed through compression middleware")
+	defer conn.CloseNow()
+
+	msgType, data, err := conn.Read(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, websocket.MessageText, msgType)
+	assert.Equal(t, "ws-payload", string(data))
+}
+
+// TestCompress_HijackedPreventsWriteAndFlush verifies that once a connection
+// is hijacked, subsequent calls to Write, WriteHeader, Flush, and Close on the
+// compressWriter do not write to or flush the underlying writer.
+func TestCompress_HijackedPreventsWriteAndFlush(t *testing.T) {
+	rec := httptest.NewRecorder()
+
+	cw := &compressWriter{
+		ResponseWriter: rec,
+		encoding:       "gzip",
+		minSize:        100,
+		hijacked:       true, // simulate successful hijack
+	}
+
+	// Write should return http.ErrHijacked
+	n, err := cw.Write([]byte("more data"))
+	assert.Equal(t, 0, n)
+	assert.ErrorIs(t, err, http.ErrHijacked)
+
+	// WriteHeader, Flush, and Close should no-op safely
+	assert.NotPanics(t, func() {
+		cw.WriteHeader(http.StatusOK)
+		cw.Flush()
+		cw.Close()
+	})
+
+	assert.Equal(t, 0, rec.Body.Len(), "no bytes should have been written to recorder after hijack")
+	assert.False(t, cw.wrote, "header should not have been flushed after hijack")
 }

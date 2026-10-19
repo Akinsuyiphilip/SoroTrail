@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -139,6 +140,14 @@ type stubStore struct {
 	ingestion    store.IngestionState
 	ingestionErr error
 
+	// pingCalls/ingestionStateCalls count dependency probes so tests can
+	// assert an endpoint that must not touch a dependency really doesn't.
+	pingCalls           atomic.Int64
+	ingestionStateCalls atomic.Int64
+	// pingFn, when set, replaces pingErr as the Ping answer so a test can
+	// hang on the request context instead of returning instantly.
+	pingFn func(context.Context) error
+
 	migrationVersion     int
 	migrationDirty       bool
 	migrationErr         error
@@ -149,19 +158,24 @@ type stubStore struct {
 	countContractsErr    error
 	lastContractsFilter  store.ContractsFilter
 
-	addressEvents    []store.Event
-	addressCursor    string
-	addressEventsErr error
-	addressCount     int64
-	addressCountErr  error
+	addressEvents     []store.Event
+	addressCursor     string
+	addressEventsErr  error
+	addressCount      int64
+	addressCountErr   error
+	addressSummary    store.AddressSummary
+	addressSummaryErr error
 
 	deadLettersResult []store.DeadLetter
 	deadLettersCursor string
 	deadLettersErr    error
+	listDeadLettersFn func(ctx context.Context, contractID string, limit int, cursor string) ([]store.DeadLetter, string, error)
 	// deadLettersCount is what CountDeadLetters returns; the error field
 	// drives the "count failed, header omitted" path.
 	deadLettersCount    int64
 	deadLettersCountErr error
+	deleteDeadLetterErr error
+	deleteDeadLetterFn  func(ctx context.Context, id int64) error
 
 	// deliveryAttemptsCount is what CountDeliveryAttempts returns; the
 	// error field drives the "count failed, header omitted" path.
@@ -279,6 +293,7 @@ func (s *stubStore) EventExists(_ context.Context, id string, _ store.Scope) (bo
 // LastIngestedLedger to drive the boundary decisions (just-below, at,
 // and above the frontier).
 func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, error) {
+	s.ingestionStateCalls.Add(1)
 	if s.ingestionState != nil {
 		return *s.ingestionState, s.ingestionStateEr
 	}
@@ -307,18 +322,24 @@ func (s *stubStore) Stats(_ context.Context, _ store.Scope) (store.Stats, error)
 	s.statsCalls++
 	return s.stats, nil
 }
-func (s *stubStore) Ping(context.Context) error { return s.pingErr }
+func (s *stubStore) Ping(ctx context.Context) error {
+	s.pingCalls.Add(1)
+	if s.pingFn != nil {
+		return s.pingFn(ctx)
+	}
+	return s.pingErr
+}
 func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return s.watchedList, s.watchedListErr
 }
 
-func (s *stubStore) AddWatchedContract(_ context.Context, id string) error {
-	s.added = append(s.added, id)
+func (s *stubStore) AddWatchedContract(_ context.Context, w store.WatchedContract) error {
+	s.added = append(s.added, w.ContractID)
 	return s.addErr
 }
 
-func (s *stubStore) RemoveWatchedContract(_ context.Context, id string) error {
-	s.removed = append(s.removed, id)
+func (s *stubStore) RemoveWatchedContract(_ context.Context, w store.WatchedContract) error {
+	s.removed = append(s.removed, w.ContractID)
 	return s.removeErr
 }
 
@@ -384,7 +405,7 @@ func (s *stubStore) CountAddressEvents(_ context.Context, address string) (int64
 	return s.addressCount, s.addressCountErr
 }
 func (s *stubStore) GetAddressSummary(context.Context, string) (store.AddressSummary, error) {
-	return store.AddressSummary{}, nil
+	return s.addressSummary, s.addressSummaryErr
 }
 func (s *stubStore) UpsertAddressRefs(context.Context, []store.AddressRef) error {
 	return nil
@@ -462,9 +483,19 @@ type stubRPC struct {
 
 	health    rpc.Health
 	healthErr error
+
+	// getHealthCalls counts probes for the same reason as pingCalls.
+	getHealthCalls atomic.Int64
+	// getHealthFn, when set, replaces healthErr/health as the answer so a
+	// test can hang on the request context instead of returning instantly.
+	getHealthFn func(context.Context) (rpc.Health, error)
 }
 
-func (s *stubRPC) GetHealth(context.Context) (rpc.Health, error) {
+func (s *stubRPC) GetHealth(ctx context.Context) (rpc.Health, error) {
+	s.getHealthCalls.Add(1)
+	if s.getHealthFn != nil {
+		return s.getHealthFn(ctx)
+	}
 	return s.health, s.healthErr
 }
 
@@ -1443,8 +1474,9 @@ func TestReadyz(t *testing.T) {
 		var h healthResponse
 		require.NoError(t, json.Unmarshal(body, &h))
 		assert.Equal(t, "ok", h.Status)
-		assert.Equal(t, "ok", h.Checks["database"])
-		assert.Equal(t, "ok", h.Checks["rpc"])
+		assert.Equal(t, healthOK, h.Checks["database"].Status)
+		assert.Equal(t, healthOK, h.Checks["rpc"].Status)
+		assert.Equal(t, healthOK, h.Checks["ingestion_lag"].Status)
 	})
 
 	t.Run("db down returns 503 with reason", func(t *testing.T) {
@@ -1453,10 +1485,12 @@ func TestReadyz(t *testing.T) {
 		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 		var h healthResponse
 		require.NoError(t, json.Unmarshal(body, &h))
-		assert.Equal(t, "degraded", h.Status)
-		assert.Contains(t, h.Checks["database"], "connection refused")
-		// RPC is still ok in this test.
-		assert.Equal(t, "ok", h.Checks["rpc"])
+		assert.Equal(t, healthUnready, h.Status)
+		assert.Equal(t, healthUnready, h.Checks["database"].Status)
+		assert.Contains(t, h.Checks["database"].Detail, "connection refused")
+		// The other checks stay ok: a failure names dependency, not the envelope.
+		assert.Equal(t, healthOK, h.Checks["rpc"].Status)
+		assert.Equal(t, healthOK, h.Checks["ingestion_lag"].Status)
 	})
 
 	t.Run("rpc down returns 503 with reason", func(t *testing.T) {
@@ -1465,8 +1499,10 @@ func TestReadyz(t *testing.T) {
 		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 		var h healthResponse
 		require.NoError(t, json.Unmarshal(body, &h))
-		assert.Equal(t, "degraded", h.Status)
-		assert.Contains(t, h.Checks["rpc"], "rpc unreachable")
+		assert.Equal(t, healthUnready, h.Status)
+		assert.Equal(t, healthUnready, h.Checks["rpc"].Status)
+		assert.Contains(t, h.Checks["rpc"].Detail, "rpc unreachable")
+		assert.Equal(t, healthOK, h.Checks["database"].Status)
 	})
 
 	t.Run("rpc unhealthy status returns 503", func(t *testing.T) {
@@ -1475,8 +1511,11 @@ func TestReadyz(t *testing.T) {
 		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 		var h healthResponse
 		require.NoError(t, json.Unmarshal(body, &h))
-		assert.Equal(t, "degraded", h.Status)
-		assert.Contains(t, h.Checks["rpc"], `rpc reports "unhealthy"`)
+		// Reachable-but-unhealthy is degraded, not unready: the distinction
+		// is what tells an operator to wait versus to intervene.
+		assert.Equal(t, healthDegraded, h.Status)
+		assert.Equal(t, healthDegraded, h.Checks["rpc"].Status)
+		assert.Contains(t, h.Checks["rpc"].Detail, `rpc reports "unhealthy"`)
 	})
 
 	t.Run("no-store cache header", func(t *testing.T) {
@@ -3013,13 +3052,21 @@ func TestGetEventTransaction_NoInterferenceWithGetEvent(t *testing.T) {
 func (m *stubStore) DeadLetterEvent(context.Context, store.DeadLetterInput) (store.DeadLetter, error) {
 	return store.DeadLetter{}, nil
 }
-func (m *stubStore) ListDeadLetters(context.Context, string, int, string) ([]store.DeadLetter, string, error) {
+func (m *stubStore) ListDeadLetters(ctx context.Context, contractID string, limit int, cursor string) ([]store.DeadLetter, string, error) {
+	if m.listDeadLettersFn != nil {
+		return m.listDeadLettersFn(ctx, contractID, limit, cursor)
+	}
 	return m.deadLettersResult, m.deadLettersCursor, m.deadLettersErr
 }
 func (m *stubStore) GetDeadLetter(context.Context, int64) (store.DeadLetter, error) {
 	return store.DeadLetter{}, store.ErrNotFound
 }
-func (m *stubStore) DeleteDeadLetter(context.Context, int64) error { return nil }
+func (m *stubStore) DeleteDeadLetter(ctx context.Context, id int64) error {
+	if m.deleteDeadLetterFn != nil {
+		return m.deleteDeadLetterFn(ctx, id)
+	}
+	return m.deleteDeadLetterErr
+}
 func (m *stubStore) CountDeadLetters(context.Context, string) (int64, error) {
 	return m.deadLettersCount, m.deadLettersCountErr
 }
