@@ -745,6 +745,22 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 	assert.ErrorContains(t, err, "not yet implemented for ClickHouse",
 		"ContractEventTypeCounts should return an explicit unsupported error")
 
+	// API key operations are unsupported by ClickHouse and must return explicit errors.
+	_, err = st.CreateAPIKey(ctx, APIKey{})
+	assert.ErrorContains(t, err, "not supported by the clickhouse backend")
+
+	_, err = st.GetAPIKey(ctx, 1)
+	assert.ErrorContains(t, err, "not supported by the clickhouse backend")
+
+	_, err = st.LookupAPIKeyByPrefix(ctx, "prefix")
+	assert.ErrorContains(t, err, "not supported by the clickhouse backend")
+
+	_, err = st.ListAPIKeys(ctx)
+	assert.ErrorContains(t, err, "not supported by the clickhouse backend")
+
+	err = st.RevokeAPIKey(ctx, 1)
+	assert.ErrorContains(t, err, "not supported by the clickhouse backend")
+
 	// GetContractCursor is implemented on this backend, not stubbed: it
 	// issues a request. On a zero-value ClickHouse there is no server to
 	// reach, so what it must not do is succeed or panic.
