@@ -104,4 +104,3 @@ func TestContractsResolver_TenantScopeIsolation(t *testing.T) {
 		assert.Nil(t, lookup["data"].(map[string]any)["contract"])
 	})
 }
-
