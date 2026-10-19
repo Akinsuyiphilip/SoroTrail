@@ -56,7 +56,7 @@ func newClickHouseTestServer(t *testing.T, respond func(query string) string) *c
 	require.NoError(t, err)
 
 	cfg := clickHouseConfig{host: host, port: port, httpPort: port, database: "sorotrail"}
-	fake.store = &ClickHouse{host: host, port: port, cfg: cfg}
+	fake.store = &ClickHouse{cfg: cfg}
 	return fake
 }
 
