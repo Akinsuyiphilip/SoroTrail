@@ -1,6 +1,7 @@
 # SoroTrail
 
 [![CI](https://img.shields.io/github/actions/workflow/status/sorotrail/SoroTrail/ci.yml?branch=main&label=CI)](https://github.com/sorotrail/SoroTrail/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/codecov/c/github/sorotrail/SoroTrail?branch=main&label=coverage&logo=codecov)](https://codecov.io/gh/sorotrail/SoroTrail)
 [![Go version](https://img.shields.io/github/go-mod/go-version/sorotrail/SoroTrail?filename=go.mod&logo=go)](https://go.dev/doc/install)
 [![License](https://img.shields.io/github/license/sorotrail/SoroTrail)](LICENSE)
 

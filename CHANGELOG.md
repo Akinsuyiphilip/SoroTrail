@@ -11,6 +11,7 @@
 - CI caches Go modules and build output with an explicit key that includes the Go version, `go.sum` and the build-tag flavour, so the `-tags=integration` job no longer shares a single cache slot with the untagged jobs.
 - The integration-tagged suite now runs against a matrix of Postgres 15 and 16 rather than 16 alone, and the aggregate `integration` check still reports the name branch tooling expects.
 - Migration version-number collisions are gated by their own database-free `migrations` job and `make migrations-check`, ahead of the suites one collision would otherwise break. [CONTRIBUTING.md](CONTRIBUTING.md) documents how to pick the next version number.
+- Dependency CVEs are reported by a new `vulncheck` CI job, which runs `govulncheck ./...` on pull requests and on pushes to `main` and fails when a known vulnerability is reachable from the module's own code. The module's minimum Go moves to 1.26.9, the newest 1.26 patch, because govulncheck reports standard-library advisories against the exact patch the `go` directive names and 1.26.0 carried 36 reachable ones.
 
 ### Fixed
 
