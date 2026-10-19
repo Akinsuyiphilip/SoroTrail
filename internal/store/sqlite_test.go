@@ -287,3 +287,64 @@ func TestFormatTime_SortsChronologically(t *testing.T) {
 		assert.Equal(t, want, got)
 	})
 }
+
+// TestSQLite_ListContracts_PaginationAcrossSortKeys walks every page of every
+// documented sort key and compares it with the unpaged listing. Postgres can
+// only keyset-page the contract_id ordering (its aggregate sorts put the
+// aggregate in WHERE), so this cannot live in the shared conformance body;
+// SQLite implements aggregate sorts with HAVING, which makes the walk a real
+// no-skip/no-repeat check for the new implementation.
+func TestSQLite_ListContracts_PaginationAcrossSortKeys(t *testing.T) {
+	st := newSQLiteStore(t)
+	ctx := context.Background()
+
+	contracts := []string{"C1", "C2", "C3", "C4", "C5"}
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	var events []Event
+	for i, contract := range contracts {
+		for j := 0; j <= i; j++ {
+			e := testEvent(eventID(i*10+j+1), int64(100+i*10+j), contract)
+			e.CreatedAt = base.Add(time.Duration(i)*time.Minute + time.Duration(j)*time.Second)
+			events = append(events, e)
+		}
+	}
+	_, err := st.UpsertEvents(ctx, events)
+	require.NoError(t, err)
+
+	for _, sortKey := range []string{"", SortByActivity, SortByFirstLedger, SortByLastLedger, SortByLastSeen} {
+		t.Run("sort="+sortKey, func(t *testing.T) {
+			want, cursor, err := st.ListContracts(ctx, ContractsFilter{SortKey: sortKey, Limit: 10})
+			require.NoError(t, err)
+			assert.Empty(t, cursor)
+
+			var got []ContractSummary
+			cursor = ""
+			for page := 0; page < len(want)+1; page++ {
+				items, next, err := st.ListContracts(ctx, ContractsFilter{
+					SortKey: sortKey,
+					Limit:   2,
+					Cursor:  cursor,
+				})
+				require.NoError(t, err)
+				got = append(got, items...)
+				if next == "" {
+					break
+				}
+				cursor = next
+			}
+
+			require.Len(t, got, len(want), "paging must return each contract exactly once")
+			for i := range want {
+				assert.Equal(t, want[i].ContractID, got[i].ContractID,
+					"page %d must resume at the same position as the unpaged listing", i)
+			}
+		})
+	}
+
+	t.Run("malformed aggregate cursor", func(t *testing.T) {
+		cursor := EncodeContractsCursor(SortByFirstLedger, "not-a-number", contracts[0])
+		_, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByFirstLedger, Cursor: cursor})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidContractsCursor)
+	})
+}

@@ -56,15 +56,57 @@ func (c *ClickHouse) UpsertContractMeta(context.Context, ContractMeta) error    
 func (c *ClickHouse) CountContractEvents(context.Context, string) (int64, error) { return 0, nil }
 
 // GetContractSummary returns a single contract's summary from ClickHouse.
+// It aggregates the events table in the database, mirroring the Postgres
+// query (which has no separate contracts registry either): a contract is a
+// contract_id that has emitted at least one stored event, and a contract
+// with no events is ErrNotFound.
+//
+// The aggregate is exact, not approximate. count(), min(ledger) and
+// max(ledger) are exact in ClickHouse, and max(created_at) is exact too, so
+// there is no need for the approximate-function caveat other analytical
+// endpoints carry.
 func (c *ClickHouse) GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error) {
-	// TODO: implement ClickHouse-specific query
-	return ContractSummary{}, fmt.Errorf("GetContractSummary: not yet implemented for ClickHouse")
+	query := "SELECT contract_id, count() AS event_count, min(ledger) AS first_ledger, " +
+		"max(ledger) AS last_ledger, max(created_at) AS last_seen " +
+		"FROM events WHERE contract_id = " + clickHouseQuoteString(contractID) +
+		" GROUP BY contract_id"
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(), query)
+	if err != nil {
+		return ContractSummary{}, fmt.Errorf("get contract summary %s: %w", contractID, err)
+	}
+	if len(rows) == 0 {
+		return ContractSummary{}, ErrNotFound
+	}
+	row := rows[0]
+	return ContractSummary{
+		ContractID:  row.str("contract_id"),
+		EventCount:  row.int64("event_count"),
+		FirstLedger: row.int64("first_ledger"),
+		LastLedger:  row.int64("last_ledger"),
+		LastSeen:    row.time("last_seen"),
+	}, nil
 }
 
-// ContractEventTypeCounts returns per-type event counts from ClickHouse.
+// ContractEventTypeCounts returns per-type event counts from ClickHouse,
+// ordered by count descending like the Postgres implementation. The
+// aggregation happens in the database rather than by fetching event rows
+// into Go, which is the point of using the analytical backend at all.
 func (c *ClickHouse) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
-	// TODO: implement ClickHouse-specific query
-	return nil, fmt.Errorf("ContractEventTypeCounts: not yet implemented for ClickHouse")
+	query := "SELECT type, count() AS event_count FROM events WHERE contract_id = " +
+		clickHouseQuoteString(contractID) +
+		" GROUP BY type ORDER BY event_count DESC"
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(), query)
+	if err != nil {
+		return nil, fmt.Errorf("contract event type counts %s: %w", contractID, err)
+	}
+	out := make([]ContractEventTypeCount, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, ContractEventTypeCount{
+			Type:  row.str("type"),
+			Count: row.int64("event_count"),
+		})
+	}
+	return out, nil
 }
 
 func (c *ClickHouse) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
