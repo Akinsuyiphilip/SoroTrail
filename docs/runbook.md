@@ -45,9 +45,14 @@ docker compose logs --tail 50 sorotrail
 psql "$DATABASE_URL" -c "SELECT 1"
 ```
 
-The `/health` endpoint returns `{"status":"ok"}` when both the database and
-RPC are reachable. A `503` with `"degraded"` tells you which dependency
-failed. The `/stats` endpoint shows `last_ingested_ledger`,
+The `/health` endpoint reports each dependency individually: every entry in
+`checks` carries a `status` (`ok`, `degraded` or `unready`) plus a `detail`
+explaining any non-ok status. A `503` names the failing dependency — and
+whether it is unreachable (`unready`) or reachable-but-unhealthy
+(`degraded`) — so you don't need the logs to see which one broke.
+`/readyz` answers the same envelope with an added `ingestion_lag` check
+(degraded beyond 100 ledgers behind the chain head); `/livez` never touches
+a dependency. The `/stats` endpoint shows `last_ingested_ledger`,
 `verified_through_ledger`, and audit counters — the three numbers that
 tell you whether the system is making progress and whether the auditor is
 happy.

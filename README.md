@@ -1,6 +1,7 @@
 # SoroTrail
 
 [![CI](https://img.shields.io/github/actions/workflow/status/sorotrail/SoroTrail/ci.yml?branch=main&label=CI)](https://github.com/sorotrail/SoroTrail/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/codecov/c/github/sorotrail/SoroTrail?branch=main&label=coverage&logo=codecov)](https://codecov.io/gh/sorotrail/SoroTrail)
 [![Go version](https://img.shields.io/github/go-mod/go-version/sorotrail/SoroTrail?filename=go.mod&logo=go)](https://go.dev/doc/install)
 [![License](https://img.shields.io/github/license/sorotrail/SoroTrail)](LICENSE)
 
@@ -237,7 +238,10 @@ SoroTrail is tested in CI against the following Postgres major versions:
 | PostgreSQL 16 | Supported |
 
 Any Postgres 15+ release should work; only the above versions are exercised in
-the test matrix.
+CI. Both suites that touch the database run the full matrix — the unit job for
+the Postgres-backed conformance tests and the `integration`-tagged job for
+migrations, reorgs and the API filter tests — so a planner or index behaviour
+difference between the two majors fails a leg rather than reaching a deployment.
 
 ## Configuration
 
@@ -770,8 +774,9 @@ match, since `If-None-Match` comparison ignores the `W/` prefix.
 ## API reference
 
 GET /health
-Reports the API's view of its dependencies. 200 when both the database and
-the RPC are reachable and healthy, 503 otherwise.
+Reports the API's view of its dependencies, each reported individually with
+its own state (`ok`, `degraded` or `unready`), reason, and latency. 200 when
+every check is ok, 503 otherwise.
 
 ### Pagination
 
@@ -803,10 +808,54 @@ curl -s 'localhost:8080/events?cursor=0001099511627776-0000000009&limit=10'
 
 ### `GET /health`
 
+Reports the API's view of its dependencies — the database and the Stellar
+RPC — each one individually: `checks` holds one entry per dependency with
+its own `status` (`ok` | `degraded` | `unready`), a `detail` explaining any
+non-ok status, and how long that check alone took (`latency_ms`). Every
+check runs concurrently with its own 5-second budget, so one hung
+dependency cannot starve another's or mask its state. `200` only when
+every check is `ok`; a `degraded` or `unready` check yields `503`.
+
 curl -s localhost:8080/health
 JSON
 
-{"status":"ok","checks":{"database":"ok","rpc":"ok"}}
+{"status":"ok","checks":{"database":{"status":"ok","latency_ms":1},"rpc":{"status":"ok","latency_ms":84}}}
+
+### `GET /livez`
+
+Liveness probe for the process alone. Always `200` while the process is
+running, and it never touches a dependency — a dead database must pull
+the instance from rotation via `/readyz`, not get the binary restarted.
+Its `checks` carries the single `process` entry and nothing else.
+
+curl -s localhost:8080/livez
+JSON
+
+{"status":"ok","checks":{"process":{"status":"ok","latency_ms":0}}}
+
+### `GET /readyz`
+
+Readiness probe: the same per-dependency envelope as `/health`, plus the
+`ingestion_lag` check. The thresholds that separate the states:
+
+- **`unready`** — a dependency gave no answer: it errored, or blew its
+  5-second per-check budget. Applies to the database, the RPC, the
+  ingestion-state row, and the chain head (needed for the lag check).
+- **`degraded`** — everything answered, but suboptimal: the RPC reports
+  `getHealth` status other than `healthy`, or ingestion is more than 100
+  ledgers behind the chain head.
+- **`ok`** — everything answered and within threshold.
+
+Both `degraded` and `unready` answer `503` — staleness and failure both
+pull the instance from rotation — and the split lives in the body so an
+operator knows whether to wait or to intervene. The full response shape
+is documented in [`api/openapi.yaml`](api/openapi.yaml).
+
+curl -s localhost:8080/readyz
+JSON
+
+{"status":"ok","checks":{"database":{"status":"ok","latency_ms":1},"rpc":{"status":"ok","latency_ms":84},"ingestion_lag":{"status":"ok","latency_ms":2}}}
+
 GET /events
 Lists stored events in ascending (oldest-first) or descending (newest-first) order. Defaults to ascending.
 
@@ -2057,9 +2106,9 @@ in normal operation — so the API serves two distinct cache policies:
   at/above the frontier are still growing, so they get
   `Cache-Control: no-cache` — a deliberate "when in doubt, don't
   cache" choice rather than a guess with a short max-age.
-- **`GET /health`** and **`GET /stats`** are always
-  `Cache-Control: no-store` so monitoring tooling, dashboards, and
-  alerting see real state rather than a stale replica.
+- **`GET /health`**, **`GET /livez`**, **`GET /readyz`** and **`GET /stats`**
+  are always `Cache-Control: no-store` so monitoring tooling, dashboards,
+  and alerting see real state rather than a stale replica.
 
 All cacheable responses set `Vary: Accept-Encoding` so a future
 compression middleware (#25) can serve distinct encoded variants

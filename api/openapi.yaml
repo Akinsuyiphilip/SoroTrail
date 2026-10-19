@@ -10,7 +10,7 @@ info:
     JSON-producing operations accept the shared `pretty=true` query
     parameter to indent responses for human inspection; it does not change
     the response data.
-  version: "0.1.0"
+  version: "0.2.0"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -33,7 +33,16 @@ paths:
       summary: Dependency health check
       description: >-
         Report whether the API process can reach its database and RPC
-        dependencies. This probe is public and does not expose tenant data.
+        dependencies, with each dependency's state reported individually.
+        This probe is public and does not expose tenant data.
+
+        Every check runs concurrently under its own 5-second timeout, so
+        one hung dependency cannot starve another's budget. Each check
+        reports `status` (`ok`, `degraded` or `unready`), a `detail`
+        explaining any non-ok status, and how long that check alone took.
+        200 only when every check is `ok`; a `degraded` or `unready` check
+        answers 503. Ingestion freshness is deliberately not part of this
+        probe — see `/readyz`.
       tags: [System]
       security: []
       responses:
@@ -46,19 +55,22 @@ paths:
               example:
                 status: ok
                 checks:
-                  database: ok
-                  rpc: ok
+                  database: {status: ok, latency_ms: 1}
+                  rpc: {status: ok, latency_ms: 84}
         "503":
-          description: One or more dependencies degraded
+          description: At least one dependency is degraded or unready
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
               example:
-                status: degraded
+                status: unready
                 checks:
-                  database: ok
-                  rpc: unavailable
+                  database: {status: ok, latency_ms: 1}
+                  rpc:
+                    status: unready
+                    detail: "Get \"https://rpc.example/\": connection refused"
+                    latency_ms: 12
   /events:
     get:
       operationId: listEvents
@@ -1265,9 +1277,13 @@ paths:
       operationId: livez
       summary: Liveness probe
       description: >-
-        Reports only that the process is up. Never touches the database or RPC.
-        It therefore has no failure response: a process that cannot answer 200
-        here cannot answer at all.
+        Reports only that the process is up. Never touches the database or
+        RPC — the `checks` object carries the single `process` check and
+        nothing else, and that independence is the contract: a dependency
+        outage must not fail a liveness probe, or the orchestrator would
+        restart the one component that could have reported the outage. A
+        process that cannot answer 200 here cannot answer at all, so there
+        is no failure response.
       tags: [Operations]
       security: []
       responses:
@@ -1279,19 +1295,39 @@ paths:
                 $ref: "#/components/schemas/HealthResponse"
               example:
                 status: ok
-                checks: {}
+                checks:
+                  process: {status: ok, latency_ms: 0}
   /readyz:
     get:
       operationId: readyz
       summary: Readiness probe
       description: >-
-        Reports whether the database, RPC and schema are usable, and whether
-        ingestion has fallen more than 100 ledgers behind the chain head.
+        Reports whether the database, RPC and ingestion freshness are usable,
+        with each dependency's state reported individually so a failing probe
+        names the dependency that failed without anyone reading logs.
+
+        Every check runs concurrently under its own 5-second timeout. The
+        thresholds that separate the states:
+
+        - `unready` — a dependency gave no answer (it errored, or blew its
+          5-second per-check budget): the database is unreachable, the RPC
+          is unreachable, the ingestion state row cannot be read, or the
+          chain head is needed but unavailable.
+        - `degraded` — everything answered, but a dependency reports a
+          suboptimal state: the RPC answers `getHealth` with something
+          other than "healthy", or ingestion is more than 100 ledgers
+          behind the chain head (`readinessLagThreshold`, evaluated only
+          once at least one ledger has been ingested).
+        - `ok` — everything answered and is within threshold.
+
+        Both `degraded` and `unready` answer 503: staleness and failure
+        both remove the instance from rotation, and the split lives in the
+        body so an operator knows whether to wait or to intervene.
       tags: [Operations]
       security: []
       responses:
         "200":
-          description: Every dependency is usable and ingestion is current
+          description: Every dependency is answering and ingestion is current
           content:
             application/json:
               schema:
@@ -1299,13 +1335,15 @@ paths:
               example:
                 status: ok
                 checks:
-                  database: ok
-                  rpc: ok
-                  ingestion: current
+                  database: {status: ok, latency_ms: 1}
+                  rpc: {status: ok, latency_ms: 84}
+                  ingestion_lag:
+                    status: ok
+                    detail: no ingestion state recorded yet
         "503":
           description: >-
-            A dependency is unusable or ingestion is lagging. The body names
-            the failing check so the instance can be pulled from the load
+            A dependency is degraded or unready. The body names the failing
+            check and its state so the instance can be pulled from the load
             balancer without reading the logs. This is a degraded-readiness
             report rather than the shared error envelope.
           content:
@@ -1315,9 +1353,12 @@ paths:
               example:
                 status: degraded
                 checks:
-                  database: ok
-                  rpc: unavailable
-                  ingestion: lagging (150 ledgers behind)
+                  database: {status: ok, latency_ms: 1}
+                  rpc: {status: ok, latency_ms: 86}
+                  ingestion_lag:
+                    status: degraded
+                    detail: "150 ledgers behind (last ingested: 260000, chain head: 260150)"
+                    latency_ms: 3
   /version:
     get:
       operationId: version
@@ -3211,18 +3252,49 @@ components:
       required: [error]
     HealthResponse:
       type: object
+      description: >-
+        Envelope shared by /health, /livez and /readyz. status aggregates
+        the checks: unready dominates degraded, which dominates ok.
       properties:
         status:
           type: string
-          enum: [ok, degraded]
+          enum: [ok, degraded, unready]
         checks:
           type: object
+          description: >-
+            One entry per dependency the endpoint consulted; empty of
+            dependency entries on /livez, which reports only `process`.
           additionalProperties:
-            type: string
+            $ref: "#/components/schemas/DependencyCheck"
           example:
-            database: ok
-            rpc: ok
+            database: {status: ok, latency_ms: 1}
+            rpc: {status: ok, latency_ms: 84}
       required: [status, checks]
+    DependencyCheck:
+      type: object
+      description: >-
+        One dependency's state inside a health envelope: what state it is
+        in, why it isn't ok, and how long its own probe took.
+      properties:
+        status:
+          type: string
+          description: >-
+            `ok` — answered within its budget and healthy. `degraded` —
+            answered, but reports a suboptimal state (a non-healthy RPC,
+            or ingestion past the lag threshold). `unready` — did not
+            answer at all: it errored or exceeded its per-check timeout.
+          enum: [ok, degraded, unready]
+          example: ok
+        detail:
+          type: string
+          description: Human-readable cause, present only when status is not ok.
+          example: "150 ledgers behind (last ingested: 260000, chain head: 260150)"
+        latency_ms:
+          type: integer
+          format: int64
+          description: Wall time of this check alone, in milliseconds.
+          example: 84
+      required: [status, latency_ms]
     Event:
       type: object
       description: A Stellar/Soroban contract event

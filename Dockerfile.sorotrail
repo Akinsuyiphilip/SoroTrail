@@ -4,7 +4,15 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go build -o /sorotrail ./cmd/sorotrail
+# Stamp the same buildinfo symbols as the main Dockerfile and GoReleaser so
+# this image can identify itself too; a plain go build without -X would
+# silently fall back to the package's "unknown" placeholders.
+ARG VERSION=unknown
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+RUN go build \
+	-ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$VERSION -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$COMMIT -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate=$BUILD_DATE" \
+	-o /sorotrail ./cmd/sorotrail
 
 FROM alpine:3.24
 RUN apk add --no-cache ca-certificates
