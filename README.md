@@ -108,6 +108,11 @@ DATABASE_URL=sqlite:./sorotrail.db make run
 
 Migrations run automatically on startup.
 
+A ClickHouse backend can also be selected with a `clickhouse://` URL, but it
+is an optional analytical backend rather than a drop-in replacement for
+Postgres. See [docs/clickhouse.md](docs/clickhouse.md) for what it supports,
+what it refuses, and which methods silently do nothing.
+
 Configuration
 All configuration comes from environment variables (see 
 .env.example
@@ -116,7 +121,7 @@ All configuration comes from environment variables (see
 Variable	Default	Description
 RPC_URL	https://soroban-testnet.stellar.org	Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet.
 RPC_RATE_LIMIT	10	Single-provider request rate limit (requests/second). Default matches the public endpoint limit — raising it against the public RPC will get you throttled; set higher only for paid plans or self-hosted RPCs. On 429 the client honors Retry-After (seconds or HTTP-date, capped at 60s).
-DATABASE_URL	— (required)	Postgres connection string.
+DATABASE_URL	— (required)	Postgres connection string. SQLite (`sqlite:./sorotrail.db`) and ClickHouse (`clickhouse://…`) are also supported; see [ClickHouse backend support](docs/clickhouse.md) before choosing ClickHouse.
 POLL_INTERVAL	5s	Sleep between polls once caught up.
 HTTP_ADDR	:8080	API listen address.
 WATCHED_CONTRACTS	empty	Comma-separated contract IDs (C...). Empty = ingest all contract events.
@@ -297,7 +302,7 @@ once. A single process still ingests one network — the one named by
 
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
-| `DATABASE_URL` | string | — (required) | Postgres or SQLite connection string. Use `postgres://…` for production or `sqlite:./sorotrail.db` for a zero-dependency single-binary setup. | restart |
+| `DATABASE_URL` | string | — (required) | Postgres or SQLite connection string. Use `postgres://…` for production or `sqlite:./sorotrail.db` for a zero-dependency single-binary setup. A `clickhouse://…` URL selects the optional analytical backend; read [ClickHouse backend support](docs/clickhouse.md) first. | restart |
 | `DB_MAX_CONNS` | int | `0` | Max connections in the Postgres pool. `0` (default) uses pgx's default. | restart |
 | `DB_MIN_CONNS` | int | `0` | Min connections kept warm in the pool (`0` = pgx default). | restart |
 | `DB_MAX_CONN_LIFETIME` | duration | `0` | Max lifetime of a DB connection (`0` = no limit, e.g. `30m`). | restart |
@@ -683,7 +688,7 @@ All configuration comes from environment variables (see
 Variable	Default	Description
 RPC_URL	https://soroban-testnet.stellar.org	Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet.
 RPC_RATE_LIMIT	10	Single-provider request rate limit (requests/second). Default matches the public endpoint limit — raising it against the public RPC will get you throttled; set higher only for paid plans or self-hosted RPCs. On 429 the client honors Retry-After (seconds or HTTP-date, capped at 60s).
-DATABASE_URL	— (required)	Postgres connection string.
+DATABASE_URL	— (required)	Postgres connection string. SQLite (`sqlite:./sorotrail.db`) and ClickHouse (`clickhouse://…`) are also supported; see [ClickHouse backend support](docs/clickhouse.md) before choosing ClickHouse.
 POLL_INTERVAL	5s	Sleep between polls once caught up.
 HTTP_ADDR	:8080	API listen address.
 WATCHED_CONTRACTS	empty	Comma-separated contract IDs (C...). Empty = ingest all contract events.

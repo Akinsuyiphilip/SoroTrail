@@ -13,6 +13,9 @@ for operators and developers.
   and system topology.
 - [Multi-tenancy](multi-tenancy.md): Multi-tenant isolation model, tenant boundaries,
   contract grants, quotas, and accounting.
+- [ClickHouse Backend Support](clickhouse.md): Capability matrix for the optional
+  analytical backend, distinguishing implemented methods from refusals and silent
+  no-ops.
 
 ## Real-Time and Authentication APIs
 
