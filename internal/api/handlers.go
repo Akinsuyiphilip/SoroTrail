@@ -1835,14 +1835,17 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	// network gains its first entry. Entries on other networks keep
 	// their own deployments' modes and are irrelevant here.
 	targetNetwork := s.effectiveNetwork(req.Network)
+	targetLabel := defaultNetworkLabel(targetNetwork)
+	instanceLabel := defaultNetworkLabel(s.defaultNetwork)
 	onTargetNetwork := 0
+	alreadyWatchedOnTarget := false
 	for _, wc := range current {
-		wcNetwork := wc.Network
-		if wcNetwork == "" {
-			wcNetwork = "default"
-		}
-		if wcNetwork == defaultNetworkLabel(targetNetwork) {
+		wcNetwork := defaultNetworkLabel(wc.Network)
+		if wcNetwork == targetLabel {
 			onTargetNetwork++
+			if wc.ContractID == req.ContractID {
+				alreadyWatchedOnTarget = true
+			}
 		}
 	}
 	if onTargetNetwork == 0 {
@@ -1861,10 +1864,10 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	state, err := s.store.GetIngestionState(r.Context())
+	state, err := s.getIngestionStateForNetwork(r.Context(), targetNetwork)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 
-		loggerFromContext(r.Context()).Error("loading ingestion state for add", "error", err)
+		loggerFromContext(r.Context()).Error("loading ingestion state for add", "network", targetLabel, "error", err)
 
 		writeError(w, http.StatusInternalServerError, errors.New("loading ingestion state failed"))
 
@@ -1872,7 +1875,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	wanted := store.WatchedContract{ContractID: req.ContractID, Network: s.effectiveNetwork(req.Network)}
+	wanted := store.WatchedContract{ContractID: req.ContractID, Network: targetNetwork}
 	if err := s.store.AddWatchedContract(r.Context(), wanted); err != nil {
 
 		loggerFromContext(r.Context()).Error("adding watched contract", "contract_id", req.ContractID, "error", err)
@@ -1888,19 +1891,25 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	// a contract resumes, never re-backfills); otherwise the cold-start
 	// retention window - latest minus RETENTION_LEDGERS, clamped to what
 	// the RPC still retains - is where the automatic backfill starts.
+	//
+	// contract_cursors and s.rpc are bound to this instance's configured
+	// network, so they only apply when targetNetwork matches the instance
+	// network (or when the contract was already watched on targetNetwork).
 	historyFrom := state.LastIngestedLedger
-	if cc, cerr := s.store.GetContractCursor(r.Context(), req.ContractID); cerr == nil {
-		historyFrom = cc.LastIngestedLedger
-	} else if errors.Is(cerr, store.ErrNotFound) {
-		if health, herr := s.rpc.GetHealth(r.Context()); herr == nil {
-			start := int64(health.LatestLedger) - int64(s.retentionWindow())
-			if oldest := int64(health.OldestLedger); start < oldest {
-				start = oldest
+	if targetLabel == instanceLabel || alreadyWatchedOnTarget {
+		if cc, cerr := s.store.GetContractCursor(r.Context(), req.ContractID); cerr == nil {
+			historyFrom = cc.LastIngestedLedger
+		} else if errors.Is(cerr, store.ErrNotFound) && targetLabel == instanceLabel {
+			if health, herr := s.rpc.GetHealth(r.Context()); herr == nil {
+				start := int64(health.LatestLedger) - int64(s.retentionWindow())
+				if oldest := int64(health.OldestLedger); start < oldest {
+					start = oldest
+				}
+				if start < 2 {
+					start = 2
+				}
+				historyFrom = start
 			}
-			if start < 2 {
-				start = 2
-			}
-			historyFrom = start
 		}
 	}
 
@@ -1911,7 +1920,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, addWatchedResponse{
 
 		ContractID: req.ContractID,
-		Network:    defaultNetworkLabel(wanted.Network),
+		Network:    targetLabel,
 
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
 
@@ -1920,6 +1929,18 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 		ModeTransition: modeTransition,
 	})
 
+}
+
+func (s *Server) getIngestionStateForNetwork(ctx context.Context, network string) (store.IngestionState, error) {
+	if r, ok := s.store.(interface {
+		GetIngestionStateForNetwork(context.Context, string) (store.IngestionState, error)
+	}); ok {
+		return r.GetIngestionStateForNetwork(ctx, network)
+	}
+	if defaultNetworkLabel(network) == defaultNetworkLabel(s.defaultNetwork) {
+		return s.store.GetIngestionState(ctx)
+	}
+	return store.IngestionState{}, store.ErrNotFound
 }
 
 func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
