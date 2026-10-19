@@ -100,6 +100,26 @@ func (s *TracingStore) GetIngestionState(ctx context.Context) (IngestionState, e
 	return state, err
 }
 
+func (s *TracingStore) GetIngestionStateForNetwork(ctx context.Context, network string) (IngestionState, error) {
+	ctx, span := s.tracer.Start(ctx, "store.GetIngestionStateForNetwork")
+	defer span.End()
+	span.SetAttributes(attribute.String("store.network", network))
+	if r, ok := s.Store.(interface {
+		GetIngestionStateForNetwork(context.Context, string) (IngestionState, error)
+	}); ok {
+		state, err := r.GetIngestionStateForNetwork(ctx, network)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		return state, err
+	}
+	if defaultNetwork(network) == "default" {
+		return s.Store.GetIngestionState(ctx)
+	}
+	return IngestionState{}, ErrNotFound
+}
+
 func (s *TracingStore) SaveIngestionState(ctx context.Context, state IngestionState) error {
 	ctx, span := s.tracer.Start(ctx, "store.SaveIngestionState")
 	defer span.End()

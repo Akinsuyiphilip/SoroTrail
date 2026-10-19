@@ -137,8 +137,9 @@ type stubStore struct {
 	existsCalls      int // count of EventExists calls
 	lastExistsID     string
 
-	ingestion    store.IngestionState
-	ingestionErr error
+	ingestion      store.IngestionState
+	ingestionErr   error
+	ingestionByNet map[string]store.IngestionState
 
 	// pingCalls/ingestionStateCalls count dependency probes so tests can
 	// assert an endpoint that must not touch a dependency really doesn't.
@@ -298,6 +299,22 @@ func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, er
 		return *s.ingestionState, s.ingestionStateEr
 	}
 	return s.ingestion, s.ingestionErr
+}
+
+func (s *stubStore) GetIngestionStateForNetwork(ctx context.Context, network string) (store.IngestionState, error) {
+	if s.ingestionByNet != nil {
+		if network == "" {
+			network = "default"
+		}
+		if st, ok := s.ingestionByNet[network]; ok {
+			return st, nil
+		}
+		return store.IngestionState{}, store.ErrNotFound
+	}
+	if network == "" || network == "default" {
+		return s.GetIngestionState(ctx)
+	}
+	return store.IngestionState{}, store.ErrNotFound
 }
 
 // MigrationVersion backs /readyz's schema check. Tests that need a dirty
