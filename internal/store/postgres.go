@@ -1708,8 +1708,15 @@ func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, network string, 
 	)
 	var f AuditFinding
 	var lastAttempted *time.Time
+	// last_error is NULL by design, not by accident: RecordAuditFinding
+	// leaves it unset until a repair attempt fails, and nullableString
+	// writes NULL back for an emptied message. Scanning it into a plain
+	// string would abort every read of a fresh finding with "cannot scan
+	// NULL into *string" — the SQLite backend's shared scanAuditFinding
+	// already reads it through a pointer for the same reason.
+	var lastError *string
 	err := row.Scan(&f.ID, &f.Network, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
-		&f.MissingIDs, &f.Status, &f.Attempts, &lastAttempted, &f.LastError, &f.CreatedAt)
+		&f.MissingIDs, &f.Status, &f.Attempts, &lastAttempted, &lastError, &f.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuditFinding{}, ErrNotFound
 	}
@@ -1718,6 +1725,9 @@ func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, network string, 
 	}
 	if lastAttempted != nil {
 		f.LastAttemptedAt = *lastAttempted
+	}
+	if lastError != nil {
+		f.LastError = *lastError
 	}
 	return f, nil
 }
