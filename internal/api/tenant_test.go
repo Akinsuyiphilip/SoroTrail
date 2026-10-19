@@ -1484,6 +1484,45 @@ func TestTenantWatch_MultiNetwork(t *testing.T) {
 	assert.Equal(t, []string{contractA}, defaultWatched.ContractIDs)
 }
 
+// TestRemoveOwnWatchedValidatesTheContractID pins the outcomes the issue
+// asks about: a malformed id is a client error reported exactly like the
+// POST handler's, and a well-formed id the tenant does not hold is the
+// documented idempotent no-op (see the OpenAPI description of the
+// operation) rather than a silent success that hides the typo.
+func TestRemoveOwnWatchedValidatesTheContractID(t *testing.T) {
+	f := newTenantFixture(t)
+	// The fake store keys watched contracts tenant -> network; these calls
+	// omit network, so the seeded contract lives under the default label.
+	def := defaultNetworkLabel("")
+	f.tenants.watched[1] = map[string][]string{def: {contractA}}
+
+	t.Run("a malformed contract id is rejected before the store", func(t *testing.T) {
+		rec := f.do(t, http.MethodDelete, f.keyA, "/tenant/watch/not-a-strkey", "")
+		require.Equal(t, http.StatusBadRequest, rec.Code, bodyString(t, rec))
+		var env struct {
+			Error string `json:"error"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+		assert.Equal(t, `invalid contract_id "not-a-strkey"`, env.Error,
+			"the message must match the POST handler's format")
+		assert.Equal(t, []string{contractA}, f.tenants.watched[1][def],
+			"a malformed id must never reach the store")
+	})
+
+	t.Run("removing a contract the tenant does not hold is a 200 no-op", func(t *testing.T) {
+		rec := f.do(t, http.MethodDelete, f.keyA, "/tenant/watch/"+contractB, "")
+		require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+		assert.Equal(t, []string{contractA}, f.tenants.watched[1][def],
+			"the list must be unchanged")
+	})
+
+	t.Run("a held contract is removed", func(t *testing.T) {
+		rec := f.do(t, http.MethodDelete, f.keyA, "/tenant/watch/"+contractA, "")
+		require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+		assert.Empty(t, f.tenants.watched[1][def])
+	})
+}
+
 // TestGrantAndRevokeTakeEffectImmediately verifies that adding or
 // removing a grant is reflected on the very next request, with no
 // stale cache or delayed propagation.

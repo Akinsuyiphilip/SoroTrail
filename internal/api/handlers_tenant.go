@@ -441,6 +441,19 @@ func (s *Server) handleAddOwnWatched(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRemoveOwnWatched(w http.ResponseWriter, r *http.Request) {
 	p, _ := PrincipalFrom(r.Context())
 	contractID := chi.URLParam(r, "contract_id")
+	// The id is checked before the store is touched so a typo in the path
+	// reads as the client error it is, not as a 200 that looks like a
+	// successful removal; the message matches the POST handler so one bad
+	// id means one thing across both watch endpoints.
+	if !config.ValidContractID(contractID) {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("invalid contract_id %q", contractID))
+		return
+	}
+	// The delete is unconditional: a well-formed id the tenant does not
+	// hold removes nothing and still answers 200 with the refreshed list,
+	// so retries and concurrent removals stay idempotent instead of racing
+	// into a 404.
 	network := s.effectiveNetwork(r.URL.Query().Get("network"))
 	if err := s.tenants.RemoveTenantWatchedContract(r.Context(), p.Tenant.ID, network, contractID); err != nil {
 		loggerFromContext(r.Context()).Error("removing watched contract", "error", err)

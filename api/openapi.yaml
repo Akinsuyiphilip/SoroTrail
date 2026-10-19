@@ -2231,7 +2231,10 @@ paths:
       operationId: removeTenantWatch
       summary: Remove a contract from the tenant's watch list
       description: >-
-        Removes a contract from the calling tenant's watch list.
+        Removes a contract from the calling tenant's watch list. Removing a
+        well-formed contract the tenant does not hold is a no-op that still
+        answers 200 with the unchanged list, so retries stay idempotent; only
+        a malformed contract_id is rejected with a 400.
       tags: [Operations]
       parameters:
         - name: contract_id
@@ -2254,6 +2257,8 @@ paths:
               example:
                 contract_ids:
                   - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
