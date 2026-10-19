@@ -1036,7 +1036,10 @@ the spec-declared fields cannot be decoded (or the topics are malformed),
 the enriched response keeps the raw event alongside `"decoded": false` and a
 `decode_error` string explaining what failed, e.g.
 `"decode_error": "decoding topic field ...: cannot decode"`. Every such
-failure is also counted in `GET /stats` (see below).
+failure is also counted in `GET /stats` (see below). For contracts that do
+not embed a `contractspecv0` section on-chain (or whose Wasm is unreachable),
+operators can upload a manual spec override via `PUT /contracts/{id}/spec` —
+see [Contract Spec Overrides](docs/spec-overrides.md).
 | `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
