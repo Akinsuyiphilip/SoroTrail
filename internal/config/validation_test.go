@@ -76,3 +76,88 @@ func TestValidateAll_Coverage(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateCORSOrigins pins down the startup guard on CORS_ALLOWED_ORIGINS,
+// which is the last point before a malformed entry becomes a permissive browser
+// policy for the life of the process. Each case covers one rule the operator
+// docs promise: an explicit scheme://host[:port] origin, the "*" wildcard, the
+// rejected "null" origin, or an empty list meaning CORS is disabled.
+func TestValidateCORSOrigins(t *testing.T) {
+	tests := []struct {
+		name    string
+		origins []string
+		// expectError is the substring the error must contain; empty means
+		// the list is accepted.
+		expectError string
+	}{
+		{
+			// An empty list is the documented default: CORS stays off and no
+			// browser request receives Access-Control-* headers.
+			name: "empty list accepted (CORS disabled)",
+		},
+		{
+			name:    "well-formed https origin accepted",
+			origins: []string{"https://app.example.com"},
+		},
+		{
+			name:    "http origin with an explicit port accepted",
+			origins: []string{"http://localhost:3000"},
+		},
+		{
+			name:    "wildcard accepted",
+			origins: []string{"*"},
+		},
+		{
+			// Load calls cleanOrigins first, so a pasted trailing slash is
+			// stripped before validation. Called directly the entry is still
+			// rejected: browsers never send a path in Origin, so comparing one
+			// would silently match nothing.
+			name:        "origin with a trailing slash rejected",
+			origins:     []string{"https://app.example.com/"},
+			expectError: `CORS_ALLOWED_ORIGINS entry "https://app.example.com/" is not a valid origin`,
+		},
+		{
+			name:        "origin with a path rejected",
+			origins:     []string{"https://app.example.com/api"},
+			expectError: `CORS_ALLOWED_ORIGINS entry "https://app.example.com/api" is not a valid origin`,
+		},
+		{
+			name:        "bare hostname with no scheme rejected",
+			origins:     []string{"app.example.com"},
+			expectError: `CORS_ALLOWED_ORIGINS entry "app.example.com" is not a valid origin`,
+		},
+		{
+			// Origin: null is what sandboxed iframes and file:// pages send, so
+			// allowing it would let any third-party page call the API.
+			name:        "null origin rejected",
+			origins:     []string{"null"},
+			expectError: `CORS_ALLOWED_ORIGINS entry "null" is not allowed`,
+		},
+		{
+			// The error has to name the offending entry, not just the variable,
+			// so an operator with a long allowlist can find the bad one.
+			name:        "error names the offending origin",
+			origins:     []string{"https://app.example.com", "app.example.com"},
+			expectError: `CORS_ALLOWED_ORIGINS entry "app.example.com" is not a valid origin`,
+		},
+		{
+			// Whitespace-only entries are dropped by cleanOrigins before Load
+			// validates, and the validator tolerates them directly rather than
+			// failing startup over a stray comma.
+			name:    "blank entries tolerated",
+			origins: []string{"", "   "},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateCORSOrigins(tt.origins)
+			if tt.expectError == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.expectError)
+		})
+	}
+}

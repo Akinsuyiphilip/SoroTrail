@@ -440,6 +440,60 @@ func TestRateLimiterRetryAfterIsCeiled(t *testing.T) {
 		"X-RateLimit-Reset must sit one refill period out")
 }
 
+// TestRateLimiterResolvedBucketsArePerKey pins the resolver seam itself.
+// Once a resolver supplies the key, two callers sharing a source address must
+// still get separate budgets — the property per-tenant limits are built on —
+// and the burst the resolver returns, not the instance-wide one, is what gets
+// enforced and advertised.
+func TestRateLimiterResolvedBucketsArePerKey(t *testing.T) {
+	// The header stands in for whatever identity the resolver keys on; the
+	// tenant path uses the principal, which authenticate installs.
+	resolve := func(r *http.Request) (string, float64, int, bool) {
+		key := r.Header.Get("X-Test-Bucket")
+		if key == "" {
+			return "", 0, 0, false
+		}
+		return key, 0.5, 2, true
+	}
+	lim := NewRateLimiter(1, 5, false, WithLimitResolver(resolve))
+
+	send := func(bucket, addr string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := mkReq(http.MethodGet, "/events")
+		req.RemoteAddr = addr
+		if bucket != "" {
+			req.Header.Set("X-Test-Bucket", bucket)
+		}
+		middlewareFor(lim).ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Both keys ride the same source address. Only the resolved key differs;
+	// a bucket chosen by address here would throttle one caller for the
+	// other's spend.
+	const sharedAddr = "203.0.113.72:6000"
+
+	for i := 0; i < 2; i++ {
+		rec := send("tenant:1", sharedAddr)
+		require.Equal(t, http.StatusOK, rec.Code,
+			"request %d within the resolved burst must be admitted", i+1)
+		assert.Equal(t, "2", rec.Header().Get("X-RateLimit-Limit"),
+			"the resolver's burst must be advertised, not the instance-wide burst")
+	}
+	rec := send("tenant:1", sharedAddr)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	assert.NotEmpty(t, rec.Header().Get("Retry-After"))
+
+	assert.Equal(t, http.StatusOK, send("tenant:2", sharedAddr).Code,
+		"a second resolved key must keep its own budget despite sharing an address")
+	assert.Equal(t, 2, lim.Size(), "each resolved key must own exactly one bucket")
+
+	// A caller the resolver declines keeps the instance-wide IP bucket, which
+	// is a third key rather than a share of either resolved one.
+	assert.Equal(t, http.StatusOK, send("", sharedAddr).Code)
+	assert.Equal(t, 3, lim.Size())
+}
+
 // TestRateLimiterDisabledIsPassthrough guards the off-by-default posture: a
 // limiter with no limits configured must not add or reject anything, even
 // though the wiring stays in place.

@@ -76,12 +76,34 @@ type ChunkInfo struct {
 // compressed NDJSON. It is safe for concurrent use by a single
 // goroutine (the pruner).
 type Archiver struct {
-	client     *minio.Client
+	client     objectClient
 	bucket     string
 	prefix     string
 	store      store.Store
 	log        *slog.Logger
 	maxRetries int
+}
+
+type objectClient interface {
+	StatObject(context.Context, string, string, minio.StatObjectOptions) (minio.ObjectInfo, error)
+	GetObject(context.Context, string, string, minio.GetObjectOptions) (io.ReadCloser, error)
+	PutObject(context.Context, string, string, io.Reader, int64, minio.PutObjectOptions) (minio.UploadInfo, error)
+}
+
+type minioObjectClient struct {
+	client *minio.Client
+}
+
+func (c minioObjectClient) StatObject(ctx context.Context, bucket, key string, opts minio.StatObjectOptions) (minio.ObjectInfo, error) {
+	return c.client.StatObject(ctx, bucket, key, opts)
+}
+
+func (c minioObjectClient) GetObject(ctx context.Context, bucket, key string, opts minio.GetObjectOptions) (io.ReadCloser, error) {
+	return c.client.GetObject(ctx, bucket, key, opts)
+}
+
+func (c minioObjectClient) PutObject(ctx context.Context, bucket, key string, reader io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
+	return c.client.PutObject(ctx, bucket, key, reader, size, opts)
 }
 
 // Options configures the archiver. All fields have safe zero-value
@@ -171,7 +193,7 @@ func New(st store.Store, opts Options) (*Archiver, error) {
 	}
 
 	return &Archiver{
-		client:     client,
+		client:     minioObjectClient{client: client},
 		bucket:     opts.Bucket,
 		prefix:     opts.Prefix,
 		store:      st,
@@ -180,26 +202,46 @@ func New(st store.Store, opts Options) (*Archiver, error) {
 	}, nil
 }
 
-// IsArchived reports whether the given ledger range has been
-// durably archived and verified. The pruner calls this before
-// deleting each batch.
+// IsArchived reports whether a compatible manifest declares coverage for the
+// ledger range and the corresponding data object exists. It does not verify
+// the compressed object's contents.
 func (a *Archiver) IsArchived(ctx context.Context, ledgerStart, ledgerEnd int64) (bool, error) {
-	// Query the store for an archived chunk covering this range.
-	// For now we check via the query_events path; a dedicated
-	// archive_chunks query will be added when the Store interface
-	// is extended. Until then, we use the exported chunk metadata
-	// stored in S3 as the source of truth.
 	if a == nil {
 		return false, nil
 	}
 	uri := a.objectPrefix(ledgerStart)
-	_, err := a.client.StatObject(ctx, a.bucket, uri+"/manifest.json", minio.StatObjectOptions{})
+	manifestKey := uri + "/manifest.json"
+	_, err := a.client.StatObject(ctx, a.bucket, manifestKey, minio.StatObjectOptions{})
 	if err != nil {
 		var minioErr minio.ErrorResponse
 		if errors.As(err, &minioErr) && minioErr.StatusCode == 404 {
 			return false, nil
 		}
 		return false, fmt.Errorf("checking archive for ledger %d: %w", ledgerStart, err)
+	}
+
+	manifestReader, err := a.client.GetObject(ctx, a.bucket, manifestKey, minio.GetObjectOptions{})
+	if err != nil {
+		return false, fmt.Errorf("reading archive manifest for ledger %d: %w", ledgerStart, err)
+	}
+	defer manifestReader.Close()
+
+	var manifest Manifest
+	if err := json.NewDecoder(manifestReader).Decode(&manifest); err != nil {
+		return false, fmt.Errorf("decoding archive manifest for ledger %d: %w", ledgerStart, err)
+	}
+	if manifest.SchemaVersion != SchemaVersion {
+		return false, fmt.Errorf("unsupported archive schema version %d", manifest.SchemaVersion)
+	}
+	if manifest.Chunk.LedgerStart > ledgerStart || manifest.Chunk.LedgerEnd < ledgerEnd {
+		return false, nil
+	}
+	if _, err := a.client.StatObject(ctx, a.bucket, uri+"/data.ndjson.gz", minio.StatObjectOptions{}); err != nil {
+		var minioErr minio.ErrorResponse
+		if errors.As(err, &minioErr) && minioErr.StatusCode == 404 {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking archive data for ledger %d: %w", ledgerStart, err)
 	}
 	return true, nil
 }
@@ -209,7 +251,7 @@ func (a *Archiver) IsArchived(ctx context.Context, ledgerStart, ledgerEnd int64)
 // It is idempotent: if the archive already exists for this range the
 // call is a no-op returning the existing object URI and manifest hash.
 //
-// Returns the object URI and manifest SHA-256 on success.
+// Returns the object URI and compressed data SHA-256 on success.
 func (a *Archiver) ArchiveRange(ctx context.Context, fromLedger, toLedger int64) (string, string, error) {
 	if a == nil {
 		return "", "", nil
@@ -225,14 +267,39 @@ func (a *Archiver) ArchiveRange(ctx context.Context, fromLedger, toLedger int64)
 		if err != nil {
 			return "", "", fmt.Errorf("reading existing manifest: %w", err)
 		}
+		defer obj.Close()
 		var m Manifest
-		if err := json.NewDecoder(obj).Decode(&m); err == nil {
-			a.log.Debug("archive already exists, skipping",
-				"from_ledger", fromLedger, "to_ledger", toLedger,
-				"object_uri", uri)
-			return uri, a.manifestHash(m), nil
+		if err := json.NewDecoder(obj).Decode(&m); err != nil {
+			return "", "", fmt.Errorf("decoding existing manifest: %w", err)
 		}
-		obj.Close()
+		if m.SchemaVersion != SchemaVersion {
+			return "", "", fmt.Errorf("existing archive has unsupported schema version %d", m.SchemaVersion)
+		}
+		if m.Chunk.LedgerStart != fromLedger || m.Chunk.LedgerEnd != toLedger {
+			return "", "", fmt.Errorf("existing archive range [%d, %d) does not match requested range [%d, %d)",
+				m.Chunk.LedgerStart, m.Chunk.LedgerEnd, fromLedger, toLedger)
+		}
+		data, err := a.client.GetObject(ctx, a.bucket, uri+"/data.ndjson.gz", minio.GetObjectOptions{})
+		if err != nil {
+			return "", "", fmt.Errorf("reading existing archive data: %w", err)
+		}
+		dataBytes, err := io.ReadAll(data)
+		closeErr := data.Close()
+		if err != nil {
+			return "", "", fmt.Errorf("reading existing archive data: %w", err)
+		}
+		if closeErr != nil {
+			return "", "", fmt.Errorf("closing existing archive data: %w", closeErr)
+		}
+		dataHash := sha256.Sum256(dataBytes)
+		a.log.Debug("archive already exists, skipping",
+			"from_ledger", fromLedger, "to_ledger", toLedger,
+			"object_uri", uri)
+		return uri, fmt.Sprintf("%x", dataHash), nil
+	}
+	var minioErr minio.ErrorResponse
+	if !errors.As(err, &minioErr) || minioErr.StatusCode != 404 {
+		return "", "", fmt.Errorf("checking existing archive manifest: %w", err)
 	}
 
 	a.log.Info("archiving range",
@@ -294,6 +361,8 @@ func (a *Archiver) ArchiveRange(ctx context.Context, fromLedger, toLedger int64)
 		return "", "", nil
 	}
 
+	hash := sha256.Sum256(gzBuf.Bytes())
+
 	// Build and upload the NDJSON data file.
 	dataKey := uri + "/data.ndjson.gz"
 	contentType := "application/x-ndjson"
@@ -305,7 +374,6 @@ func (a *Archiver) ArchiveRange(ctx context.Context, fromLedger, toLedger int64)
 	}
 
 	// Build the manifest.
-	hash := sha256.Sum256(gzBuf.Bytes())
 	manifest := Manifest{
 		SchemaVersion: SchemaVersion,
 		Chunk: ChunkInfo{
@@ -360,5 +428,8 @@ func (a *Archiver) manifestHash(m Manifest) string {
 // GetObject returns a reader for an archived object. The caller must
 // close the returned ReadCloser. Used by recovery tooling.
 func (a *Archiver) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
+	if a == nil {
+		return nil, errors.New("archive is disabled")
+	}
 	return a.client.GetObject(ctx, a.bucket, key, minio.GetObjectOptions{})
 }

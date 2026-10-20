@@ -211,11 +211,13 @@ func querySchemaMatch(appliedVersion int) (*schemaMatchInfo, error) {
 		}
 	}
 
-	matched := appliedVersion > 0 && len(pending) == 0
+	matched := appliedVersion > 0 && appliedVersion == entries
 	detail := fmt.Sprintf("applied %d, embedded %d, pending %d",
 		appliedVersion, entries, len(pending))
 	if appliedVersion == 0 {
 		detail = "no migrations applied"
+	} else if appliedVersion > entries {
+		detail = fmt.Sprintf("applied %d exceeds embedded %d", appliedVersion, entries)
 	} else if len(pending) > 0 {
 		detail = fmt.Sprintf("applied %d, embedded %d, %d pending: %v",
 			appliedVersion, entries, len(pending), pending)
@@ -234,12 +236,13 @@ func querySchemaMatch(appliedVersion int) (*schemaMatchInfo, error) {
 // the ledger range from the partition name and counting rows.
 func queryPartitions(ctx context.Context, pool *pgxpool.Pool) ([]schemaPartition, error) {
 	rows, err := pool.Query(ctx, `
-		SELECT c.relname::text,
-		       pg_get_expr(c.relpartbound, c.oid),
-		       (SELECT coalesce(count(*), 0) FROM pg_class c2 WHERE c2.oid = c.oid)
+		SELECT n.nspname::text,
+		       c.relname::text,
+		       pg_get_expr(c.relpartbound, c.oid)
 		FROM pg_inherits i
 		JOIN pg_class c ON c.oid = i.inhrelid
 		JOIN pg_class p ON p.oid = i.inhparent
+		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE p.relname = 'events'
 		ORDER BY c.relname`)
 	if err != nil {
@@ -247,26 +250,47 @@ func queryPartitions(ctx context.Context, pool *pgxpool.Pool) ([]schemaPartition
 	}
 	defer rows.Close()
 
-	var parts []schemaPartition
+	type partitionRef struct {
+		schema string
+		part   schemaPartition
+	}
+	var refs []partitionRef
 	for rows.Next() {
 		var (
-			name  string
-			bound string
-			count int64
+			schema string
+			name   string
+			bound  string
 		)
-		if err := rows.Scan(&name, &bound, &count); err != nil {
+		if err := rows.Scan(&schema, &name, &bound); err != nil {
 			return nil, fmt.Errorf("scanning partition: %w", err)
 		}
 		p := schemaPartition{
-			Name:      name,
-			RowCounts: count,
+			Name: name,
 		}
-		// Parse "FOR VALUES FROM (X) TO (Y)" to extract the range.
-		_, _ = fmt.Sscanf(bound, "FOR VALUES FROM (%d) TO (%d)", &p.From, &p.To)
-		parts = append(parts, p)
+		if bound != "DEFAULT" {
+			// pg_get_expr quotes range values for bigint partition keys.
+			n, err := fmt.Sscanf(bound, "FOR VALUES FROM ('%d') TO ('%d')", &p.From, &p.To)
+			if n != 2 {
+				n, err = fmt.Sscanf(bound, "FOR VALUES FROM (%d) TO (%d)", &p.From, &p.To)
+			}
+			if err != nil || n != 2 {
+				return nil, fmt.Errorf("parsing partition %s bound %q: expected numeric range", name, bound)
+			}
+		}
+		refs = append(refs, partitionRef{schema: schema, part: p})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	rows.Close()
+
+	parts := make([]schemaPartition, 0, len(refs))
+	for _, ref := range refs {
+		table := pgx.Identifier{ref.schema, ref.part.Name}.Sanitize()
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&ref.part.RowCounts); err != nil {
+			return nil, fmt.Errorf("counting rows in partition %s: %w", ref.part.Name, err)
+		}
+		parts = append(parts, ref.part)
 	}
 	return parts, nil
 }
