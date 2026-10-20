@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -285,4 +286,66 @@ func TestIngestion_Parity(t *testing.T) {
 		"value":      "XDR==",
 	}
 	assert.Equal(t, storedEventRPC, storedEventHorizon)
+}
+
+// recordingTransport is a RoundTripper that never touches the network: it
+// captures the outgoing request and answers with a canned body, so a test
+// can prove which transport served a call.
+type recordingTransport struct {
+	got  *http.Request
+	body string
+}
+
+func (rt *recordingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	rt.got = r
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(rt.body)),
+		Request:    r,
+	}, nil
+}
+
+// TestHTTPClient_WithHTTPClient_UsesTheInjectedTransport: WithHTTPClient is
+// the testing seam; requests must flow through the injected RoundTripper
+// rather than the default transport, and the canned response must parse
+// like a real one.
+func TestHTTPClient_WithHTTPClient_UsesTheInjectedTransport(t *testing.T) {
+	rt := &recordingTransport{body: `{"_embedded":{"records":[{"id":"r1","hash":"h1","ledger":100,"result_code":"txSuccess"}]}}`}
+
+	// The base URL is unroutable on purpose: if the client used its own
+	// transport the request would fail instead of reaching the recorder.
+	c := NewHTTPClient("http://127.0.0.1:1", 0).WithHTTPClient(&http.Client{Transport: rt})
+
+	resp, err := c.ListContractTransactions(context.Background(), "CABC", "cur1", 25, true)
+
+	require.NoError(t, err)
+	require.NotNil(t, rt.got, "the injected transport must serve the request")
+	assert.Equal(t, "/accounts/CABC/transactions", rt.got.URL.Path)
+	assert.Equal(t, "25", rt.got.URL.Query().Get("limit"))
+	assert.Equal(t, "cur1", rt.got.URL.Query().Get("cursor"))
+	assert.Equal(t, "true", rt.got.URL.Query().Get("include_failed"))
+	require.Len(t, resp.Embedded.Records, 1)
+	assert.Equal(t, "h1", resp.Embedded.Records[0].Hash)
+}
+
+// TestHTTPClient_WithHTTPClient_NilKeepsTheDefault: a nil swap is a no-op.
+// The seam only exists to redirect traffic in tests; passing nil must not
+// disarm the client, because a nil *http.Client panics on the first Do and
+// the failure would surface far away from the call site.
+func TestHTTPClient_WithHTTPClient_NilKeepsTheDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"_embedded":{"records":[]}}`)
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, 0)
+	original := c.http
+
+	c.WithHTTPClient(nil)
+
+	assert.Same(t, original, c.http, "a nil client must leave the current transport in place")
+	resp, err := c.ListContractTransactions(context.Background(), "CABC", "", 50, false)
+	require.NoError(t, err)
+	assert.Empty(t, resp.Embedded.Records)
 }

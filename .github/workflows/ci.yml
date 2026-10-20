@@ -526,6 +526,28 @@ jobs:
           fi
       - name: Helm template render (defaults)
         run: helm template sorotrail deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db > /dev/null
+
+  monitoring:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # promtool ships with Prometheus; pin a release here the same way
+      # the lint job pins golangci-lint rather than tracking latest.
+      - name: Install promtool
+        env:
+          PROM_VERSION: 3.15.0
+        run: |
+          curl -sSfL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" -o /tmp/prometheus.tar.gz
+          tar -xzf /tmp/prometheus.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          promtool --version
+      # No secrets and no running Prometheus: promtool parses and unit-tests
+      # the rule file in-process, and the script cross-checks every metric
+      # the rules and the dashboard reference against the list of metrics
+      # this project exports, so a renamed or deleted metric fails here
+      # instead of shipping as a silently dead alert or blank panel.
+      - name: Validate Prometheus rules and Grafana dashboard
+        run: make check-monitoring
       - name: Helm template render (existing secret)
         run: |
           helm template sorotrail deploy/helm/sorotrail \

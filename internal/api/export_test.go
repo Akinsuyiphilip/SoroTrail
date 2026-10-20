@@ -168,6 +168,9 @@ func (f *fakeExportStore) SaveAuditStateIfGreater(context.Context, string, int64
 func (f *fakeExportStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return nil, nil
 }
+func (f *fakeExportStore) ListWatchedContractsScoped(context.Context, store.Scope) ([]store.WatchedContract, error) {
+	return nil, nil
+}
 func (f *fakeExportStore) AddWatchedContract(context.Context, store.WatchedContract) error {
 	return nil
 }

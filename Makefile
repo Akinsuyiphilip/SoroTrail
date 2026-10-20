@@ -5,6 +5,7 @@ MIGRATIONS := internal/store/migrations
 # to a non-default host port.
 DATABASE_URL ?= postgres://sorotrail:sorotrail@localhost:5432/sorotrail?sslmode=disable
 
+.PHONY: build run test test-db lint cover cover-html migrate-up migrate-down docker-up docker-down clean check-monitoring
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "unknown")
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown")
@@ -91,6 +92,19 @@ lint-fix: ## Run golangci-lint run --fix and apply the fixes
 lint: lint-guard ## Run golangci-lint (guards go.mod/toolchain drift first)
 	golangci-lint run
 
+# Validate the operator-facing monitoring assets. promtool parses the rule
+# file and runs the unit tests in deploy/prometheus/sorotrail-rules-test.yml;
+# scripts/validate_monitoring.py then asserts the dashboard parses as a real
+# Grafana dashboard and that every metric both assets reference is one
+# SoroTrail actually exports (deploy/prometheus/exported-metrics.txt).
+# Needs promtool on PATH (ships with Prometheus); no Prometheus server or
+# secrets required, so CI runs the same thing.
+check-monitoring:
+	promtool check rules deploy/prometheus/sorotrail-rules.yml
+	promtool test rules deploy/prometheus/sorotrail-rules-test.yml
+	python3 scripts/validate_monitoring.py
+
+cover:
 lint-guard: ## Fail fast when go.mod targets a newer Go than the pinned linter
 	@scripts/check_lint_toolchain.sh
 

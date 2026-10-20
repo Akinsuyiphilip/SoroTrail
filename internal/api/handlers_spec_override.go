@@ -45,13 +45,20 @@ func (s *Server) handlePutContractSpecOverride(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// decodeJSONBody drains r.Body, so a second call would see an empty
+	// request and the bare form could never succeed. Read the body once
+	// and try both shapes on the same bytes instead.
+	raw, err := readJSONBody(r)
 	var body struct {
 		Spec json.RawMessage `json:"spec"`
 	}
-	if err := decodeJSONBody(r, &body); err != nil {
+	if err == nil {
+		err = decodeJSONBytes(raw, &body)
+	}
+	if err != nil {
 		// Retry as a bare spec object: {"events": [...]} without the wrapper.
 		var bare json.RawMessage
-		if bareErr := decodeJSONBody(r, &bare); bareErr != nil {
+		if bareErr := decodeJSONBytes(raw, &bare); bareErr != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err))
 			return
 		}

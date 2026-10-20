@@ -96,6 +96,7 @@ they matter rather than on every path.
 | the tenant's quota fields are inconsistent or negative (validateTenantQuotas) | POST /admin/tenants | `rate_limit_rps must be non-negative; rate_limit_burst must be non-negative; max_watched_contracts must be non-negative; rate_limit_rps and rate_limit_burst must be set together` |
 | the tenant is created without a name | POST /admin/tenants | `name is required` |
 | the grant names a contract_id that is not a strkey | POST /admin/tenants/{id}/grants | `invalid contract_id %q` |
+| the {contract_id} path segment is not a strkey | DELETE /tenant/watch/{contract_id} | `invalid contract_id %q` |
 | the update would leave the tenant's quota fields inconsistent or negative (validateTenantQuotas) | PATCH /admin/tenants/{id} | `rate_limit_rps must be non-negative; rate_limit_burst must be non-negative; max_watched_contracts must be non-negative; rate_limit_rps and rate_limit_burst must be set together` |
 | the usage window is outside [1, days] | GET /tenant/usage, GET /admin/tenants/{id}/usage | `days must be an integer in [1,%d]` |
 | a tenant control-plane body cannot be decoded — including a body over the request-body cap, which surfaces as 'http: request body too large' | POST /admin/tenants, PATCH /admin/tenants/{id}, POST /admin/tenants/{id}/grants, POST /admin/tenants/{id}/keys, POST /tenant/watch | `invalid JSON body: <json error>` |

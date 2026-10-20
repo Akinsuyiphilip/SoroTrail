@@ -5,23 +5,23 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// ClickHouse implements Store with clickhouse-go/v2.
-// It is intentionally minimal for now and is wired through the same
-// interface so the app can select it via DATABASE_URL.
+// ClickHouse implements Store over ClickHouse's HTTP interface (the
+// clickhouseExecutor wrapping it predates, and never grew into, a native
+// driver dependency). It is intentionally minimal for now and is wired
+// through the same interface so the app can select it via DATABASE_URL.
 //
-// contributors: Ping performs a real TCP dial to the server so the
-// readiness probe cannot report healthy against an unreachable database.
+// Every method below (Ping included) talks to the server over the HTTP
+// interface the executor wraps, so the readiness probe and the query path
+// fail against exactly the same dependency.
 type ClickHouse struct {
-	host string
-	port int
-	cfg  clickHouseConfig
+	cfg clickHouseConfig
 }
 
 var _ Store = (*ClickHouse)(nil)
@@ -63,12 +63,58 @@ func (c *ClickHouse) GetContractMeta(context.Context, string) (ContractMeta, err
 func (c *ClickHouse) UpsertContractMeta(context.Context, ContractMeta) error     { return nil }
 func (c *ClickHouse) CountContractEvents(context.Context, string) (int64, error) { return 0, nil }
 
+// GetContractSummary returns a single contract's summary from ClickHouse.
+// It aggregates the events table in the database, mirroring the Postgres
+// query (which has no separate contracts registry either): a contract is a
+// contract_id that has emitted at least one stored event, and a contract
+// with no events is ErrNotFound.
+//
+// The aggregate is exact, not approximate. count(), min(ledger) and
+// max(ledger) are exact in ClickHouse, and max(created_at) is exact too, so
+// there is no need for the approximate-function caveat other analytical
+// endpoints carry.
 func (c *ClickHouse) GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error) {
-	return ContractSummary{}, errUnsupported("clickhouse", "GetContractSummary")
+	query := "SELECT contract_id, count() AS event_count, min(ledger) AS first_ledger, " +
+		"max(ledger) AS last_ledger, max(created_at) AS last_seen " +
+		"FROM events WHERE contract_id = " + clickHouseQuoteString(contractID) +
+		" GROUP BY contract_id"
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(), query)
+	if err != nil {
+		return ContractSummary{}, fmt.Errorf("get contract summary %s: %w", contractID, err)
+	}
+	if len(rows) == 0 {
+		return ContractSummary{}, ErrNotFound
+	}
+	row := rows[0]
+	return ContractSummary{
+		ContractID:  row.str("contract_id"),
+		EventCount:  row.int64("event_count"),
+		FirstLedger: row.int64("first_ledger"),
+		LastLedger:  row.int64("last_ledger"),
+		LastSeen:    row.time("last_seen"),
+	}, nil
 }
 
+// ContractEventTypeCounts returns per-type event counts from ClickHouse,
+// ordered by count descending like the Postgres implementation. The
+// aggregation happens in the database rather than by fetching event rows
+// into Go, which is the point of using the analytical backend at all.
 func (c *ClickHouse) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
-	return nil, errUnsupported("clickhouse", "ContractEventTypeCounts")
+	query := "SELECT type, count() AS event_count FROM events WHERE contract_id = " +
+		clickHouseQuoteString(contractID) +
+		" GROUP BY type ORDER BY event_count DESC"
+	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(), query)
+	if err != nil {
+		return nil, fmt.Errorf("contract event type counts %s: %w", contractID, err)
+	}
+	out := make([]ContractEventTypeCount, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, ContractEventTypeCount{
+			Type:  row.str("type"),
+			Count: row.int64("event_count"),
+		})
+	}
+	return out, nil
 }
 
 func (c *ClickHouse) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
@@ -126,7 +172,7 @@ func NewStoreFromURL(databaseURL string) (Store, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ClickHouse{host: cfg.host, port: cfg.port, cfg: cfg}, nil
+		return &ClickHouse{cfg: cfg}, nil
 	}
 	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
 		return &Postgres{}, nil
@@ -492,14 +538,42 @@ func (c *ClickHouse) AggregateEvents(ctx context.Context, f EventFilter, bucket 
 	return nil, errUnsupported("clickhouse", "AggregateEvents")
 }
 
+// clickHouseIngestionStateVersion mints the updated_at version stamped onto
+// every SaveIngestionState row. DateTime64(3) only resolves a millisecond,
+// so two saves inside the same millisecond would carry equal versions;
+// ReplacingMergeTree then collapses equal versions in an unspecified order
+// and FINAL could hand a restarting ingester the older resume position,
+// silently rewinding the frontier it just persisted. Keeping the version
+// strictly increasing within the process makes the newer save always win.
+var lastClickHouseIngestionStateVersion atomic.Int64
+
+func clickHouseIngestionStateVersion(now time.Time) time.Time {
+	ms := now.UnixMilli()
+	for {
+		last := lastClickHouseIngestionStateVersion.Load()
+		if ms <= last {
+			ms = last + 1
+		}
+		if lastClickHouseIngestionStateVersion.CompareAndSwap(last, ms) {
+			return time.UnixMilli(ms).UTC()
+		}
+	}
+}
+
 // GetIngestionState returns the single default-network ingestion row, or
 // ErrNotFound on a fresh instance. FINAL collapses the ReplacingMergeTree's
-// appended versions to the newest one, which is the durable resume position.
+// appended versions to the newest one, which is the durable resume position
+// the ingester restarts from (issue #523).
 func (c *ClickHouse) GetIngestionState(ctx context.Context) (IngestionState, error) {
+	return c.GetIngestionStateForNetwork(ctx, "default")
+}
+
+func (c *ClickHouse) GetIngestionStateForNetwork(ctx context.Context, network string) (IngestionState, error) {
+	network = defaultNetwork(network)
 	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
-		"SELECT network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state FINAL WHERE network = 'default' LIMIT 1")
+		"SELECT network, last_ingested_ledger, last_cursor, last_successful_poll, updated_at FROM ingestion_state FINAL WHERE network = "+clickHouseQuoteString(network)+" LIMIT 1")
 	if err != nil {
-		return IngestionState{}, fmt.Errorf("loading ingestion state: %w", err)
+		return IngestionState{}, fmt.Errorf("loading ingestion state for network %q: %w", network, err)
 	}
 	if len(rows) == 0 {
 		return IngestionState{}, ErrNotFound
@@ -510,12 +584,14 @@ func (c *ClickHouse) GetIngestionState(ctx context.Context) (IngestionState, err
 // SaveIngestionState appends a new version of the singleton row. ClickHouse
 // has no efficient row-level UPDATE, so an upsert is an insert of a newer
 // version keyed by network; the schema's ReplacingMergeTree(updated_at) makes
-// readers see the latest without waiting for a background merge.
+// readers see the latest without waiting for a background merge. updated_at
+// comes from clickHouseIngestionStateVersion so back-to-back saves can never
+// tie on that version column (issue #523).
 func (c *ClickHouse) SaveIngestionState(ctx context.Context, s IngestionState) error {
 	if s.Network == "" {
 		s.Network = "default"
 	}
-	now := time.Now().UTC()
+	now := clickHouseIngestionStateVersion(time.Now().UTC())
 	row := map[string]any{
 		"network":              s.Network,
 		"last_ingested_ledger": s.LastIngestedLedger,
@@ -597,8 +673,23 @@ func (c *ClickHouse) SaveAuditStateIfGreater(ctx context.Context, network string
 // removed_at set), so FINAL is what turns the append-only table back into
 // the presence list ingestion reads.
 func (c *ClickHouse) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
+	return c.ListWatchedContractsScoped(ctx, WildcardScope())
+}
+
+func (c *ClickHouse) ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error) {
+	if sc.DeniesAll() {
+		return []WatchedContract{}, nil
+	}
+	where := "removed_at IS NULL"
+	if !sc.IsWildcard() {
+		ids := sc.Contracts()
+		if len(ids) == 0 {
+			return []WatchedContract{}, nil
+		}
+		where += " AND contract_id IN (" + clickHouseQuoteList(ids) + ")"
+	}
 	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
-		"SELECT network, contract_id, added_at FROM watched_contracts FINAL WHERE removed_at IS NULL ORDER BY network, contract_id")
+		"SELECT network, contract_id, added_at FROM watched_contracts FINAL WHERE "+where+" ORDER BY network, contract_id")
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
@@ -1141,9 +1232,16 @@ func (c *ClickHouse) ListContracts(ctx context.Context, f ContractsFilter) ([]Co
 // contract_id that has emitted at least one stored event, not a row in a
 // separate contracts registry (ClickHouse has none).
 func (c *ClickHouse) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
-	where := ""
+	var clauses []string
+	if !f.Scope.IsWildcard() && len(f.Scope.Contracts()) > 0 {
+		clauses = append(clauses, "contract_id IN ("+clickHouseQuoteList(f.Scope.Contracts())+")")
+	}
 	if f.ContractIDPrefix != "" {
-		where = "WHERE contract_id LIKE " + clickHouseQuoteString(f.ContractIDPrefix+"%")
+		clauses = append(clauses, "contract_id LIKE "+clickHouseQuoteString(f.ContractIDPrefix+"%"))
+	}
+	where := ""
+	if len(clauses) > 0 {
+		where = "WHERE " + strings.Join(clauses, " AND ")
 	}
 	query := "SELECT count(*) FROM (SELECT contract_id FROM events " + where + " GROUP BY contract_id) AS sub"
 	total, err := newClickHouseExecutor(c.cfg).queryInt64(ctx, c.cfg.databaseOrDefault(), query)
@@ -1378,16 +1476,26 @@ func (c *ClickHouse) DeleteDeadLetter(ctx context.Context, id int64) error {
 	return nil
 }
 
+// Ping performs a real round-trip to ClickHouse over the HTTP interface
+// every query in this file uses, rather than merely opening a socket: the
+// native TCP port a clickhouse:// URL names is not the port this backend
+// talks to, so a dial there could succeed while the interface the app
+// depends on is dead — or fail while it is healthy behind a proxy — either
+// way leaving /readyz reporting an instance that cannot serve (issue #524).
+// SELECT 1 is the cheapest statement the server will answer, and it runs
+// under the caller's context, which is what lets the readiness probe's own
+// deadline bound how long an unresponsive server can stall the probe.
 func (c *ClickHouse) Ping(ctx context.Context) error {
-	if c.host == "" {
+	if c.cfg.host == "" {
 		return fmt.Errorf("clickhouse: not configured (empty host)")
 	}
-	addr := net.JoinHostPort(c.host, strconv.Itoa(c.port))
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	out, err := newClickHouseExecutor(c.cfg).query(ctx, c.cfg.databaseOrDefault(), "SELECT 1 FORMAT TabSeparated")
 	if err != nil {
-		return fmt.Errorf("clickhouse ping %s: %w", addr, err)
+		return fmt.Errorf("clickhouse ping: %w", err)
 	}
-	conn.Close()
+	if out != "1" {
+		return fmt.Errorf("clickhouse ping: unexpected response %q", out)
+	}
 	return nil
 }
 
