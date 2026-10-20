@@ -796,11 +796,17 @@ Responses are gzip- or deflate-encoded when the client advertises support via
 `Accept-Encoding`, which matters most for event listings — a 200-event page is
 largely repetitive JSON keys and compresses well.
 
-Compression is applied per response, not per route, and only once the body
-reaches `COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet
-MTU). Below that, encoding costs CPU on both ends and can make the body
-*larger* once the gzip header and trailer are counted, so small responses
-(error envelopes, `/health`, a single event) are sent as-is.
+Compression is registered on the read routes whose responses grow with the
+data: event and contract lists, aggregate buckets, transaction siblings, raw
+and single events, contract stats, subscriptions, deliveries, watched contracts
+and address activity. Bounded reads (`/events/count`, `/contracts/{id}`,
+`/stats`, `/subscriptions/{id}`) and streaming exports are registered outside
+that group, so they are sent identity. Within the compressed routes the
+decision is still per response: encoding is applied only once the body reaches
+`COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet MTU). Below
+that, encoding costs CPU on both ends and can make the body *larger* once the
+gzip header and trailer are counted, so small responses (error envelopes,
+`/health`, a small single event) are sent as-is.
 
 Clients that don't advertise an encoding get the original bytes, byte for
 byte. `gzip` is preferred over `deflate` when both are offered, and
