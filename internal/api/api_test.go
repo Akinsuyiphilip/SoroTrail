@@ -100,9 +100,16 @@ type stubStore struct {
 	contractSummaryErr error
 	eventTypeCounts    []store.ContractEventTypeCount
 	eventTypeCountsErr error
-	lastFilter         store.EventFilter
-	nextCursor         string
-	queryErr           error
+	// Contract-stats responses for /contracts/{id}/stats. The zero values
+	// preserve the old stub behaviour: no events and no metadata, so the
+	// handler answers 404 unless a test opts in.
+	contractEventCount    int64
+	contractEventCountErr error
+	contractMeta          *store.ContractMeta
+	contractMetaErr       error
+	lastFilter            store.EventFilter
+	nextCursor            string
+	queryErr              error
 
 	totalCount      int64
 	countEventsErr  error
@@ -492,13 +499,19 @@ func (s *stubStore) ListContractIDs(context.Context) ([]string, error) {
 	return nil, nil
 }
 func (s *stubStore) GetContractMeta(context.Context, string) (store.ContractMeta, error) {
+	if s.contractMetaErr != nil {
+		return store.ContractMeta{}, s.contractMetaErr
+	}
+	if s.contractMeta != nil {
+		return *s.contractMeta, nil
+	}
 	return store.ContractMeta{}, store.ErrNotFound
 }
 func (s *stubStore) UpsertContractMeta(context.Context, store.ContractMeta) error {
 	return nil
 }
 func (s *stubStore) CountContractEvents(context.Context, string) (int64, error) {
-	return 0, nil
+	return s.contractEventCount, s.contractEventCountErr
 }
 
 func (s *stubStore) GetContractSummary(_ context.Context, id string) (store.ContractSummary, error) {

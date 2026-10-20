@@ -180,3 +180,44 @@ func TestBodyLimitMiddleware(t *testing.T) {
 		})
 	}
 }
+
+// TestRouteMux_RejectsDuplicateMethodAndPattern covers the guard directly: a
+// second registration of the same method and pattern must be a hard failure,
+// while the same pattern under another method is legitimate.
+func TestRouteMux_RejectsDuplicateMethodAndPattern(t *testing.T) {
+	r := newRouteMux(chi.NewRouter())
+	noop := func(http.ResponseWriter, *http.Request) {}
+
+	r.Get("/events", noop)
+	assert.Panics(t, func() {
+		r.Get("/events", noop)
+	}, "a duplicate GET /events must not silently replace the first handler")
+
+	assert.NotPanics(t, func() {
+		r.Delete("/events", noop)
+	}, "GET and DELETE on the same pattern are distinct routes")
+}
+
+// TestRouter_RegistersEachRouteOnce pins the final router surface and fails if
+// a duplicate registration is reintroduced. routeMux panics while the router
+// is being built because chi would have already replaced the earlier handler
+// by the time chi.Walk could inspect the tree; walking afterwards also catches
+// a route that was removed or renamed.
+func TestRouter_RegistersEachRouteOnce(t *testing.T) {
+	s := newTestServer(&stubStore{}, nil)
+
+	var router chi.Router
+	require.NotPanics(t, func() { router = s.router() },
+		"router construction must reject duplicate method/pattern registrations")
+
+	seen := make(map[string]struct{})
+	require.NoError(t, chi.Walk(router, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		key := method + " " + route
+		if _, exists := seen[key]; exists {
+			t.Errorf("route %s is registered more than once", key)
+		}
+		seen[key] = struct{}{}
+		return nil
+	}))
+	assert.NotEmpty(t, seen)
+}

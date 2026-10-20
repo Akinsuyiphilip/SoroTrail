@@ -782,6 +782,8 @@ It is batched, resumable (Ctrl-C and re-run picks up where it stopped),
 idempotent, and safe to run against a live database while ingestion
 continues; a Postgres advisory lock prevents two replays at once.
 
+For the full documentation index, see [docs/README.md](docs/README.md).
+See [docs/replay.md](docs/replay.md) for flags, the summary output, the
 See [docs/replay.md](docs/replay.md) for the end-to-end workflow — sizing
 the job, dry-running it, spot-checking a single event, running it in chunks,
 and verifying the result — plus the flag reference, the summary output, the
@@ -796,11 +798,17 @@ Responses are gzip- or deflate-encoded when the client advertises support via
 `Accept-Encoding`, which matters most for event listings — a 200-event page is
 largely repetitive JSON keys and compresses well.
 
-Compression is applied per response, not per route, and only once the body
-reaches `COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet
-MTU). Below that, encoding costs CPU on both ends and can make the body
-*larger* once the gzip header and trailer are counted, so small responses
-(error envelopes, `/health`, a single event) are sent as-is.
+Compression is registered on the read routes whose responses grow with the
+data: event and contract lists, aggregate buckets, transaction siblings, raw
+and single events, contract stats, subscriptions, deliveries, watched contracts
+and address activity. Bounded reads (`/events/count`, `/contracts/{id}`,
+`/stats`, `/subscriptions/{id}`) and streaming exports are registered outside
+that group, so they are sent identity. Within the compressed routes the
+decision is still per response: encoding is applied only once the body reaches
+`COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet MTU). Below
+that, encoding costs CPU on both ends and can make the body *larger* once the
+gzip header and trailer are counted, so small responses (error envelopes,
+`/health`, a small single event) are sent as-is.
 
 Clients that don't advertise an encoding get the original bytes, byte for
 byte. `gzip` is preferred over `deflate` when both are offered, and

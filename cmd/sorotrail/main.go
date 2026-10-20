@@ -284,10 +284,18 @@ func runService(dryRun bool) error {
 		if cfg.RetentionEnabled() {
 			return fmt.Errorf("clickhouse: retention pruning is not supported by the clickhouse backend")
 		}
-		st, err = store.NewStoreFromURL(cfg.DatabaseURL)
-		if err != nil {
-			return err
+		// The ClickHouse backend deliberately does not implement the
+		// per-contract resume cursors the watched-contract ingester depends
+		// on, so a deployment configured to use it would quietly resume from
+		// ledger 0 on every restart and watch nothing. Refuse to start
+		// rather than serve a healthy-looking process that ingests into the
+		// ground. The same check applies once NewStoreFromURL succeeds, so
+		// the refusal cannot be skipped by a bad URL.
+		if _, err = store.NewStoreFromURL(cfg.DatabaseURL); err != nil {
+			return fmt.Errorf("clickhouse: %w", err)
 		}
+		return fmt.Errorf(
+			"clickhouse: the backend is not production-ready; use a postgres:// DATABASE_URL")
 	} else {
 		pool, err = store.NewPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnLifetime, cfg.DBMaxConnIdleTime)
 		if err != nil {

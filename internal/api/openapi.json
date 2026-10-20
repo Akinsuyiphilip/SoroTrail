@@ -2717,22 +2717,40 @@
                     }
                   }
                 },
-                "example": {
-                  "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-                  "name": "Soroban Token",
-                  "symbol": "STOK",
-                  "decimals": 7,
-                  "event_count": 42,
-                  "type_breakdown": [
-                    {
-                      "type": "contract",
-                      "count": 38
-                    },
-                    {
-                      "type": "diagnostic",
-                      "count": 4
+                "examples": {
+                  "token_contract": {
+                    "summary": "Contract with cached token metadata",
+                    "value": {
+                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                      "name": "Soroban Token",
+                      "symbol": "STOK",
+                      "decimals": 7,
+                      "event_count": 42,
+                      "type_breakdown": [
+                        {
+                          "type": "contract",
+                          "count": 38
+                        },
+                        {
+                          "type": "diagnostic",
+                          "count": 4
+                        }
+                      ]
                     }
-                  ]
+                  },
+                  "plain_contract": {
+                    "summary": "Contract without cached token metadata",
+                    "value": {
+                      "contract_id": "CAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSBFLM",
+                      "event_count": 19,
+                      "type_breakdown": [
+                        {
+                          "type": "contract",
+                          "count": 19
+                        }
+                      ]
+                    }
+                  }
                 }
               }
             }
@@ -4344,14 +4362,15 @@
       "Limit": {
         "name": "limit",
         "in": "query",
-        "description": "Page size. Out-of-range values are rejected rather than clamped, so\na caller asking for more than it may have finds out instead of\nsilently receiving a short page and assuming it reached the end.\n\nThe ceiling is 500. An operator can lower it with the API_MAX_LIMIT\nenvironment variable, so a deployment may reject a value this schema\npermits; the store never returns more than 500 rows in one page\nregardless.\n",
+        "description": "Page size. Out-of-range values are rejected rather than clamped, so\na caller asking for more than it may have finds out instead of\nsilently receiving a short page and assuming it reached the end.\n\nThe maximum is configurable at deploy time: API_MAX_LIMIT lowers the\nceiling to whatever the operator sets, and the store never returns\nmore than 500 rows in one page regardless.\n",
         "schema": {
           "type": "integer",
           "minimum": 1,
           "maximum": 500,
           "default": 50
         },
-        "example": 100
+        "example": 100,
+        "default": 50
       },
       "ContractsLimit": {
         "name": "limit",
@@ -6233,6 +6252,36 @@
               "minimum": 1,
               "examples": [
                 1
+              ]
+            }
+          },
+          "X-RateLimit-Limit": {
+            "description": "The caller's configured burst capacity.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "examples": [
+                20
+              ]
+            }
+          },
+          "X-RateLimit-Remaining": {
+            "description": "The caller's remaining request budget; always 0 on a 429.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "examples": [
+                0
+              ]
+            }
+          },
+          "X-RateLimit-Reset": {
+            "description": "Unix timestamp in seconds when the next request token is expected to become available, or the quota window resets.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "examples": [
+                1792512000
               ]
             }
           }
