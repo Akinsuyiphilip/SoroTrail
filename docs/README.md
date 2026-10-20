@@ -97,6 +97,9 @@ for operators and developers.
   when contract ABIs change or parser bugs are fixed.
 - [Local Setup](local-setup.md): Setting up local development dependencies,
   PostgreSQL, and Stellar RPC testnet environments.
+- [onboarding.md](onboarding.md): End-to-end guide for new contributors —
+  environment setup, test tiers, issue assignment, review conventions, and common
+  first-PR mistakes with their CI failures.
 
 ## Operations and Runbooks
 
