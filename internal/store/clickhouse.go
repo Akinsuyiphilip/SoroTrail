@@ -60,8 +60,12 @@ func (c *ClickHouse) ListContractIDs(ctx context.Context) ([]string, error) {
 func (c *ClickHouse) GetContractMeta(context.Context, string) (ContractMeta, error) {
 	return ContractMeta{}, ErrNotFound
 }
-func (c *ClickHouse) UpsertContractMeta(context.Context, ContractMeta) error     { return nil }
-func (c *ClickHouse) CountContractEvents(context.Context, string) (int64, error) { return 0, nil }
+func (c *ClickHouse) UpsertContractMeta(context.Context, ContractMeta) error {
+	return errUnsupported("clickhouse", "UpsertContractMeta")
+}
+func (c *ClickHouse) CountContractEvents(context.Context, string) (int64, error) {
+	return 0, errUnsupported("clickhouse", "CountContractEvents")
+}
 
 // GetContractSummary returns a single contract's summary from ClickHouse.
 // It aggregates the events table in the database, mirroring the Postgres
@@ -1517,17 +1521,17 @@ func (c *ClickHouse) Ping(ctx context.Context) error {
 }
 
 func (c *ClickHouse) UpsertAddressRefs(ctx context.Context, refs []AddressRef) error {
-	return nil
+	return errUnsupported("clickhouse", "UpsertAddressRefs")
 }
 
 func (c *ClickHouse) QueryAddressEvents(ctx context.Context, address string, f EventFilter) ([]Event, string, error) {
-	return nil, "", nil
+	return nil, "", errUnsupported("clickhouse", "QueryAddressEvents")
 }
 
 func (c *ClickHouse) CountAddressEvents(ctx context.Context, address string) (int64, error) {
-	return 0, nil
+	return 0, errUnsupported("clickhouse", "CountAddressEvents")
 }
 
 func (c *ClickHouse) GetAddressSummary(ctx context.Context, address string) (AddressSummary, error) {
-	return AddressSummary{}, nil
+	return AddressSummary{}, errUnsupported("clickhouse", "GetAddressSummary")
 }
