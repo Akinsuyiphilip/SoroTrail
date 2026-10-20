@@ -105,6 +105,8 @@ func dispatch(args []string) error {
 		return runContracts(args[1:])
 	case "backfill":
 		return runBackfill(args[1:])
+	case "loadtest":
+		return runLoadtest(args[1:])
 	case "index-addresses":
 		return runIndexAddresses(args[1:])
 	case "migrate":
@@ -171,6 +173,8 @@ subcommands:
                    (sorotrail contracts --help)
   backfill         ingest historical contract events from Horizon
                    (sorotrail backfill --help)
+  loadtest         run the synthetic ingester load-test harness
+                   (sorotrail loadtest --help)
   index-addresses  rebuild the address→event inverted index from stored events
                    (sorotrail index-addresses --help)
   migrate          apply, roll back, or inspect database migrations
