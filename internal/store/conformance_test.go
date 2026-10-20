@@ -1119,25 +1119,24 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 	st := &ClickHouse{}
 	ctx := context.Background()
 
-	// Verify that unsupported methods return explicit errors.
+	// Verify that unsupported methods fail loudly with ErrUnsupported.
 	_, err := st.ListContractIDs(ctx)
-	assert.NoError(t, err, "ListContractIDs should return nil, nil for ClickHouse")
+	assert.ErrorIs(t, err, ErrUnsupported, "ListContractIDs must report its absence explicitly")
 
 	_, err = st.GetContractMeta(ctx, "test")
-	assert.ErrorIs(t, err, ErrNotFound, "GetContractMeta should return ErrNotFound")
+	assert.ErrorIs(t, err, ErrNotFound, "GetContractMeta must return ErrNotFound")
 
-	// ListContracts is a zero-value stub rather than an error path: the
-	// backend has no contract registry to read, and it reports "nothing"
-	// instead of refusing. Pinned as-is; changing it to ErrUnsupported
-	// would be a behaviour change, not a test fix.
+	// ListContracts is an unsupported operation on ClickHouse: the
+	// backend has no contract registry to read and refuses rather than
+	// returning a zero value that would read as success.
 	_, _, err = st.ListContracts(ctx, ContractsFilter{})
-	assert.NoError(t, err, "ListContracts is a zero-value stub on the clickhouse backend")
+	assert.ErrorIs(t, err, ErrUnsupported, "ListContracts must report its absence explicitly")
 
 	_, err = st.GetContractSummary(ctx, "test")
 	assert.Error(t, err,
 		"GetContractSummary must surface the failed ClickHouse request rather than a zero-value summary")
 
-	// ContractEventTypeCounts should return an explicit error.
+	// ContractEventTypeCounts is unsupported on the ClickHouse backend.
 	_, err = st.ContractEventTypeCounts(ctx, "test")
 	assert.Error(t, err,
 		"ContractEventTypeCounts must surface the failed ClickHouse request")
@@ -1158,9 +1157,10 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 	err = st.RevokeAPIKey(ctx, 1)
 	assert.ErrorContains(t, err, "not supported by the clickhouse backend")
 
-	// GetContractCursor is implemented on this backend, not stubbed: it
-	// issues a request. On a zero-value ClickHouse there is no server to
-	// reach, so what it must not do is succeed or panic.
+	// GetContractCursor, SaveContractCursor, DeleteContractCursor and
+	// ListContractCursors are unsupported on the ClickHouse backend, so a
+	// call fails loudly instead of returning a zero cursor that would make
+	// the watched-contract ingester silently resume from ledger 0.
 	_, err = st.GetContractCursor(ctx, "test")
 	assert.Error(t, err, "GetContractCursor must report the failed lookup rather than a zero cursor")
 

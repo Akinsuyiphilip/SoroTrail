@@ -26,6 +26,12 @@ type ClickHouse struct {
 
 var _ Store = (*ClickHouse)(nil)
 
+// unsupportedLists the named operations this backend deliberately does not
+// implement. A silent zero-value result here would let an operator believe a
+// capability exists when it does not, which is the bug issue #527 traces to.
+// Every method named here returns ErrUnsupported; the conformance suite
+// asserts exactly this set (see TestStoreUnsupportedOperations).
+
 type clickHouseConfig struct {
 	host     string
 	port     int
@@ -48,7 +54,9 @@ func (cfg clickHouseConfig) databaseOrDefault() string {
 
 // Contract metadata (token enrichment) is Postgres-only; the ClickHouse
 // backend reports "not found"/empty so the enrichment worker stays a no-op.
-func (c *ClickHouse) ListContractIDs(context.Context) ([]string, error) { return nil, nil }
+func (c *ClickHouse) ListContractIDs(ctx context.Context) ([]string, error) {
+	return nil, errUnsupported("clickhouse", "ListContractIDs")
+}
 func (c *ClickHouse) GetContractMeta(context.Context, string) (ContractMeta, error) {
 	return ContractMeta{}, ErrNotFound
 }
@@ -110,7 +118,7 @@ func (c *ClickHouse) ContractEventTypeCounts(ctx context.Context, contractID str
 }
 
 func (c *ClickHouse) ListContractsNeedingRefresh(context.Context, time.Time) ([]string, error) {
-	return nil, nil
+	return nil, errUnsupported("clickhouse", "ListContractsNeedingRefresh")
 }
 
 func parseClickHouseConfig(raw string) (clickHouseConfig, error) {
@@ -523,11 +531,11 @@ func clickHouseQuoteList(values []string) string {
 }
 
 func (c *ClickHouse) LedgerRangeCensus(ctx context.Context, fromLedger, toLedger int64, idsOnly bool) ([]LedgerCensus, error) {
-	return nil, nil
+	return nil, errUnsupported("clickhouse", "LedgerRangeCensus")
 }
 
 func (c *ClickHouse) AggregateEvents(ctx context.Context, f EventFilter, bucket string) ([]AggregateBucket, error) {
-	return nil, nil
+	return nil, errUnsupported("clickhouse", "AggregateEvents")
 }
 
 // clickHouseIngestionStateVersion mints the updated_at version stamped onto
@@ -734,64 +742,22 @@ func (c *ClickHouse) AddWatchedContract(ctx context.Context, w WatchedContract) 
 }
 
 func (c *ClickHouse) GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error) {
-	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
-		"SELECT contract_id, last_ingested_ledger, last_cursor, updated_at FROM contract_cursors FINAL WHERE contract_id = "+clickHouseQuoteString(contractID)+" LIMIT 1")
-	if err != nil {
-		return ContractCursor{}, fmt.Errorf("loading cursor for contract %s: %w", contractID, err)
-	}
-	if len(rows) == 0 {
-		return ContractCursor{}, ErrNotFound
-	}
-	return contractCursorFromRow(rows[0]), nil
+	return ContractCursor{}, errUnsupported("clickhouse", "GetContractCursor")
 }
 
 func (c *ClickHouse) SaveContractCursor(ctx context.Context, cur ContractCursor) error {
-	row := map[string]any{
-		"contract_id":          cur.ContractID,
-		"last_ingested_ledger": cur.LastIngestedLedger,
-		"last_cursor":          cur.LastCursor,
-		"updated_at":           formatClickHouseTime(time.Now().UTC()),
-	}
-	if err := newClickHouseExecutor(c.cfg).insertRows(ctx, c.cfg.databaseOrDefault(), "contract_cursors",
-		[]string{"contract_id", "last_ingested_ledger", "last_cursor", "updated_at"},
-		[]map[string]any{row}); err != nil {
-		return fmt.Errorf("saving cursor for contract %s: %w", cur.ContractID, err)
-	}
-	return nil
+	return errUnsupported("clickhouse", "SaveContractCursor")
 }
 
 // DeleteContractCursor removes a contract's resume position, returning
 // ErrNotFound when there was nothing to delete. mutations_sync makes the
 // delete synchronous so a subsequent ListContractCursors reflects it.
 func (c *ClickHouse) DeleteContractCursor(ctx context.Context, contractID string) error {
-	exec := newClickHouseExecutor(c.cfg)
-	database := c.cfg.databaseOrDefault()
-	total, err := exec.queryInt64(ctx, database,
-		"SELECT count(*) FROM contract_cursors FINAL WHERE contract_id = "+clickHouseQuoteString(contractID))
-	if err != nil {
-		return fmt.Errorf("deleting cursor for contract %s: %w", contractID, err)
-	}
-	if total == 0 {
-		return ErrNotFound
-	}
-	if err := exec.exec(ctx, database,
-		"ALTER TABLE contract_cursors DELETE WHERE contract_id = "+clickHouseQuoteString(contractID)+" SETTINGS mutations_sync = 1"); err != nil {
-		return fmt.Errorf("deleting cursor for contract %s: %w", contractID, err)
-	}
-	return nil
+	return errUnsupported("clickhouse", "DeleteContractCursor")
 }
 
 func (c *ClickHouse) ListContractCursors(ctx context.Context) ([]ContractCursor, error) {
-	rows, err := newClickHouseExecutor(c.cfg).queryRows(ctx, c.cfg.databaseOrDefault(),
-		"SELECT contract_id, last_ingested_ledger, last_cursor, updated_at FROM contract_cursors FINAL ORDER BY contract_id")
-	if err != nil {
-		return nil, fmt.Errorf("listing contract cursors: %w", err)
-	}
-	out := make([]ContractCursor, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, contractCursorFromRow(r))
-	}
-	return out, nil
+	return nil, errUnsupported("clickhouse", "ListContractCursors")
 }
 
 // RecordAuditFinding inserts a new finding. The id is minted by the writer
@@ -1124,23 +1090,23 @@ func (c *ClickHouse) CountDeliveryAttempts(ctx context.Context, subscriptionID i
 }
 
 func (c *ClickHouse) GetContractSpec(ctx context.Context, wasmHash string) ([]byte, error) {
-	return nil, ErrNotFound
+	return nil, errUnsupported("clickhouse", "GetContractSpec")
 }
 
 func (c *ClickHouse) SetContractSpec(ctx context.Context, wasmHash, contractID string, specJSON []byte) error {
-	return nil
+	return errUnsupported("clickhouse", "SetContractSpec")
 }
 
 func (c *ClickHouse) GetContractSpecOverride(ctx context.Context, contractID string) ([]byte, error) {
-	return nil, ErrNotFound
+	return nil, errUnsupported("clickhouse", "GetContractSpecOverride")
 }
 
 func (c *ClickHouse) SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error {
-	return nil
+	return errUnsupported("clickhouse", "SetContractSpecOverride")
 }
 
 func (c *ClickHouse) DeleteContractSpecOverride(ctx context.Context, contractID string) error {
-	return nil
+	return errUnsupported("clickhouse", "DeleteContractSpecOverride")
 }
 
 // DeleteEventsBeforeLedger deletes every event strictly below beforeLedger.
@@ -1172,7 +1138,7 @@ func (c *ClickHouse) DeleteEventsBeforeLedger(ctx context.Context, beforeLedger 
 }
 
 func (c *ClickHouse) MigrationVersion(ctx context.Context) (int, bool, error) {
-	return 0, false, nil
+	return 0, false, errUnsupported("clickhouse", "MigrationVersion")
 }
 
 // Stats aggregates the same counters as Postgres.Stats, against the tables
@@ -1257,8 +1223,8 @@ func (c *ClickHouse) Stats(ctx context.Context, sc Scope) (Stats, error) {
 	return s, nil
 }
 
-func (c *ClickHouse) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
-	return nil, "", nil
+func (c *ClickHouse) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
+	return nil, "", errUnsupported("clickhouse", "ListContracts")
 }
 
 // CountContracts counts distinct contract_id values in events, matching
