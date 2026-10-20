@@ -1,55 +1,3 @@
-package docs_test
-
-import (
-	"os"
-	"path/filepath"
-	"strings"
-	"testing"
-)
-
-func TestDocsIndexIncludesAllDocs(t *testing.T) {
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read docs directory: %v", err)
-	}
-
-	documents := make(map[string]struct{})
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		if filepath.Ext(entry.Name()) != ".md" || entry.Name() == "README.md" {
-			continue
-		}
-		documents[entry.Name()] = struct{}{}
-	}
-
-	if len(documents) == 0 {
-		t.Fatal("expected at least one Markdown document under docs/")
-	}
-
-	readme, err := os.ReadFile("README.md")
-	if err != nil {
-		t.Fatalf("README.md should exist in docs/: %v", err)
-	}
-	content := string(readme)
-
-	for name := range documents {
-		if !strings.Contains(content, "["+name+"]("+name+")") {
-			t.Fatalf("docs/README.md is missing an entry for %s", name)
-		}
-	}
-}
-
-func TestRootReadmeLinksDocsIndex(t *testing.T) {
-	readme, err := os.ReadFile(filepath.Join("..", "README.md"))
-	if err != nil {
-		t.Fatalf("read root README.md: %v", err)
-	}
-
-	content := string(readme)
-	if !strings.Contains(content, "docs/README.md") && !strings.Contains(content, "documentation index") {
-		t.Fatal("root README.md should link to the documentation index")
 package docs
 
 // Structural tests for the documentation in this directory. They are not a
@@ -92,6 +40,57 @@ func markdownDocs(t *testing.T) []string {
 	require.NoError(t, err)
 	require.NotEmpty(t, matches, "no markdown files found in docs/")
 	return matches
+}
+
+// TestDocsIndexIncludesAllDocs ensures every .md file in docs/ (except
+// README.md) is linked from docs/README.md so a new doc cannot be added
+// without updating the index.
+func TestDocsIndexIncludesAllDocs(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read docs directory: %v", err)
+	}
+
+	documents := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if filepath.Ext(entry.Name()) != ".md" || entry.Name() == "README.md" {
+			continue
+		}
+		documents[entry.Name()] = struct{}{}
+	}
+
+	if len(documents) == 0 {
+		t.Fatal("expected at least one Markdown document under docs/")
+	}
+
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("README.md should exist in docs/: %v", err)
+	}
+	content := string(readme)
+
+	for name := range documents {
+		if !strings.Contains(content, "["+name+"]("+name+")") {
+			t.Fatalf("docs/README.md is missing an entry for %s", name)
+		}
+	}
+}
+
+// TestRootReadmeLinksDocsIndex ensures the root README.md links to the
+// documentation index so visitors can discover the full docs.
+func TestRootReadmeLinksDocsIndex(t *testing.T) {
+	readme, err := os.ReadFile(filepath.Join("..", "README.md"))
+	if err != nil {
+		t.Fatalf("read root README.md: %v", err)
+	}
+
+	content := string(readme)
+	if !strings.Contains(content, "docs/README.md") && !strings.Contains(content, "documentation index") {
+		t.Fatal("root README.md should link to the documentation index")
+	}
 }
 
 // TestCodeFencesAreBalanced catches the classic markdown bug: an unclosed

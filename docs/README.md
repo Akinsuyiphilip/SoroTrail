@@ -8,14 +8,53 @@ full details.
 
 - [replay.md](replay.md) — explains how to re-run the decoder over stored raw
   XDR and refresh decoded event data after a decoder change.
+- [backfill.md](backfill.md) — procedures for historical ledger backfills and
+  navigating Stellar RPC retention limits.
+- [runbook.md](runbook.md) — procedures for health probes, scaling, dead-letter
+  queue maintenance, and backups.
+- [triage.md](triage.md) — immediate step-by-step triage guide for production
+  outages and lag alerts.
+- [troubleshooting.md](troubleshooting.md) — diagnosis and remedies for RPC errors,
+  database lock contention, decode failures, and startup issues.
 
 ## Reference
 
-- No standalone reference pages are currently present in this directory.
+- [api-keys.md](api-keys.md) — key generation, storage hashing, startup
+  bootstrap behavior, CLI management, scope enforcement, rotation procedures,
+  and the PostgreSQL requirement.
+- [clickhouse.md](clickhouse.md) — capability matrix for the optional
+  analytical backend, distinguishing implemented methods from refusals and silent
+  no-ops.
+- [errors.md](errors.md) — error code reference and handling guide.
+- [graphql.md](graphql.md) — read-only GraphQL endpoint (`/graphql`) and GraphiQL
+  playground, top-level query fields, Relay cursor pagination, depth/complexity limits,
+  filter parity with `GET /events`, and multi-tenant scope behavior.
+- [indexes.md](indexes.md) — explanations of composite indexes and query plans.
+- [logging.md](logging.md) — structured logging conventions and tracing configuration.
+- [metrics.md](metrics.md) — exported Prometheus metrics and alerting rules.
+- [spec-overrides.md](spec-overrides.md) — uploading, inspecting, and deleting
+  user-supplied contract event specs, JSON schema validation, precedence over
+  on-chain Wasm specs, and cache invalidation behavior.
+- [subscriptions.md](subscriptions.md) — real-time event streaming over WebSocket,
+  pub-sub broker architecture, at-most-once delivery semantics, backpressure handling,
+  and the cursor catch-up pattern.
 
 ## Design
 
-- No design documents are currently present in this directory.
+- [architecture.md](architecture.md) — complete internal system architecture,
+  component boundaries, data flow from Stellar RPC to storage, request lifecycles,
+  and sequence diagrams.
+- [architecture-overview.md](architecture-overview.md) — high-level architectural summary
+  and system topology.
+- [multi-tenancy.md](multi-tenancy.md) — multi-tenant isolation model, tenant boundaries,
+  contract grants, quotas, and accounting.
+- [local-setup.md](local-setup.md) — setting up local development dependencies,
+  PostgreSQL, and Stellar RPC testnet environments.
+- [performance.md](performance.md) — latency profiles, indexing strategies, and
+  throughput tuning.
+- [archival.md](archival.md) — data retention, partition pruning, and historical archiving.
+- [sink.md](sink.md) — bulk event export configurations and external sinks.
+
 # SoroTrail Documentation
 
 Welcome to the SoroTrail documentation index. This directory contains detailed
