@@ -3,6 +3,9 @@
 Thanks for helping! SoroTrail aims to stay small, idiomatic Go with clear
 seams — most features should slot in behind an existing interface.
 
+Before contributing, please read our [Code of Conduct](CODE_OF_CONDUCT.md).
+For security issues, see [SECURITY.md](SECURITY.md).
+
 ## Start here
 
 - **New contributor?** Read [`docs/local-setup.md`](docs/local-setup.md) to

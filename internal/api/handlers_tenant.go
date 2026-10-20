@@ -392,11 +392,13 @@ func (s *Server) writeUsage(w http.ResponseWriter, r *http.Request, tenantID int
 
 type watchRequest struct {
 	ContractID string `json:"contract_id"`
+	Network    string `json:"network,omitempty"`
 }
 
 func (s *Server) handleListOwnWatched(w http.ResponseWriter, r *http.Request) {
 	p, _ := PrincipalFrom(r.Context())
-	s.writeOwnWatched(w, r, p.Tenant.ID)
+	network := s.effectiveNetwork(r.URL.Query().Get("network"))
+	s.writeOwnWatched(w, r, p.Tenant.ID, network)
 }
 
 // handleAddOwnWatched lets a tenant ask for a contract to be indexed.
@@ -419,7 +421,8 @@ func (s *Server) handleAddOwnWatched(w http.ResponseWriter, r *http.Request) {
 			fmt.Errorf("invalid contract_id %q", req.ContractID))
 		return
 	}
-	err := s.tenants.AddTenantWatchedContract(r.Context(), p.Tenant, req.ContractID, s.maxWatched)
+	network := s.effectiveNetwork(req.Network)
+	err := s.tenants.AddTenantWatchedContract(r.Context(), p.Tenant, network, req.ContractID, s.maxWatched)
 	if errors.Is(err, store.ErrQuotaExceeded) {
 		writeError(w, http.StatusTooManyRequests, err)
 		return
@@ -429,7 +432,7 @@ func (s *Server) handleAddOwnWatched(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errors.New("adding watched contract failed"))
 		return
 	}
-	s.writeOwnWatched(w, r, p.Tenant.ID)
+	s.writeOwnWatched(w, r, p.Tenant.ID, network)
 }
 
 // handleRemoveOwnWatched drops this tenant's claim. Ingestion keeps
@@ -438,16 +441,30 @@ func (s *Server) handleAddOwnWatched(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRemoveOwnWatched(w http.ResponseWriter, r *http.Request) {
 	p, _ := PrincipalFrom(r.Context())
 	contractID := chi.URLParam(r, "contract_id")
-	if err := s.tenants.RemoveTenantWatchedContract(r.Context(), p.Tenant.ID, contractID); err != nil {
+	// The id is checked before the store is touched so a typo in the path
+	// reads as the client error it is, not as a 200 that looks like a
+	// successful removal; the message matches the POST handler so one bad
+	// id means one thing across both watch endpoints.
+	if !config.ValidContractID(contractID) {
+		writeError(w, http.StatusBadRequest,
+			fmt.Errorf("invalid contract_id %q", contractID))
+		return
+	}
+	// The delete is unconditional: a well-formed id the tenant does not
+	// hold removes nothing and still answers 200 with the refreshed list,
+	// so retries and concurrent removals stay idempotent instead of racing
+	// into a 404.
+	network := s.effectiveNetwork(r.URL.Query().Get("network"))
+	if err := s.tenants.RemoveTenantWatchedContract(r.Context(), p.Tenant.ID, network, contractID); err != nil {
 		loggerFromContext(r.Context()).Error("removing watched contract", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("removing watched contract failed"))
 		return
 	}
-	s.writeOwnWatched(w, r, p.Tenant.ID)
+	s.writeOwnWatched(w, r, p.Tenant.ID, network)
 }
 
-func (s *Server) writeOwnWatched(w http.ResponseWriter, r *http.Request, tenantID int64) {
-	watched, err := s.tenants.ListTenantWatchedContracts(r.Context(), tenantID)
+func (s *Server) writeOwnWatched(w http.ResponseWriter, r *http.Request, tenantID int64, network string) {
+	watched, err := s.tenants.ListTenantWatchedContracts(r.Context(), tenantID, network)
 	if err != nil {
 		loggerFromContext(r.Context()).Error("listing watched contracts", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("listing watched contracts failed"))

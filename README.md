@@ -22,6 +22,11 @@ HTTP API long after the RPC has forgotten them.
  Stellar RPC ──getEvents──▶ ingester ──▶ Postgres/SQLite ◀── HTTP API ◀── you
 ```
 
+## Community
+
+We welcome contributors and expect all participants to follow our
+[Code of Conduct](CODE_OF_CONDUCT.md). To report a security issue, use the
+private channel described in [SECURITY.md](SECURITY.md).
 
 ## Quickstart
 text
@@ -108,6 +113,11 @@ DATABASE_URL=sqlite:./sorotrail.db make run
 
 Migrations run automatically on startup.
 
+A ClickHouse backend can also be selected with a `clickhouse://` URL, but it
+is an optional analytical backend rather than a drop-in replacement for
+Postgres. See [docs/clickhouse.md](docs/clickhouse.md) for what it supports,
+what it refuses, and which methods silently do nothing.
+
 Configuration
 All configuration comes from environment variables (see 
 .env.example
@@ -116,7 +126,7 @@ All configuration comes from environment variables (see
 Variable	Default	Description
 RPC_URL	https://soroban-testnet.stellar.org	Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet.
 RPC_RATE_LIMIT	10	Single-provider request rate limit (requests/second). Default matches the public endpoint limit — raising it against the public RPC will get you throttled; set higher only for paid plans or self-hosted RPCs. On 429 the client honors Retry-After (seconds or HTTP-date, capped at 60s).
-DATABASE_URL	— (required)	Postgres connection string.
+DATABASE_URL	— (required)	Postgres connection string. SQLite (`sqlite:./sorotrail.db`) and ClickHouse (`clickhouse://…`) are also supported; see [ClickHouse backend support](docs/clickhouse.md) before choosing ClickHouse.
 POLL_INTERVAL	5s	Sleep between polls once caught up.
 HTTP_ADDR	:8080	API listen address.
 WATCHED_CONTRACTS	empty	Comma-separated contract IDs (C...). Empty = ingest all contract events.
@@ -297,7 +307,7 @@ once. A single process still ingests one network — the one named by
 
 | Variable | Type | Default | Description | Reload |
 | --- | --- | --- | --- | --- |
-| `DATABASE_URL` | string | — (required) | Postgres or SQLite connection string. Use `postgres://…` for production or `sqlite:./sorotrail.db` for a zero-dependency single-binary setup. | restart |
+| `DATABASE_URL` | string | — (required) | Postgres or SQLite connection string. Use `postgres://…` for production or `sqlite:./sorotrail.db` for a zero-dependency single-binary setup. A `clickhouse://…` URL selects the optional analytical backend; read [ClickHouse backend support](docs/clickhouse.md) first. | restart |
 | `DB_MAX_CONNS` | int | `0` | Max connections in the Postgres pool. `0` (default) uses pgx's default. | restart |
 | `DB_MIN_CONNS` | int | `0` | Min connections kept warm in the pool (`0` = pgx default). | restart |
 | `DB_MAX_CONN_LIFETIME` | duration | `0` | Max lifetime of a DB connection (`0` = no limit, e.g. `30m`). | restart |
@@ -663,6 +673,34 @@ operator overlay and cannot be removed by this command; unset the environment
 variable to stop those entries. The CLI never edits the environment or
 configuration file.
 
+### Managing watched contracts via the HTTP API
+
+When `API_KEY` is set, operators can inspect and mutate the watch list at
+runtime without restarting the process. Every watched contract is keyed by
+`(network, contract_id)`:
+
+| Method | Path | Network parameter | Description |
+| --- | --- | --- | --- |
+| `GET` | `/watched-contracts` | — | Lists all persisted `(network, contract_id)` entries (`source: "api"`) plus any `WATCHED_CONTRACTS` environment overlay (`source: "config"`, `from_config`). |
+| `POST` | `/watched-contracts` | Body `"network"` (optional; defaults to the server's `NETWORK`, or `"default"` if unset) | Adds a contract to the watch list for that network. Requires `"confirm": true` (or `?confirm=true`) when adding the first watched contract on that network, since ingestion transitions from indexing all contracts to only the watched set. |
+| `DELETE` | `/watched-contracts/{id}` | Query `?network=` (optional; defaults to the server's `NETWORK`, or `"default"` if unset) | Removes a persisted contract from that network's watch list. Requires `?confirm=true` when removing the last watched contract on that network. Returns `409 Conflict` if the contract is pinned via `WATCHED_CONTRACTS`. |
+
+```sh
+# Add a contract on the server's default NETWORK (or pass "network": "testnet" explicitly)
+curl -s -X POST localhost:8080/watched-contracts \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"contract_id":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC","network":"testnet","confirm":true}'
+
+# Remove a contract from a specific network's watch list
+curl -s -X DELETE 'localhost:8080/watched-contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC?network=testnet&confirm=true' \
+  -H "X-API-Key: $API_KEY"
+```
+
+See [The watch list and its network dimension](docs/architecture.md#the-watch-list-and-its-network-dimension)
+for how `buildFilterBatches` selects entries per network and how multi-network
+deployments share a single database.
+
 ### How to check who is behind
 
 `GET /stats` now includes a `contract_cursors` field — the number of
@@ -683,7 +721,7 @@ All configuration comes from environment variables (see
 Variable	Default	Description
 RPC_URL	https://soroban-testnet.stellar.org	Stellar RPC endpoint (JSON-RPC 2.0). Point at a provider URL for mainnet.
 RPC_RATE_LIMIT	10	Single-provider request rate limit (requests/second). Default matches the public endpoint limit — raising it against the public RPC will get you throttled; set higher only for paid plans or self-hosted RPCs. On 429 the client honors Retry-After (seconds or HTTP-date, capped at 60s).
-DATABASE_URL	— (required)	Postgres connection string.
+DATABASE_URL	— (required)	Postgres connection string. SQLite (`sqlite:./sorotrail.db`) and ClickHouse (`clickhouse://…`) are also supported; see [ClickHouse backend support](docs/clickhouse.md) before choosing ClickHouse.
 POLL_INTERVAL	5s	Sleep between polls once caught up.
 HTTP_ADDR	:8080	API listen address.
 WATCHED_CONTRACTS	empty	Comma-separated contract IDs (C...). Empty = ingest all contract events.
@@ -760,11 +798,17 @@ Responses are gzip- or deflate-encoded when the client advertises support via
 `Accept-Encoding`, which matters most for event listings — a 200-event page is
 largely repetitive JSON keys and compresses well.
 
-Compression is applied per response, not per route, and only once the body
-reaches `COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet
-MTU). Below that, encoding costs CPU on both ends and can make the body
-*larger* once the gzip header and trailer are counted, so small responses
-(error envelopes, `/health`, a single event) are sent as-is.
+Compression is registered on the read routes whose responses grow with the
+data: event and contract lists, aggregate buckets, transaction siblings, raw
+and single events, contract stats, subscriptions, deliveries, watched contracts
+and address activity. Bounded reads (`/events/count`, `/contracts/{id}`,
+`/stats`, `/subscriptions/{id}`) and streaming exports are registered outside
+that group, so they are sent identity. Within the compressed routes the
+decision is still per response: encoding is applied only once the body reaches
+`COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet MTU). Below
+that, encoding costs CPU on both ends and can make the body *larger* once the
+gzip header and trailer are counted, so small responses (error envelopes,
+`/health`, a small single event) are sent as-is.
 
 Clients that don't advertise an encoding get the original bytes, byte for
 byte. `gzip` is preferred over `deflate` when both are offered, and
@@ -1000,7 +1044,10 @@ the spec-declared fields cannot be decoded (or the topics are malformed),
 the enriched response keeps the raw event alongside `"decoded": false` and a
 `decode_error` string explaining what failed, e.g.
 `"decode_error": "decoding topic field ...: cannot decode"`. Every such
-failure is also counted in `GET /stats` (see below).
+failure is also counted in `GET /stats` (see below). For contracts that do
+not embed a `contractspecv0` section on-chain (or whose Wasm is unreachable),
+operators can upload a manual spec override via `PUT /contracts/{id}/spec` —
+see [Contract Spec Overrides](docs/spec-overrides.md).
 | `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
@@ -1329,7 +1376,10 @@ triggers a reload; the one-shot subcommands (`replay`, `backfill`,
 Read-only GraphQL endpoint at `POST /graphql`, schema-first with
 Shared query-builder helpers in `internal/api/queries` so REST and
 GraphQL validate filters identically. Same `EventFilter` shape,
-same `Cursor` semantics, no drift between transports.
+same `Cursor` semantics, no drift between transports. See the
+[GraphQL API Guide](docs/graphql.md) for the full reference, including
+example queries for every top-level field, complexity calculation, and
+multi-tenant scope behavior.
 
 #### Endpoints
 

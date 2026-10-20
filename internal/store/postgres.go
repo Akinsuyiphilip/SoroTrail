@@ -488,15 +488,25 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
+	var sortValue, cursorContractID string
+	if f.Cursor != "" {
+		var err error
+		sortValue, cursorContractID, err = DecodeContractsCursor(f.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	if f.Scope.DeniesAll() {
+		return []ContractSummary{}, "", nil
+	}
 	where := []string{}
+	if !f.Scope.IsWildcard() {
+		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
 	if f.ContractIDPrefix != "" {
 		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}
 	if f.Cursor != "" {
-		sortValue, contractID, err := DecodeContractsCursor(f.Cursor)
-		if err != nil {
-			return nil, "", err
-		}
 		typed := arg(sortValue)
 		switch sortType {
 		case "bigint":
@@ -506,7 +516,7 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 		}
 		where = append(where,
 			fmt.Sprintf("(%s, contract_id) %s (%s, %s)",
-				sortCol, cursorOp, typed, arg(contractID)))
+				sortCol, cursorOp, typed, arg(cursorContractID)))
 	}
 	query := fmt.Sprintf(`
 		SELECT contract_id, count(*) AS event_count,
@@ -606,12 +616,18 @@ func (p *Postgres) ContractEventTypeCounts(ctx context.Context, contractID strin
 }
 
 func (p *Postgres) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
+	if f.Scope.DeniesAll() {
+		return 0, nil
+	}
 	args := []any{}
 	arg := func(v any) string {
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
 	where := []string{}
+	if !f.Scope.IsWildcard() {
+		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
 	if f.ContractIDPrefix != "" {
 		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}
@@ -1241,8 +1257,23 @@ const watchedContractsUnion = `
 	) w GROUP BY network, contract_id`
 
 func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
-	rows, err := p.pool.Query(ctx,
-		watchedContractsUnion+` ORDER BY network, contract_id`)
+	return p.ListWatchedContractsScoped(ctx, WildcardScope())
+}
+
+// ListWatchedContractsScoped returns watched contracts filtered by sc in SQL.
+func (p *Postgres) ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error) {
+	if sc.DeniesAll() {
+		return []WatchedContract{}, nil
+	}
+	var (
+		query = watchedContractsUnion + ` ORDER BY network, contract_id`
+		args  []any
+	)
+	if !sc.IsWildcard() {
+		query = `SELECT network, contract_id, added_at FROM (` + watchedContractsUnion + `) s WHERE contract_id = ANY($1) ORDER BY network, contract_id`
+		args = []any{sc.Contracts()}
+	}
+	rows, err := p.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
@@ -1714,8 +1745,15 @@ func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, network string, 
 	)
 	var f AuditFinding
 	var lastAttempted *time.Time
+	// last_error is NULL by design, not by accident: RecordAuditFinding
+	// leaves it unset until a repair attempt fails, and nullableString
+	// writes NULL back for an emptied message. Scanning it into a plain
+	// string would abort every read of a fresh finding with "cannot scan
+	// NULL into *string" — the SQLite backend's shared scanAuditFinding
+	// already reads it through a pointer for the same reason.
+	var lastError *string
 	err := row.Scan(&f.ID, &f.Network, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
-		&f.MissingIDs, &f.Status, &f.Attempts, &lastAttempted, &f.LastError, &f.CreatedAt)
+		&f.MissingIDs, &f.Status, &f.Attempts, &lastAttempted, &lastError, &f.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuditFinding{}, ErrNotFound
 	}
@@ -1724,6 +1762,9 @@ func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, network string, 
 	}
 	if lastAttempted != nil {
 		f.LastAttemptedAt = *lastAttempted
+	}
+	if lastError != nil {
+		f.LastError = *lastError
 	}
 	return f, nil
 }

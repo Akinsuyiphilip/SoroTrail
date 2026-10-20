@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1042,6 +1043,13 @@ func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, network string, le
 }
 
 func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
+	return s.ListWatchedContractsScoped(ctx, WildcardScope())
+}
+
+func (s *SQLite) ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error) {
+	if sc.DeniesAll() {
+		return []WatchedContract{}, nil
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT network, contract_id FROM watched_contracts ORDER BY network, contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
@@ -1053,7 +1061,9 @@ func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, e
 		if err := rows.Scan(&wc.Network, &wc.ContractID); err != nil {
 			return nil, err
 		}
-		out = append(out, wc)
+		if sc.Allows(wc.ContractID) {
+			out = append(out, wc)
+		}
 	}
 	return out, rows.Err()
 }
@@ -1593,8 +1603,147 @@ func (s *SQLite) ListContractsNeedingRefresh(context.Context, time.Time) ([]stri
 	return nil, errUnsupported("sqlite", "ListContractsNeedingRefresh")
 }
 
-// ListContracts is not implemented for the SQLite backend: the contract
-// inventory endpoint is Postgres-only.
+// ListContracts returns one ContractSummary per indexed contract, using the
+// same aggregate shape and keyset pagination as the Postgres backend. The
+// cursor carries (sort value, contract_id); the sort value is normalized to
+// the column's stored representation before it is compared, because SQLite
+// compares TEXT byte by byte and the RFC3339Nano form contractSortValue
+// produces trims trailing zeros while the database stores a fixed-width
+// timestamp.
+func (s *SQLite) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+	if !ValidContractsSortKey(f.SortKey) {
+		return nil, "", fmt.Errorf("unsupported sort_key %q", f.SortKey)
+	}
+
+	sortCol, sortExpr, sortType := contractsSortParts(f.SortKey)
+	orderDir := "DESC"
+	cursorOp := "<"
+	// contract_id is the documented default listing order and reads
+	// naturally ascending; activity-style keys keep their historical
+	// "busiest first" descending default.
+	if strings.EqualFold(f.Order, "asc") ||
+		(f.Order == "" && sortCol == "contract_id") {
+		orderDir = "ASC"
+		cursorOp = ">"
+	}
+	orderBy := fmt.Sprintf("%s %s, contract_id %s", sortExpr, orderDir, orderDir)
+	if sortCol == "contract_id" {
+		orderBy = fmt.Sprintf("contract_id %s", orderDir)
+	}
+
+	var (
+		where []string
+		have  []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return "?"
+	}
+	if f.ContractIDPrefix != "" {
+		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
+	}
+	if f.Cursor != "" {
+		sortValue, contractID, err := DecodeContractsCursor(f.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		// Bind the sort value in the type the column stores: integers stay
+		// integers so SQLite's type ordering cannot rank TEXT above them,
+		// and timestamps use the same fixed-width layout as formatTime.
+		normalized, err := contractsCursorValue(sortCol, sortType, sortValue)
+		if err != nil {
+			return nil, "", err
+		}
+		if sortCol == "contract_id" {
+			where = append(where, "contract_id "+cursorOp+" "+arg(normalized))
+		} else {
+			// Aggregate sort keys are only addressable after grouping, so
+			// the keyset predicate belongs in HAVING rather than WHERE.
+			have = append(have,
+				fmt.Sprintf("(%s, contract_id) %s (%s, %s)",
+					sortCol, cursorOp, arg(normalized), arg(contractID)))
+		}
+	}
+
+	query := `SELECT contract_id, count(*) AS event_count,
+	                 min(ledger) AS first_ledger, max(ledger) AS last_ledger,
+	                 max(created_at) AS last_seen
+	            FROM events`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY contract_id"
+	if len(have) > 0 {
+		query += " HAVING " + strings.Join(have, " AND ")
+	}
+	query += " ORDER BY " + orderBy + " LIMIT " + arg(limit+1)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("listing contracts: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]ContractSummary, 0, limit)
+	for rows.Next() {
+		var (
+			c        ContractSummary
+			lastSeen string
+		)
+		if err := rows.Scan(&c.ContractID, &c.EventCount,
+			&c.FirstLedger, &c.LastLedger, &lastSeen); err != nil {
+			return nil, "", fmt.Errorf("scanning contract summary: %w", err)
+		}
+		c.LastSeen = parseTime(lastSeen)
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("reading contracts: %w", err)
+	}
+
+	next := ""
+	if len(out) > limit {
+		last := out[limit-1]
+		out = out[:limit]
+		next = EncodeContractsCursor(f.SortKey, contractSortValue(last, f.SortKey), last.ContractID)
+	}
+	return out, next, nil
+}
+
+// contractsCursorValue converts a decoded cursor's sort half back into the
+// value SQLite compares against. A malformed value is client input, so it is
+// reported as ErrInvalidContractsCursor rather than a query error.
+func contractsCursorValue(sortCol, sortType, value string) (any, error) {
+	// count(*) has no declared cast type in contractsSortParts (Postgres
+	// compares it as an untyped numeric literal), but SQLite orders TEXT
+	// after INTEGER across storage classes, so the count cursor must be
+	// bound as an integer or an activity-sorted page would skip rows.
+	if sortType == "bigint" || sortCol == "count(*)" {
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%w: contracts cursor", ErrInvalidContractsCursor)
+		}
+		return n, nil
+	}
+	switch sortType {
+	case "timestamptz":
+		t, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			return nil, fmt.Errorf("%w: contracts cursor", ErrInvalidContractsCursor)
+		}
+		return formatTime(t), nil
+	default:
+		return value, nil
+	}
+}
 
 // API keys are not implemented for the SQLite backend: single-node
 // deployments authenticate via the operator's own reverse proxy or run
@@ -1619,19 +1768,63 @@ func (s *SQLite) RevokeAPIKey(context.Context, int64) error {
 	return errUnsupported("sqlite", "RevokeAPIKey")
 }
 
-// GetContractSummary is not implemented for the SQLite backend: the contract
-// statistics endpoint is Postgres-only.
-func (s *SQLite) GetContractSummary(context.Context, string) (ContractSummary, error) {
-	return ContractSummary{}, errUnsupported("sqlite", "GetContractSummary")
+// GetContractSummary returns a single contract's summary row. Like the
+// Postgres implementation it aggregates the events table directly, so a
+// contract that only appears in the watch list but has emitted nothing is
+// reported as ErrNotFound.
+func (s *SQLite) GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error) {
+	var (
+		c        ContractSummary
+		lastSeen string
+	)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT contract_id,
+		       count(*),
+		       min(ledger),
+		       max(ledger),
+		       max(created_at)
+		  FROM events
+		 WHERE contract_id = ?
+		 GROUP BY contract_id`, contractID,
+	).Scan(&c.ContractID, &c.EventCount, &c.FirstLedger, &c.LastLedger, &lastSeen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ContractSummary{}, ErrNotFound
+	}
+	if err != nil {
+		return ContractSummary{}, fmt.Errorf("get contract summary %s: %w", contractID, err)
+	}
+	c.LastSeen = parseTime(lastSeen)
+	return c, nil
 }
 
-// ContractEventTypeCounts is not implemented for the SQLite backend.
-func (s *SQLite) ContractEventTypeCounts(context.Context, string) ([]ContractEventTypeCount, error) {
-	return nil, errUnsupported("sqlite", "ContractEventTypeCounts")
-}
+// ContractEventTypeCounts returns per-type event counts for a single
+// contract, ordered by count descending like the Postgres implementation.
+// The result is a non-nil empty slice when the contract has no events, so an
+// empty breakdown is distinguishable from a backend that cannot answer.
+func (s *SQLite) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT type, count(*)
+		  FROM events
+		 WHERE contract_id = ?
+		 GROUP BY type
+		 ORDER BY count(*) DESC`, contractID)
+	if err != nil {
+		return nil, fmt.Errorf("contract event type counts %s: %w", contractID, err)
+	}
+	defer rows.Close()
 
-func (s *SQLite) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
-	return nil, "", errUnsupported("sqlite", "ListContracts")
+	out := make([]ContractEventTypeCount, 0)
+	for rows.Next() {
+		var c ContractEventTypeCount
+		if err := rows.Scan(&c.Type, &c.Count); err != nil {
+			return nil, fmt.Errorf("scanning contract event type count: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading contract event type counts: %w", err)
+	}
+	return out, nil
 }
 
 // Per-contract cursors mirror the Postgres implementation. Watched-mode

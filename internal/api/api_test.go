@@ -100,9 +100,16 @@ type stubStore struct {
 	contractSummaryErr error
 	eventTypeCounts    []store.ContractEventTypeCount
 	eventTypeCountsErr error
-	lastFilter         store.EventFilter
-	nextCursor         string
-	queryErr           error
+	// Contract-stats responses for /contracts/{id}/stats. The zero values
+	// preserve the old stub behaviour: no events and no metadata, so the
+	// handler answers 404 unless a test opts in.
+	contractEventCount    int64
+	contractEventCountErr error
+	contractMeta          *store.ContractMeta
+	contractMetaErr       error
+	lastFilter            store.EventFilter
+	nextCursor            string
+	queryErr              error
 
 	totalCount      int64
 	countEventsErr  error
@@ -137,8 +144,9 @@ type stubStore struct {
 	existsCalls      int // count of EventExists calls
 	lastExistsID     string
 
-	ingestion    store.IngestionState
-	ingestionErr error
+	ingestion      store.IngestionState
+	ingestionErr   error
+	ingestionByNet map[string]store.IngestionState
 
 	// pingCalls/ingestionStateCalls count dependency probes so tests can
 	// assert an endpoint that must not touch a dependency really doesn't.
@@ -185,6 +193,11 @@ type stubStore struct {
 	subscriptions []store.Subscription
 
 	contractCursors map[string]store.ContractCursor
+
+	// specOverride is the last value SetContractSpecOverride stored, so
+	// tests can assert exactly which bytes reached the store.
+	specOverride   []byte
+	specOverrideID string
 }
 
 func (s *stubStore) QueryEvents(_ context.Context, f store.EventFilter) ([]store.Event, string, error) {
@@ -300,6 +313,22 @@ func (s *stubStore) GetIngestionState(context.Context) (store.IngestionState, er
 	return s.ingestion, s.ingestionErr
 }
 
+func (s *stubStore) GetIngestionStateForNetwork(ctx context.Context, network string) (store.IngestionState, error) {
+	if s.ingestionByNet != nil {
+		if network == "" {
+			network = "default"
+		}
+		if st, ok := s.ingestionByNet[network]; ok {
+			return st, nil
+		}
+		return store.IngestionState{}, store.ErrNotFound
+	}
+	if network == "" || network == "default" {
+		return s.GetIngestionState(ctx)
+	}
+	return store.IngestionState{}, store.ErrNotFound
+}
+
 // MigrationVersion backs /readyz's schema check. Tests that need a dirty
 // or errored schema set migrationErr / migrationDirty.
 func (s *stubStore) MigrationVersion(context.Context) (int, bool, error) {
@@ -331,6 +360,22 @@ func (s *stubStore) Ping(ctx context.Context) error {
 }
 func (s *stubStore) ListWatchedContracts(context.Context) ([]store.WatchedContract, error) {
 	return s.watchedList, s.watchedListErr
+}
+
+func (s *stubStore) ListWatchedContractsScoped(_ context.Context, sc store.Scope) ([]store.WatchedContract, error) {
+	if s.watchedListErr != nil {
+		return nil, s.watchedListErr
+	}
+	if sc.DeniesAll() {
+		return []store.WatchedContract{}, nil
+	}
+	out := make([]store.WatchedContract, 0, len(s.watchedList))
+	for _, wc := range s.watchedList {
+		if sc.Allows(wc.ContractID) {
+			out = append(out, wc)
+		}
+	}
+	return out, nil
 }
 
 func (s *stubStore) AddWatchedContract(_ context.Context, w store.WatchedContract) error {
@@ -372,9 +417,11 @@ func (s *stubStore) DeleteSubscription(context.Context, int64, store.Subscriptio
 	return nil
 }
 func (s *stubStore) GetContractSpecOverride(context.Context, string) ([]byte, error) {
-	return nil, nil
+	return s.specOverride, nil
 }
-func (s *stubStore) SetContractSpecOverride(context.Context, string, []byte) error {
+func (s *stubStore) SetContractSpecOverride(_ context.Context, id string, data []byte) error {
+	s.specOverrideID = id
+	s.specOverride = data
 	return nil
 }
 func (s *stubStore) DeleteContractSpecOverride(context.Context, string) error {
@@ -452,13 +499,19 @@ func (s *stubStore) ListContractIDs(context.Context) ([]string, error) {
 	return nil, nil
 }
 func (s *stubStore) GetContractMeta(context.Context, string) (store.ContractMeta, error) {
+	if s.contractMetaErr != nil {
+		return store.ContractMeta{}, s.contractMetaErr
+	}
+	if s.contractMeta != nil {
+		return *s.contractMeta, nil
+	}
 	return store.ContractMeta{}, store.ErrNotFound
 }
 func (s *stubStore) UpsertContractMeta(context.Context, store.ContractMeta) error {
 	return nil
 }
 func (s *stubStore) CountContractEvents(context.Context, string) (int64, error) {
-	return 0, nil
+	return s.contractEventCount, s.contractEventCountErr
 }
 
 func (s *stubStore) GetContractSummary(_ context.Context, id string) (store.ContractSummary, error) {

@@ -65,6 +65,22 @@ func (s *stubStore) ListWatchedContracts(_ context.Context) ([]store.WatchedCont
 	return s.watchedList, s.watchedListErr
 }
 
+func (s *stubStore) ListWatchedContractsScoped(_ context.Context, sc store.Scope) ([]store.WatchedContract, error) {
+	if s.watchedListErr != nil {
+		return nil, s.watchedListErr
+	}
+	if sc.DeniesAll() {
+		return []store.WatchedContract{}, nil
+	}
+	out := make([]store.WatchedContract, 0, len(s.watchedList))
+	for _, wc := range s.watchedList {
+		if sc.Allows(wc.ContractID) {
+			out = append(out, wc)
+		}
+	}
+	return out, nil
+}
+
 func (s *stubStore) GetContractSpecOverride(context.Context, string) ([]byte, error) {
 	return nil, nil
 }
@@ -83,14 +99,22 @@ func newGraphQLTestServer(t *testing.T, st *stubStore) *Handler {
 	return h
 }
 
-// postQuery POSTs a GraphQL query document to the test server and
-// returns the parsed JSON envelope. Queries must be valid SDL — a
-// leading `{` is required.
+// postQuery POSTs a GraphQL query document to the test server as a
+// single-tenant (wildcard scope) principal and returns the parsed JSON
+// envelope. Queries must be valid SDL — a leading `{` is required.
 func postQuery(t *testing.T, h *Handler, q string) map[string]any {
+	t.Helper()
+	return postQueryWithContext(t, h, api.WithPrincipal(context.Background(), api.Principal{
+		Scope:      store.WildcardScope(),
+		Untenanted: true,
+	}), q)
+}
+
+func postQueryWithContext(t *testing.T, h *Handler, ctx context.Context, q string) map[string]any {
 	t.Helper()
 	body, _ := json.Marshal(map[string]string{"query": q})
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/graphql", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/graphql", bytes.NewReader(body)).WithContext(ctx)
 	h.ServeHTTP(w, req)
 	var resp map[string]any
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
