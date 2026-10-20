@@ -1828,17 +1828,28 @@ paths:
                           type: integer
                           format: int64
                           description: Number of events of this type
-              example:
-                contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                name: "Soroban Token"
-                symbol: "STOK"
-                decimals: 7
-                event_count: 42
-                type_breakdown:
-                  - type: contract
-                    count: 38
-                  - type: diagnostic
-                    count: 4
+              examples:
+                token_contract:
+                  summary: Contract with cached token metadata
+                  value:
+                    contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    name: "Soroban Token"
+                    symbol: "STOK"
+                    decimals: 7
+                    event_count: 42
+                    type_breakdown:
+                      - type: contract
+                        count: 38
+                      - type: diagnostic
+                        count: 4
+                plain_contract:
+                  summary: Contract without cached token metadata
+                  value:
+                    contract_id: "CAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSBFLM"
+                    event_count: 19
+                    type_breakdown:
+                      - type: contract
+                        count: 19
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
