@@ -517,6 +517,11 @@ func (s *Server) router() chi.Router {
 	r.With(watchedMW).Put("/contracts/{id}/spec", s.handlePutContractSpecOverride)
 	r.With(watchedMW).Get("/contracts/{id}/spec", s.handleGetContractSpecOverride)
 	r.With(watchedMW).Delete("/contracts/{id}/spec", s.handleDeleteContractSpecOverride)
+	// The override history answers "did someone change the override?", and
+	// a revert puts a previous version back. Both are management surfaces,
+	// so they sit behind the same key gate as the override itself.
+	r.With(watchedMW).Get("/contracts/{id}/spec/history", s.handleListContractSpecOverrideHistory)
+	r.With(watchedMW).Post("/contracts/{id}/spec/revert", s.handleRevertContractSpecOverride)
 
 	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
 	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)

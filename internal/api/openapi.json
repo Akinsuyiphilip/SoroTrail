@@ -2980,6 +2980,9 @@
           "500": {
             "$ref": "#/components/responses/InternalError"
           },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
           }
@@ -3112,6 +3115,177 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/contracts/{id}/spec/history": {
+      "get": {
+        "operationId": "listContractSpecOverrideHistory",
+        "summary": "List a contract's spec override history",
+        "description": "Lists every recorded change to a contract's spec override, newest first. Each entry records the spec that was in force, the API key prefix that made the change, and when — so \"did someone change the override?\" has an answer.\nAn entry with no `spec` is a tombstone: the override was deleted at that point rather than replaced. The history is append-only and is retained in full; it is never consulted when decoding an event.\nPaginated with an opaque cursor over the version id.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract whose override history is being read.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of override history, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "versions",
+                    "count"
+                  ],
+                  "properties": {
+                    "versions": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ContractSpecOverrideVersion"
+                      }
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "cursor": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/contracts/{id}/spec/revert": {
+      "post": {
+        "operationId": "revertContractSpecOverride",
+        "summary": "Restore a previous contract spec override",
+        "description": "Restores a previous version of a contract's spec override, named by the `version` in the request body — the id of an entry in the override history.\nThe revert is itself a change, so it is recorded as a new history entry: the history stays append-only and keeps the whole sequence, including the way back.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract whose spec override is being restored.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContractSpecOverrideRevertRequest"
+              },
+              "example": {
+                "version": 3
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The restored override",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "contract_id",
+                    "spec"
+                  ],
+                  "properties": {
+                    "contract_id": {
+                      "type": "string"
+                    },
+                    "spec": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -4708,6 +4882,57 @@
           "spec": {
             "type": "object",
             "description": "SEP-0041 contract specification JSON."
+          }
+        }
+      },
+      "ContractSpecOverrideRevertRequest": {
+        "type": "object",
+        "description": "Names the override-history entry to restore. The id is the one listed by GET /contracts/{id}/spec/history.",
+        "required": [
+          "version"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "The id of the history entry to restore.",
+            "example": 3
+          }
+        }
+      },
+      "ContractSpecOverrideVersion": {
+        "type": "object",
+        "description": "One recorded change to a contract's spec override. The spec is absent for a tombstone entry, which means the override was deleted at that point rather than replaced.",
+        "required": [
+          "id",
+          "contract_id",
+          "api_key_prefix",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The version number. It is also the pagination cursor."
+          },
+          "contract_id": {
+            "type": "string",
+            "description": "The contract whose override changed."
+          },
+          "spec": {
+            "type": "object",
+            "description": "The override document that was in force. Absent for a tombstone entry."
+          },
+          "api_key_prefix": {
+            "type": "string",
+            "description": "The public prefix of the API key that made the change. The secret half of the key is never stored."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the change was recorded."
           }
         }
       },

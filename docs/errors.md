@@ -82,6 +82,11 @@ they matter rather than on every path.
 | the PUT body is valid JSON but carries neither a "spec" wrapper nor a bare spec object | PUT /contracts/{id}/spec | `request body must contain a "spec" object` |
 | neither wrapped nor bare body could be decoded as JSON | PUT /contracts/{id}/spec | `invalid JSON body: <json error>` |
 | the {id} path segment is not a strkey | PUT /contracts/{id}/spec | `invalid contract id %q (want 56-char C... strkey)` |
+| the {id} path segment is not a strkey | GET /contracts/{id}/spec/history | `invalid contract id %q (want 56-char C... strkey)` |
+| the history page size is outside [1, limit] | GET /contracts/{id}/spec/history | `limit must be an integer in [1,%d]` |
+| the ?cursor= is not a cursor this endpoint produced | GET /contracts/{id}/spec/history | `spec override history cursor is not valid base64url; spec override history cursor is not a version id` |
+| the {id} path segment is not a strkey | POST /contracts/{id}/spec/revert | `invalid contract id %q (want 56-char C... strkey)` |
+| the body names no history version to restore | POST /contracts/{id}/spec/revert | `version must be a positive integer` |
 | the subscription is created without the HMAC signing secret | POST /subscriptions | `secret is required` |
 | the subscription is created without a webhook URL | POST /subscriptions | `url is required` |
 | DELETE /subscriptions/{id} is given a path id that is not a positive integer | DELETE /subscriptions/{id} | `subscription id must be a positive integer, got %q` |
@@ -105,7 +110,7 @@ they matter rather than on every path.
 | --- | --- | --- |
 | requireAPIKey sees a missing, malformed, unknown, revoked or mismatched key — one sentence for all five so the response is not an existence oracle | POST /apikeys, GET /apikeys, DELETE /apikeys/{id}, GET /events/ws, POST /subscriptions, PUT /subscriptions/{id}, DELETE /subscriptions/{id}, GET /subscriptions, GET /subscriptions/{id}, GET /subscriptions/{id}/deliveries | `missing or invalid API key` |
 | multi-tenant authentication rejects the credential, with the reason that lets a legitimate caller fix it | any authenticated or rate-limited operation (middleware-wide) | `missing API key; malformed API key; unknown or revoked API key` |
-| a management endpoint is called without the configured X-API-Key, or with the wrong one | DELETE /events, GET /watched-contracts, POST /watched-contracts, DELETE /watched-contracts/{id}, PUT /contracts/{id}/spec, GET /contracts/{id}/spec, DELETE /contracts/{id}/spec, GET /dead-letters, DELETE /dead-letters/{id} | `invalid or missing X-API-Key header` |
+| a management endpoint is called without the configured X-API-Key, or with the wrong one | DELETE /events, GET /watched-contracts, POST /watched-contracts, DELETE /watched-contracts/{id}, PUT /contracts/{id}/spec, GET /contracts/{id}/spec, DELETE /contracts/{id}/spec, GET /contracts/{id}/spec/history, POST /contracts/{id}/spec/revert, GET /dead-letters, DELETE /dead-letters/{id} | `invalid or missing X-API-Key header` |
 
 ### 403 Forbidden
 
@@ -132,6 +137,7 @@ they matter rather than on every path.
 | the contract has no indexed events | GET /contracts/{id}/stats | `contract %q not found` |
 | the contract has no indexed events | GET /contracts/{id} | `contract %q not found` |
 | no override was ever stored for this contract | GET /contracts/{id}/spec | `no spec override for contract %q` |
+| the named version is not in the contract's override history | POST /contracts/{id}/spec/revert | `no spec override version %d for contract %q` |
 | the subscription does not exist or is not visible to the caller | DELETE /subscriptions/{id} | `subscription %d not found` |
 | the subscription does not exist or is not visible to the caller | GET /subscriptions/{id} | `subscription %d not found` |
 | the subscription does not exist or is not visible to the caller | GET /subscriptions/{id}/deliveries | `subscription %d not found` |
@@ -197,6 +203,9 @@ they matter rather than on every path.
 | the store fails while deleting the override | DELETE /contracts/{id}/spec | `deleting contract spec override failed` |
 | the store fails while loading the override | GET /contracts/{id}/spec | `loading contract spec override failed` |
 | the store fails while persisting the override | PUT /contracts/{id}/spec | `saving contract spec override failed` |
+| the store fails while listing the override history | GET /contracts/{id}/spec/history | `listing contract spec override history failed` |
+| the store fails while listing the override history to find the version to restore | POST /contracts/{id}/spec/revert | `listing contract spec override history failed` |
+| the store fails while writing the restored override | POST /contracts/{id}/spec/revert | `reverting contract spec override failed` |
 | the store fails while creating the subscription | POST /subscriptions | `creating subscription failed` |
 | the store fails while deleting the subscription | DELETE /subscriptions/{id} | `deleting subscription failed` |
 | the store fails while loading the subscription | GET /subscriptions/{id} | `getting subscription failed` |
@@ -232,12 +241,16 @@ they matter rather than on every path.
 | the live stream is requested on an instance with no broadcaster | GET /events/ws | `streaming not configured` |
 | the store backend does not support listing contracts (ErrUnsupported) | GET /contracts | `operation not supported by this store backend` |
 | the store backend does not support contract summaries (ErrUnsupported) | GET /contracts/{id} | `operation not supported by this store backend` |
+| the store backend does not implement contract spec overrides (ErrUnsupported) | DELETE /contracts/{id}/spec | `operation not supported by this store backend` |
+| the store backend does not implement contract spec overrides (ErrUnsupported) | PUT /contracts/{id}/spec | `operation not supported by this store backend` |
+| the store backend does not implement the override history (ErrUnsupported) | GET /contracts/{id}/spec/history | `operation not supported by this store backend` |
+| the store backend does not implement the override history (ErrUnsupported) | POST /contracts/{id}/spec/revert | `operation not supported by this store backend` |
 
 ### 503 Service Unavailable
 
 | Condition | Operations | Message |
 | --- | --- | --- |
-| a management endpoint is called on an instance with no API_KEY — fail-closed, so writes are never open on a misconfigured deployment | DELETE /events, GET /watched-contracts, POST /watched-contracts, DELETE /watched-contracts/{id}, PUT /contracts/{id}/spec, GET /contracts/{id}/spec, DELETE /contracts/{id}/spec, GET /dead-letters, DELETE /dead-letters/{id} | `API_KEY env var must be set to access watched-contracts endpoints` |
+| a management endpoint is called on an instance with no API_KEY — fail-closed, so writes are never open on a misconfigured deployment | DELETE /events, GET /watched-contracts, POST /watched-contracts, DELETE /watched-contracts/{id}, PUT /contracts/{id}/spec, GET /contracts/{id}/spec, DELETE /contracts/{id}/spec, GET /contracts/{id}/spec/history, POST /contracts/{id}/spec/revert, GET /dead-letters, DELETE /dead-letters/{id} | `API_KEY env var must be set to access watched-contracts endpoints` |
 | /metrics is scraped on an instance with no metrics collector wired in | GET /metrics | `metrics not enabled` |
 
 ## Event-filter validation messages

@@ -1434,6 +1434,123 @@ func (s *SQLite) DeleteContractSpecOverride(ctx context.Context, contractID stri
 	return nil
 }
 
+// SetContractSpecOverrideWithHistory upserts the override and appends the
+// history row in one transaction, so the recorded history can never disagree
+// with the stored override.
+func (s *SQLite) SetContractSpecOverrideWithHistory(ctx context.Context, contractID string, specJSON []byte, apiKeyPrefix string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting contract spec override transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO contract_spec_overrides (contract_id, spec_json, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT (contract_id) DO UPDATE SET
+			spec_json  = excluded.spec_json,
+			updated_at = datetime('now')`,
+		contractID, string(specJSON),
+	); err != nil {
+		return fmt.Errorf("saving contract spec override for %s: %w", contractID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO contract_spec_override_history (contract_id, spec_json, api_key_prefix)
+		VALUES (?, ?, ?)`,
+		contractID, string(specJSON), apiKeyPrefix,
+	); err != nil {
+		return fmt.Errorf("recording contract spec override history for %s: %w", contractID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+// DeleteContractSpecOverrideWithHistory removes the override and appends a
+// tombstone history row in one transaction.
+func (s *SQLite) DeleteContractSpecOverrideWithHistory(ctx context.Context, contractID string, apiKeyPrefix string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting contract spec override transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM contract_spec_overrides WHERE contract_id = ?`, contractID,
+	); err != nil {
+		return fmt.Errorf("deleting contract spec override for %s: %w", contractID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO contract_spec_override_history (contract_id, spec_json, api_key_prefix)
+		VALUES (?, NULL, ?)`,
+		contractID, apiKeyPrefix,
+	); err != nil {
+		return fmt.Errorf("recording contract spec override history for %s: %w", contractID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing contract spec override delete for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+// ListContractSpecOverrideHistory returns a contract's override history
+// newest first, with cursor pagination over the version id.
+func (s *SQLite) ListContractSpecOverrideHistory(ctx context.Context, contractID string, limit int, cursor string) ([]ContractSpecOverrideVersion, string, error) {
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+
+	var afterID int64
+	if cursor != "" {
+		id, err := DecodeSpecOverrideHistoryCursor(cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		afterID = id
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, contract_id, spec_json, api_key_prefix, created_at
+		FROM contract_spec_override_history
+		WHERE contract_id = ? AND (? = 0 OR id < ?)
+		ORDER BY id DESC
+		LIMIT ?`,
+		contractID, afterID, afterID, limit,
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("listing contract spec override history for %s: %w", contractID, err)
+	}
+	defer rows.Close()
+
+	var out []ContractSpecOverrideVersion
+	for rows.Next() {
+		var (
+			v       ContractSpecOverrideVersion
+			specSQL sql.NullString
+			ts      string
+		)
+		if err := rows.Scan(&v.ID, &v.ContractID, &specSQL, &v.APIKeyPrefix, &ts); err != nil {
+			return nil, "", fmt.Errorf("scanning contract spec override history for %s: %w", contractID, err)
+		}
+		// A tombstone row stores NULL, so the spec is absent rather than empty.
+		if specSQL.Valid && specSQL.String != "" {
+			v.Spec = []byte(specSQL.String)
+		}
+		v.CreatedAt = parseTime(ts)
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("listing contract spec override history for %s: %w", contractID, err)
+	}
+
+	next := ""
+	if len(out) == limit {
+		next = EncodeSpecOverrideHistoryCursor(out[len(out)-1].ID)
+	}
+	return out, next, nil
+}
+
 func (s *SQLite) Stats(ctx context.Context, _ Scope) (Stats, error) {
 	var st Stats
 	err := s.db.QueryRowContext(ctx, `

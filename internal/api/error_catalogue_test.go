@@ -220,6 +220,7 @@ var errorCatalogue = []errorCondition{
 	// --- handlers_spec_override.go ---
 	{File: "handlers_spec_override.go", Func: "Server.handleDeleteContractSpecOverride", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the {id} path segment is not a strkey"},
 	{File: "handlers_spec_override.go", Func: "Server.handleDeleteContractSpecOverride", Status: 500, Arg: `errors.New("deleting contract spec override failed")`, Message: "deleting contract spec override failed", Condition: "the store fails while deleting the override"},
+	{File: "handlers_spec_override.go", Func: "Server.handleDeleteContractSpecOverride", Status: 501, Arg: `err`, Message: "operation not supported by this store backend", Condition: "the store backend does not implement contract spec overrides (ErrUnsupported)"},
 	{File: "handlers_spec_override.go", Func: "Server.handleGetContractSpecOverride", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the {id} path segment is not a strkey"},
 	{File: "handlers_spec_override.go", Func: "Server.handleGetContractSpecOverride", Status: 404, Arg: `fmt.Errorf("no spec override for contract %q", contractID)`, Message: "no spec override for contract %q", Condition: "no override was ever stored for this contract"},
 	{File: "handlers_spec_override.go", Func: "Server.handleGetContractSpecOverride", Status: 500, Arg: `errors.New("loading contract spec override failed")`, Message: "loading contract spec override failed", Condition: "the store fails while loading the override"},
@@ -228,6 +229,18 @@ var errorCatalogue = []errorCondition{
 	{File: "handlers_spec_override.go", Func: "Server.handlePutContractSpecOverride", Status: 400, Arg: `fmt.Errorf("invalid JSON body: %w", err)`, Message: "invalid JSON body: <json error>", Condition: "neither wrapped nor bare body could be decoded as JSON"},
 	{File: "handlers_spec_override.go", Func: "Server.handlePutContractSpecOverride", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the {id} path segment is not a strkey"},
 	{File: "handlers_spec_override.go", Func: "Server.handlePutContractSpecOverride", Status: 500, Arg: `errors.New("saving contract spec override failed")`, Message: "saving contract spec override failed", Condition: "the store fails while persisting the override"},
+	{File: "handlers_spec_override.go", Func: "Server.handlePutContractSpecOverride", Status: 501, Arg: `err`, Message: "operation not supported by this store backend", Condition: "the store backend does not implement contract spec overrides (ErrUnsupported)"},
+	{File: "handlers_spec_override.go", Func: "Server.handleListContractSpecOverrideHistory", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the {id} path segment is not a strkey"},
+	{File: "handlers_spec_override.go", Func: "Server.handleListContractSpecOverrideHistory", Status: 400, Arg: `fmt.Errorf("limit must be an integer in [1,%d]", maxLimit)`, Message: "limit must be an integer in [1,%d]", Condition: "the history page size is outside [1, limit]"},
+	{File: "handlers_spec_override.go", Func: "Server.handleListContractSpecOverrideHistory", Status: 400, Arg: `err`, Message: "spec override history cursor is not valid base64url; spec override history cursor is not a version id", Condition: "the ?cursor= is not a cursor this endpoint produced"},
+	{File: "handlers_spec_override.go", Func: "Server.handleListContractSpecOverrideHistory", Status: 500, Arg: `errors.New("listing contract spec override history failed")`, Message: "listing contract spec override history failed", Condition: "the store fails while listing the override history"},
+	{File: "handlers_spec_override.go", Func: "Server.handleListContractSpecOverrideHistory", Status: 501, Arg: `err`, Message: "operation not supported by this store backend", Condition: "the store backend does not implement the override history (ErrUnsupported)"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the {id} path segment is not a strkey"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 400, Arg: `errors.New("version must be a positive integer")`, Message: "version must be a positive integer", Condition: "the body names no history version to restore"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 404, Arg: `fmt.Errorf("no spec override version %d for contract %q", versionID, contractID)`, Message: "no spec override version %d for contract %q", Condition: "the named version is not in the contract's override history"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 500, Arg: `errors.New("listing contract spec override history failed")`, Message: "listing contract spec override history failed", Condition: "the store fails while listing the override history to find the version to restore"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 500, Arg: `errors.New("reverting contract spec override failed")`, Message: "reverting contract spec override failed", Condition: "the store fails while writing the restored override"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 501, Arg: `err`, Count: 2, Message: "operation not supported by this store backend", Condition: "the store backend does not implement the override history (ErrUnsupported)"},
 
 	// --- handlers_subscription.go ---
 	{File: "handlers_subscription.go", Func: "Server.handleCreateSubscription", Status: 400, Arg: `errors.New("secret is required")`, Message: "secret is required", Condition: "the subscription is created without the HMAC signing secret"},
@@ -344,14 +357,16 @@ var funcRoutes = map[string][]string{
 	"Server.handleEventStreamWS":  {"GET /events/ws"},
 
 	// Operator watch list, spec overrides, dead letters.
-	"Server.handleListWatchedChains":          {"GET /watched-contracts"},
-	"Server.handleAddWatchedChain":            {"POST /watched-contracts"},
-	"Server.handleRemoveWatchedChain":         {"DELETE /watched-contracts/{id}"},
-	"Server.handlePutContractSpecOverride":    {"PUT /contracts/{id}/spec"},
-	"Server.handleGetContractSpecOverride":    {"GET /contracts/{id}/spec"},
-	"Server.handleDeleteContractSpecOverride": {"DELETE /contracts/{id}/spec"},
-	"Server.handleListDeadLetters":            {"GET /dead-letters"},
-	"Server.handleDeleteDeadLetter":           {"DELETE /dead-letters/{id}"},
+	"Server.handleListWatchedChains":               {"GET /watched-contracts"},
+	"Server.handleAddWatchedChain":                 {"POST /watched-contracts"},
+	"Server.handleRemoveWatchedChain":              {"DELETE /watched-contracts/{id}"},
+	"Server.handlePutContractSpecOverride":         {"PUT /contracts/{id}/spec"},
+	"Server.handleGetContractSpecOverride":         {"GET /contracts/{id}/spec"},
+	"Server.handleDeleteContractSpecOverride":      {"DELETE /contracts/{id}/spec"},
+	"Server.handleListContractSpecOverrideHistory": {"GET /contracts/{id}/spec/history"},
+	"Server.handleRevertContractSpecOverride":      {"POST /contracts/{id}/spec/revert"},
+	"Server.handleListDeadLetters":                 {"GET /dead-letters"},
+	"Server.handleDeleteDeadLetter":                {"DELETE /dead-letters/{id}"},
 
 	// API keys and subscriptions (requireAPIKey / protect groups).
 	"Server.handleCreateAPIKey":       {"POST /apikeys"},
@@ -367,7 +382,7 @@ var funcRoutes = map[string][]string{
 	"Server.handleListDeliveries":     {"GET /subscriptions/{id}/deliveries"},
 
 	// Operator management (apiKeyAuth group): fail-closed 503 + 401.
-	"apiKeyAuth": {"DELETE /events", "GET /watched-contracts", "POST /watched-contracts", "DELETE /watched-contracts/{id}", "PUT /contracts/{id}/spec", "GET /contracts/{id}/spec", "DELETE /contracts/{id}/spec", "GET /dead-letters", "DELETE /dead-letters/{id}"},
+	"apiKeyAuth": {"DELETE /events", "GET /watched-contracts", "POST /watched-contracts", "DELETE /watched-contracts/{id}", "PUT /contracts/{id}/spec", "GET /contracts/{id}/spec", "DELETE /contracts/{id}/spec", "GET /contracts/{id}/spec/history", "POST /contracts/{id}/spec/revert", "GET /dead-letters", "DELETE /dead-letters/{id}"},
 
 	// Tenant self-service.
 	"Server.handleWhoAmI":           {"GET /tenant"},

@@ -58,6 +58,7 @@ ones that still do not.
 | Contract metadata | `ListContractIDs`, `GetContractMeta`, `UpsertContractMeta`, `CountContractEvents`, `ListContractsNeedingRefresh` | **silent no-op** | Reads return empty or `ErrNotFound`; the write returns nil. Token enrichment is effectively disabled, and a non-token contract is indistinguishable from one whose metadata was never fetched. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+metadata). |
 | Contract specs | `GetContractSpec`, `GetContractSpecOverride` | **silent no-op** | Both return `ErrNotFound`, so a cached spec looks absent. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+spec). |
 | Contract spec writes | `SetContractSpec`, `SetContractSpecOverride`, `DeleteContractSpecOverride` | **silent no-op** | All return nil without persisting anything. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+spec). |
+| Contract spec override history | `SetContractSpecOverrideWithHistory`, `DeleteContractSpecOverrideWithHistory`, `ListContractSpecOverrideHistory` | **refuses** | All three return `ErrUnsupported`, so the API answers 501 rather than reporting an empty history. The history is written in the same transaction as the override it records, and the backend has neither. |
 
 ### Ingestion, audit and watch state
 

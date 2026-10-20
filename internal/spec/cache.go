@@ -279,6 +279,25 @@ func (c *Cache) InvalidateContract(contractID string) {
 	}
 }
 
+// InvalidateOverride evicts the parsed user-supplied override for a contract.
+// The override is cached in the same map as the fetched specs, under the
+// "override:<contractID>" key, so it needs its own eviction: a fetched spec
+// and an override are different things and a write to one says nothing about
+// the other.
+//
+// The override never expires on its own — it is authoritative until it is
+// replaced or deleted — so this is the only way a stale override leaves the
+// cache.
+func (c *Cache) InvalidateOverride(contractID string) {
+	c.mu.Lock()
+	_, ok := c.mem[overrideKeyPrefix+contractID]
+	delete(c.mem, overrideKeyPrefix+contractID)
+	c.mu.Unlock()
+	if ok {
+		c.invalidations.Add(1)
+	}
+}
+
 // LoadFromDB hydrates the in-memory cache from the database for the given
 // wasm hash. Returns nil when the spec is not in the database.
 func (c *Cache) LoadFromDB(ctx context.Context, wasmHash string) (*ContractSpec, error) {

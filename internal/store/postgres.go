@@ -1682,6 +1682,129 @@ func (p *Postgres) DeleteContractSpecOverride(ctx context.Context, contractID st
 	return nil
 }
 
+// SetContractSpecOverrideWithHistory upserts the override and appends the
+// history row in one transaction. The two writes share a transaction so the
+// recorded history can never disagree with the stored override: a crash
+// between them would otherwise leave a history entry for a change that never
+// landed, or a change with no history entry at all.
+func (p *Postgres) SetContractSpecOverrideWithHistory(ctx context.Context, contractID string, specJSON []byte, apiKeyPrefix string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("starting contract spec override transaction: %w", err)
+	}
+	// Rollback after a successful Commit is a no-op, so this is the only
+	// cleanup path needed.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO contract_spec_overrides (contract_id, spec_json, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (contract_id) DO UPDATE SET
+			spec_json  = EXCLUDED.spec_json,
+			updated_at = now()`,
+		contractID, specJSON,
+	); err != nil {
+		return fmt.Errorf("saving contract spec override for %s: %w", contractID, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO contract_spec_override_history (contract_id, spec_json, api_key_prefix)
+		VALUES ($1, $2, $3)`,
+		contractID, specJSON, apiKeyPrefix,
+	); err != nil {
+		return fmt.Errorf("recording contract spec override history for %s: %w", contractID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+// DeleteContractSpecOverrideWithHistory removes the override and appends a
+// tombstone history row in one transaction. The tombstone records that the
+// override was deleted, so "the override disappeared" is answerable.
+func (p *Postgres) DeleteContractSpecOverrideWithHistory(ctx context.Context, contractID string, apiKeyPrefix string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("starting contract spec override transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM contract_spec_overrides WHERE contract_id = $1`, contractID,
+	); err != nil {
+		return fmt.Errorf("deleting contract spec override for %s: %w", contractID, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO contract_spec_override_history (contract_id, spec_json, api_key_prefix)
+		VALUES ($1, NULL, $2)`,
+		contractID, apiKeyPrefix,
+	); err != nil {
+		return fmt.Errorf("recording contract spec override history for %s: %w", contractID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing contract spec override delete for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+// ListContractSpecOverrideHistory returns a contract's override history
+// newest first. The cursor is the last version id of the previous page, and
+// the next page is the rows with a smaller id, so a change made while a
+// client is paging cannot make an entry be skipped or repeated.
+func (p *Postgres) ListContractSpecOverrideHistory(ctx context.Context, contractID string, limit int, cursor string) ([]ContractSpecOverrideVersion, string, error) {
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+
+	// The cursor is the last id of the previous page; the next page is
+	// everything older than it.
+	var afterID int64 = 0
+	if cursor != "" {
+		id, err := DecodeSpecOverrideHistoryCursor(cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		afterID = id
+	}
+
+	rows, err := p.pool.Query(ctx, `
+		SELECT id, contract_id, spec_json, api_key_prefix, created_at
+		FROM contract_spec_override_history
+		WHERE contract_id = $1 AND ($2 = 0 OR id < $2)
+		ORDER BY id DESC
+		LIMIT $3`,
+		contractID, afterID, limit,
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("listing contract spec override history for %s: %w", contractID, err)
+	}
+	defer rows.Close()
+
+	var out []ContractSpecOverrideVersion
+	for rows.Next() {
+		var v ContractSpecOverrideVersion
+		var specJSON []byte
+		if err := rows.Scan(&v.ID, &v.ContractID, &specJSON, &v.APIKeyPrefix, &v.CreatedAt); err != nil {
+			return nil, "", fmt.Errorf("scanning contract spec override history for %s: %w", contractID, err)
+		}
+		// A tombstone row has no spec; the empty JSON document stands in
+		// for the SQL NULL so the column scans as bytes.
+		if len(specJSON) > 0 {
+			v.Spec = specJSON
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("listing contract spec override history for %s: %w", contractID, err)
+	}
+
+	next := ""
+	if len(out) == limit {
+		next = EncodeSpecOverrideHistoryCursor(out[len(out)-1].ID)
+	}
+	return out, next, nil
+}
+
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
 	err := p.pool.QueryRow(ctx, `
 		INSERT INTO audit_findings
