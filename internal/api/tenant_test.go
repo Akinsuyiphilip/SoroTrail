@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1656,4 +1657,253 @@ func TestAdminEndpointsRequireAdminCredentials(t *testing.T) {
 				"wildcard tenant must be rejected from admin endpoint %s", path)
 		})
 	}
+}
+
+// --- Per-tenant rate limiting ---
+//
+// The isolation property these tests exist for is the reason per-tenant
+// budgets exist at all: a tenant that burns through its quota must not spend
+// anyone else's, and must not escape its own by changing source address.
+// They drive the middleware the way the router does — a request carrying the
+// Principal authenticate installs — so the resolver, the bucket map and the
+// 429 response are all exercised rather than a hand-picked bucket key.
+
+// tenantWithQuota builds a tenant carrying its own rate-limit override. The
+// resolver reads these pointer fields, so the override has to sit on the
+// Tenant exactly as the admin handler stores it.
+func tenantWithQuota(id int64, rps float64, burst int) store.Tenant {
+	return store.Tenant{
+		ID:             id,
+		Name:           fmt.Sprintf("tenant-%d", id),
+		Enabled:        true,
+		RateLimitRPS:   &rps,
+		RateLimitBurst: &burst,
+	}
+}
+
+// newTenantRateLimiter builds a limiter whose only limits are per-tenant: no
+// instance-wide RPS/BURST is configured, so every authenticated request below
+// takes the tenant branch and every credential-less one takes the documented
+// IP fallback.
+func newTenantRateLimiter(opts ...LimiterOption) *RateLimiter {
+	return NewRateLimiter(0, 0, false,
+		append([]LimiterOption{WithLimitResolver(TenantLimitResolver(0, 0))}, opts...)...)
+}
+
+// sendAsTenant drives one request through the limiter as p from a fixed
+// address; tests that care about the source address use sendAsTenantFrom.
+func sendAsTenant(lim *RateLimiter, p Principal) *httptest.ResponseRecorder {
+	return sendAsTenantFrom(lim, "203.0.113.70:443", p)
+}
+
+// sendAsTenantFrom pins the source address so a test can prove identity, not
+// network position, decides which budget a request spends.
+func sendAsTenantFrom(lim *RateLimiter, addr string, p Principal) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	req.RemoteAddr = addr
+	req = req.WithContext(WithPrincipal(req.Context(), p))
+	rec := httptest.NewRecorder()
+	middlewareFor(lim).ServeHTTP(rec, req)
+	return rec
+}
+
+// TestPerTenantRateLimitIsolation is the deliverable: one tenant driven past
+// its limit must leave every other tenant unaffected.
+func TestPerTenantRateLimitIsolation(t *testing.T) {
+	tenantA := tenantWithQuota(1, 0.5, 1)
+	tenantB := tenantWithQuota(2, 0.5, 1)
+
+	t.Run("a spent budget belongs to the tenant that spent it", func(t *testing.T) {
+		lim := newTenantRateLimiter()
+
+		require.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+			"tenant A's first request must be admitted")
+		require.Equal(t, http.StatusTooManyRequests, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+			"tenant A's second request must exhaust its one-token budget")
+
+		assert.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantB}).Code,
+			"tenant B must be admitted while tenant A is throttled")
+
+		assert.Equal(t, http.StatusTooManyRequests, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+			"tenant A must stay throttled; tenant B's traffic must not refill it")
+		assert.Equal(t, 2, lim.Size(), "each tenant must own exactly one bucket")
+	})
+
+	t.Run("tenant identity separates budgets behind a shared address", func(t *testing.T) {
+		// Both tenants call from one egress — the NAT/corporate-proxy case
+		// IP keying gets wrong in both directions: a shared bucket would
+		// throttle one tenant for the other's spend, and a tenant changing
+		// address would be handed a fresh budget per address.
+		const egress = "198.51.100.20:5000"
+		lim := newTenantRateLimiter()
+
+		require.Equal(t, http.StatusOK, sendAsTenantFrom(lim, egress, Principal{Tenant: tenantA}).Code)
+		require.Equal(t, http.StatusTooManyRequests, sendAsTenantFrom(lim, egress, Principal{Tenant: tenantA}).Code)
+
+		assert.Equal(t, http.StatusOK, sendAsTenantFrom(lim, egress, Principal{Tenant: tenantB}).Code,
+			"a second tenant behind the same egress must keep its own budget")
+	})
+
+	t.Run("same tenant on a new address keeps spending the same budget", func(t *testing.T) {
+		// The other half of keying on identity: a new source address must
+		// not mint a fresh bucket, or a caller could rotate addresses and
+		// never run out.
+		lim := newTenantRateLimiter()
+
+		require.Equal(t, http.StatusOK,
+			sendAsTenantFrom(lim, "203.0.113.80:1000", Principal{Tenant: tenantA}).Code)
+		assert.Equal(t, http.StatusTooManyRequests,
+			sendAsTenantFrom(lim, "203.0.113.81:2000", Principal{Tenant: tenantA}).Code,
+			"tenant A's budget must follow its identity across addresses")
+		assert.Equal(t, 1, lim.Size(),
+			"the same tenant must not accumulate one bucket per address")
+	})
+
+	t.Run("an override applies only to the tenant that carries it", func(t *testing.T) {
+		// Tenant A buys a burst of three; tenant B inherits the instance
+		// default of one. A's extra capacity must not widen B's budget,
+		// and B's spend must not consume A's.
+		generous := tenantWithQuota(1, 0.5, 3)
+		lim := NewRateLimiter(0, 0, false, WithLimitResolver(TenantLimitResolver(0.5, 1)))
+
+		for i := 0; i < 3; i++ {
+			require.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: generous}).Code,
+				"request %d must be admitted within tenant A's burst", i+1)
+		}
+		require.Equal(t, http.StatusTooManyRequests, sendAsTenant(lim, Principal{Tenant: generous}).Code)
+
+		assert.Equal(t, http.StatusOK,
+			sendAsTenant(lim, Principal{Tenant: store.Tenant{ID: 2}}).Code,
+			"tenant B's default burst must be untouched by tenant A's override")
+		assert.Equal(t, http.StatusTooManyRequests,
+			sendAsTenant(lim, Principal{Tenant: store.Tenant{ID: 2}}).Code,
+			"tenant B must be held to its own default budget")
+	})
+}
+
+// TestPerTenantRateLimitRejectionCarriesRetryAfter pins the rejection
+// contract: a throttled tenant gets the documented 429 envelope and a
+// Retry-After it can act on, while another tenant keeps being served.
+func TestPerTenantRateLimitRejectionCarriesRetryAfter(t *testing.T) {
+	tenantA := tenantWithQuota(1, 0.5, 1)
+	tenantB := tenantWithQuota(2, 0.5, 1)
+	lim := newTenantRateLimiter()
+
+	require.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantA}).Code)
+	rec := sendAsTenant(lim, Principal{Tenant: tenantA})
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+
+	raw := rec.Header().Get("Retry-After")
+	require.NotEmpty(t, raw, "a 429 must tell the caller when to come back")
+	secs, err := strconv.Atoi(raw)
+	require.NoError(t, err, "Retry-After must be integer delta-seconds (RFC 7231 §7.1.3)")
+	assert.Equal(t, 2, secs,
+		"a tenant limited to 0.5 rps waits two seconds for its next token; rounding down would invite an immediate retry")
+
+	assert.Equal(t, "0", rec.Header().Get("X-RateLimit-Remaining"))
+	assert.Equal(t, "1", rec.Header().Get("X-RateLimit-Limit"),
+		"the tenant's own burst must be advertised")
+
+	reset, err := strconv.ParseInt(rec.Header().Get("X-RateLimit-Reset"), 10, 64)
+	require.NoError(t, err, "X-RateLimit-Reset must be a unix timestamp")
+	assert.InDelta(t, time.Now().Add(2*time.Second).Unix(), reset, 1)
+
+	var envelope errorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &envelope))
+	assert.Contains(t, envelope.Error, "rate limit exceeded")
+
+	assert.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantB}).Code,
+		"tenant B must still be served while tenant A is told to retry later")
+}
+
+// TestPerTenantRateLimitBudgetRefills covers the documented refill path
+// without sleeping: the idle sweep retires a quiet bucket, and the tenant's
+// next request starts from a fresh one carrying its full burst. The sweep's
+// explicit `now` is the same time seam the IP-keyed refill test uses.
+func TestPerTenantRateLimitBudgetRefills(t *testing.T) {
+	tenantA := tenantWithQuota(1, 0.5, 2)
+	lim := newTenantRateLimiter(WithIdleTTL(time.Minute))
+
+	for i := 0; i < 2; i++ {
+		require.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+			"request %d must be admitted within the burst", i+1)
+	}
+	require.Equal(t, http.StatusTooManyRequests, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+		"the budget must be empty once the burst is spent")
+
+	// An hour of quiet is well past both the one-minute idle TTL and the
+	// two-token refill period, so the sweep retires the bucket.
+	require.Equal(t, 1, lim.evictIdle(time.Now().Add(time.Hour)),
+		"an idle tenant bucket must be evicted")
+	require.Zero(t, lim.Size())
+
+	assert.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+		"after the refill window the tenant must be admitted again")
+	assert.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+		"the refilled bucket must carry the full burst, not a single token")
+	assert.Equal(t, http.StatusTooManyRequests, sendAsTenant(lim, Principal{Tenant: tenantA}).Code)
+}
+
+// TestTenantRateLimitWithoutCredentialUsesIPFallback covers the documented
+// path for requests that carry no tenant identity: the resolver declines and
+// the limiter falls back to the instance-wide IP-keyed bucket. That traffic
+// must neither be rejected outright nor spend a tenant's budget.
+func TestTenantRateLimitWithoutCredentialUsesIPFallback(t *testing.T) {
+	cases := []struct {
+		name string
+		send func(*RateLimiter, string) *httptest.ResponseRecorder
+	}{
+		{
+			name: "no principal at all",
+			send: func(l *RateLimiter, addr string) *httptest.ResponseRecorder {
+				return sendFrom(l, addr)
+			},
+		},
+		{
+			name: "untenanted principal in single-tenant mode",
+			send: func(l *RateLimiter, addr string) *httptest.ResponseRecorder {
+				return sendAsTenantFrom(l, addr, Principal{Untenanted: true})
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lim := NewRateLimiter(0.5, 1, false,
+				WithLimitResolver(TenantLimitResolver(0.5, 1)))
+			const addr = "203.0.113.90:7000"
+
+			require.Equal(t, http.StatusOK, tc.send(lim, addr).Code,
+				"the first credential-less request must be admitted by the IP bucket")
+			rec := tc.send(lim, addr)
+			require.Equal(t, http.StatusTooManyRequests, rec.Code,
+				"the instance-wide IP bucket must bind once its burst is spent")
+			assert.NotEmpty(t, rec.Header().Get("Retry-After"))
+			assert.Equal(t, 1, lim.Size(), "credential-less traffic must key on the source IP")
+
+			// A different address is a different bucket...
+			assert.Equal(t, http.StatusOK, tc.send(lim, "203.0.113.91:7000").Code)
+
+			// ...and the exhausted IP bucket must not touch the
+			// authenticated tenant's budget at the same address.
+			assert.Equal(t, http.StatusOK,
+				sendAsTenantFrom(lim, addr, Principal{Tenant: tenantWithQuota(1, 0.5, 1)}).Code,
+				"credential-less traffic must not spend a tenant's budget")
+		})
+	}
+}
+
+// TestTenantRateLimitUnconfiguredIsPassthrough guards the off-by-default
+// posture for tenants without an override: when neither the tenant nor the
+// instance configures a budget, the limiter must add no limits of its own.
+func TestTenantRateLimitUnconfiguredIsPassthrough(t *testing.T) {
+	lim := newTenantRateLimiter()
+	require.True(t, lim.Enabled(), "the resolver keeps the limiter wired in")
+
+	for i := 0; i < 5; i++ {
+		assert.Equal(t, http.StatusOK,
+			sendAsTenant(lim, Principal{Tenant: store.Tenant{ID: 7}}).Code,
+			"request %d must pass: no budget is configured for this tenant", i+1)
+	}
+	assert.Zero(t, lim.Size(), "an unbudgeted tenant must not accumulate a bucket")
 }
