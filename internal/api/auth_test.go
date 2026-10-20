@@ -32,6 +32,51 @@ import (
 // an absent key, an unknown key, a disabled tenant, and an unconfigured
 // API_KEY must all deny, and must deny without leaking why.
 
+func TestCredentialFromRequest(t *testing.T) {
+	cases := []struct {
+		name          string
+		authorization string
+		apiKey        string
+		want          string
+	}{
+		{name: "missing headers"},
+		{name: "Bearer token", authorization: "Bearer tenant-key", want: "tenant-key"},
+		{name: "Bearer credential whitespace", authorization: "Bearer \t tenant-key \t", want: "tenant-key"},
+		{name: "API key", apiKey: "header-key", want: "header-key"},
+		{name: "API key whitespace", apiKey: " \t header-key \t", want: "header-key"},
+		{name: "whitespace-only API key", apiKey: " \t "},
+		{name: "Bearer takes precedence", authorization: "Bearer tenant-key", apiKey: "header-key", want: "tenant-key"},
+		{name: "empty Bearer does not fall back", authorization: "Bearer ", apiKey: "header-key"},
+		{name: "whitespace-only Bearer does not fall back", authorization: "Bearer \t ", apiKey: "header-key"},
+		{name: "bare token is rejected", authorization: "tenant-key"},
+		{name: "bare token falls back", authorization: "tenant-key", apiKey: "header-key", want: "header-key"},
+		{name: "lowercase scheme is rejected", authorization: "bearer tenant-key"},
+		{name: "mixed-case scheme is rejected", authorization: "bEaReR tenant-key"},
+		{name: "lowercase scheme falls back", authorization: "bearer tenant-key", apiKey: "header-key", want: "header-key"},
+		{name: "other scheme is rejected", authorization: "Basic tenant-key"},
+		{name: "other scheme falls back", authorization: "Basic tenant-key", apiKey: "header-key", want: "header-key"},
+		{name: "missing separator", authorization: "Bearertenant-key"},
+		{name: "missing credential", authorization: "Bearer"},
+		{name: "tab separator is rejected", authorization: "Bearer\ttenant-key"},
+		{name: "leading scheme whitespace is rejected", authorization: " Bearer tenant-key"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("Authorization", tc.authorization)
+			req.Header.Set("X-API-Key", tc.apiKey)
+			assert.Equal(t, tc.want, credentialFromRequest(req))
+		})
+	}
+	t.Run("unintended credential sources are ignored", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/?api_key=query-key", nil)
+		req.Header.Set("Proxy-Authorization", "Bearer proxy-key")
+		req.Header.Set("X-Auth-Token", "header-key")
+		req.AddCookie(&http.Cookie{Name: "api_key", Value: "cookie-key"})
+		assert.Empty(t, credentialFromRequest(req))
+	})
+}
+
 // authRecorder is a terminal handler that records whether it ran and the
 // request it was handed, so a test can assert both "the gate allowed the
 // call through" and "the principal reached the handler".
