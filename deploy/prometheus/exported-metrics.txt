@@ -1,0 +1,29 @@
+# The Prometheus metrics SoroTrail exports, one base name per line.
+#
+# This file is the canonical list consumed by scripts/validate_monitoring.py
+# (run via `make check-monitoring` and the CI `monitoring` job): every metric
+# referenced by a rule expression in deploy/prometheus/sorotrail-rules.yml or
+# by a panel query in deploy/grafana/sorotrail-dashboard.json must appear
+# here, otherwise a renamed or deleted metric would ship as a silently dead
+# alert or a blank panel.
+#
+# Conventions:
+#   - List the base name exactly as registered. Histograms and HistogramVecs
+#     are listed once by base name; the checker also accepts the usual
+#     <name>_bucket / <name>_count / <name>_sum suffixes derived from them.
+#   - Comments start with #; blank lines are ignored.
+#
+# When the "document and test every exported metric" issue lands a
+# canonical list elsewhere, point scripts/validate_monitoring.py at that
+# list and delete this file rather than keeping two copies.
+sorotrail_events_ingested_total
+sorotrail_ingest_errors_total
+sorotrail_rpc_call_duration_seconds
+sorotrail_db_write_duration_seconds
+sorotrail_db_query_duration_seconds
+sorotrail_ingestion_lag_ledgers
+sorotrail_event_batch_writes_total
+sorotrail_event_batch_size
+sorotrail_event_backpressure_total
+sorotrail_event_backpressure_seconds_total
+http_request_duration_seconds

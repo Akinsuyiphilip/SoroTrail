@@ -1,0 +1,192 @@
+# Unit tests for deploy/prometheus/sorotrail-rules.yml, in promtool's own
+# test format (https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/).
+#
+# Run with: promtool test rules deploy/prometheus/sorotrail-rules-test.yml
+# (also part of `make check-monitoring` and the CI `monitoring` job).
+#
+# Every alert gets a firing case; the two alerts whose conditions are
+# easiest to accidentally invert (the lag threshold and the latency
+# quantiles) also get a not-firing case. The recording rules are checked
+# by value so a broken aggregation shows up here rather than on a
+# dashboard.
+
+rule_files:
+  - sorotrail-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ── IngestionLagHigh ───────────────────────────────────────────────────
+  # Lag jumps from 0 to 300 ledgers; the 5m `for` makes the alert fire at
+  # 11m, so 15m is safely inside the firing window.
+  - interval: 1m
+    input_series:
+      - series: 'sorotrail_ingestion_lag_ledgers'
+        values: '0x6 300x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: IngestionLagHigh
+        exp_alerts:
+          - exp_labels:
+              alertname: IngestionLagHigh
+              severity: warning
+              component: ingester
+            exp_annotations:
+              summary: "SoroTrail ingestion lag exceeds 200 ledgers"
+              description: "SoroTrail indexer is 300 ledgers behind the Stellar RPC chain head (threshold: 200, ≈ 16 min at ~5 s/ledger). Sustained lag risks an unrecoverable data gap if the RPC retention window closes. Check RPC latency, ingestion errors, and DB backpressure."
+              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+
+  # A steady 50-ledger lag is below the threshold and must stay silent.
+  - interval: 1m
+    input_series:
+      - series: 'sorotrail_ingestion_lag_ledgers'
+        values: '50x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: IngestionLagHigh
+        exp_alerts: []
+
+  # ── IngestionErrorsBurst ──────────────────────────────────────────────
+  # A steady 6 errors/min = 0.1 errors/s; any non-zero sustained rate is
+  # above the threshold, and the 10m `for` fires the alert at 10m.
+  # (Prometheus humanize renders 0.1 as "100m" — that is the template's
+  # real output, so the expectation spells it that way.)
+  - interval: 1m
+    input_series:
+      - series: 'sorotrail_ingest_errors_total'
+        values: '0+6x60'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: IngestionErrorsBurst
+        exp_alerts:
+          - exp_labels:
+              alertname: IngestionErrorsBurst
+              severity: warning
+              component: ingester
+            exp_annotations:
+              summary: "SoroTrail ingestion errors detected"
+              description: "SoroTrail ingestion pass error rate is 100m errors/s for the last 10 minutes. Any sustained error rate means events are being dropped. Check RPC reachability, rate limiting, and database health."
+              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+
+  # ── RPCP99LatencyHigh ─────────────────────────────────────────────────
+  # All observations land in the (5s, 10s] bucket, so the P99 quantile
+  # interpolates to 9.95s — above the 5s threshold.
+  - interval: 1m
+    input_series:
+      - series: 'sorotrail_rpc_call_duration_seconds_bucket{le="5"}'
+        values: '0x60'
+      - series: 'sorotrail_rpc_call_duration_seconds_bucket{le="10"}'
+        values: '0+1x60'
+      - series: 'sorotrail_rpc_call_duration_seconds_bucket{le="+Inf"}'
+        values: '0+1x60'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: RPCP99LatencyHigh
+        exp_alerts:
+          - exp_labels:
+              alertname: RPCP99LatencyHigh
+              severity: warning
+              component: rpc
+            exp_annotations:
+              summary: "SoroTrail RPC P99 latency exceeds 5 seconds"
+              description: "Stellar RPC call P99 latency is 9.95s (threshold: 5 s). The default poll interval is 5 s, so the ingester cannot keep up. Check RPC provider status, network connectivity, and rate limiting."
+              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+      # Mostly-fast calls: half the observations sit in the (2s, 5s]
+      # bucket, which puts the P99 at 4.94s — below the threshold.
+  - interval: 1m
+    input_series:
+      - series: 'sorotrail_rpc_call_duration_seconds_bucket{le="2"}'
+        values: '0+1x60'
+      - series: 'sorotrail_rpc_call_duration_seconds_bucket{le="5"}'
+        values: '0+1x60'
+      - series: 'sorotrail_rpc_call_duration_seconds_bucket{le="+Inf"}'
+        values: '0+2x60'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: RPCP99LatencyHigh
+        exp_alerts: []
+
+  # ── StoreWriteLatencyHigh ─────────────────────────────────────────────
+  # All observations land in the (5s, 15s] bucket, so the P99 quantile
+  # interpolates to 14.9s — above the 10s threshold.
+  - interval: 1m
+    input_series:
+      - series: 'sorotrail_db_write_duration_seconds_bucket{le="5"}'
+        values: '0x60'
+      - series: 'sorotrail_db_write_duration_seconds_bucket{le="15"}'
+        values: '0+1x60'
+      - series: 'sorotrail_db_write_duration_seconds_bucket{le="+Inf"}'
+        values: '0+1x60'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: StoreWriteLatencyHigh
+        exp_alerts:
+          - exp_labels:
+              alertname: StoreWriteLatencyHigh
+              severity: warning
+              component: store
+            exp_annotations:
+              summary: "SoroTrail DB write P99 latency exceeds 10 seconds"
+              description: "Database write P99 latency is 14.9s (threshold: 10 s). Postgres may be saturated. Check connection pool, disk I/O, locks, and vacuum status. The adaptive batch controller is likely throttling — check sorotrail_event_batch_size."
+              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+
+  # ── BackpressureActive ────────────────────────────────────────────────
+  # A steady 6 throttle sleeps/min = 0.1/s; the 15m `for` makes the alert
+  # fire at 15m, so evaluate well past that.
+  - interval: 1m
+    input_series:
+      - series: 'sorotrail_event_backpressure_total'
+        values: '0+6x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BackpressureActive
+        exp_alerts:
+          - exp_labels:
+              alertname: BackpressureActive
+              severity: warning
+              component: ingester
+            exp_annotations:
+              summary: "SoroTrail backpressure sustained for 15+ minutes"
+              description: "The event write backpressure has been active for 15+ minutes at 100m/s. The DB cannot absorb the ingester's write rate. Check DB health, batch size, and write latency."
+              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+
+  # ── EventBatchSizeCritical ────────────────────────────────────────────
+  # The adaptive batch controller has scaled down to 3 and stays there
+  # for the whole 10m `for` window.
+  - interval: 1m
+    input_series:
+      - series: 'sorotrail_event_batch_size'
+        values: '500x5 3x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: EventBatchSizeCritical
+        exp_alerts:
+          - exp_labels:
+              alertname: EventBatchSizeCritical
+              severity: critical
+              component: ingester
+            exp_annotations:
+              summary: "SoroTrail event batch size below 10 — ingestion nearly stalled"
+              description: "The adaptive batch size is 3 (threshold: < 10). The DB is severely strained and ingestion throughput is near zero. Check DB write latency and Postgres health immediately."
+              runbook_url: "https://github.com/sorotrail/sorotrail/blob/main/README.md#operational-monitoring"
+
+  # ── Recording rules ───────────────────────────────────────────────────
+  # 60 events/min = 1/s and 6 errors/min = 0.1/s; assert the recorded
+  # values so a broken aggregation fails here, not on a dashboard.
+  - interval: 1m
+    input_series:
+      - series: 'sorotrail_events_ingested_total'
+        values: '0+60x20'
+      - series: 'sorotrail_ingest_errors_total'
+        values: '0+6x20'
+    promql_expr_test:
+      - expr: sorotrail:events_ingested:rate5m
+        eval_time: 6m
+        exp_samples:
+          - labels: 'sorotrail:events_ingested:rate5m'
+            value: 1
+      - expr: sorotrail:ingest_errors:rate5m
+        eval_time: 6m
+        exp_samples:
+          - labels: 'sorotrail:ingest_errors:rate5m'
+            value: 0.1
