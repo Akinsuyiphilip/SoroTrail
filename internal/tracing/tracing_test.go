@@ -2,14 +2,14 @@ package tracing
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
-
 	"go.opentelemetry.io/otel"
-	"log/slog"
+
 	"github.com/sorotrail/sorotrail/internal/tracing/tracingtest"
 )
 
