@@ -782,6 +782,8 @@ It is batched, resumable (Ctrl-C and re-run picks up where it stopped),
 idempotent, and safe to run against a live database while ingestion
 continues; a Postgres advisory lock prevents two replays at once.
 
+For the full documentation index, see [docs/README.md](docs/README.md).
+See [docs/replay.md](docs/replay.md) for flags, the summary output, the
 See [docs/replay.md](docs/replay.md) for the end-to-end workflow — sizing
 the job, dry-running it, spot-checking a single event, running it in chunks,
 and verifying the result — plus the flag reference, the summary output, the

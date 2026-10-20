@@ -18,6 +18,23 @@ For security issues, see [SECURITY.md](SECURITY.md).
 
 1. Go 1.25+ (any Go ≥ 1.21 works too — the go toolchain auto-downloads the
    version pinned in go.mod) and Docker.
+2. `docker compose up -d postgres` for a local database.
+3. `make test` for the unit suite; `make test-db` runs everything including
+   the Postgres integration tests (they use `TEST_DATABASE_URL` and skip
+   themselves when it's unset).
+4. `make cover` runs the test suite with coverage and prints a per-package
+   summary; `make cover-html` opens the HTML report in your browser.
+5. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
+6. `make check-monitoring` validates the Prometheus rules and the Grafana
+   dashboard the way CI does (needs [promtool](https://prometheus.io/download/)
+   and python3; no running Prometheus required) — run it when you touch
+   anything under `deploy/`.
+
+The integration tests truncate the tables they use — point
+`TEST_DATABASE_URL` at a throwaway database, not one with data you care
+about. `internal/store` and `internal/replay` share those tables, so the
+database suite runs with `go test -p 1` (already the case in `make test-db`
+and CI); don't drop that flag.
 2. Run `make help` to see every available target.
 3. `make docker-up` is the quickest route to a local Postgres (starts
    Postgres and the indexer via `docker compose up -d --build`). Alternatively,
