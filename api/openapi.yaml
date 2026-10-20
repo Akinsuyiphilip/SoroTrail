@@ -4346,6 +4346,26 @@ components:
             type: integer
             minimum: 1
             examples: [1]
+        X-RateLimit-Limit:
+          description: The caller's configured burst capacity.
+          schema:
+            type: integer
+            minimum: 1
+            examples: [20]
+        X-RateLimit-Remaining:
+          description: The caller's remaining request budget; always 0 on a 429.
+          schema:
+            type: integer
+            minimum: 0
+            examples: [0]
+        X-RateLimit-Reset:
+          description: >-
+            Unix timestamp in seconds when the next request token is expected
+            to become available, or the quota window resets.
+          schema:
+            type: integer
+            format: int64
+            examples: [1792512000]
       content:
         application/json:
           schema:
