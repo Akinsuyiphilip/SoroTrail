@@ -253,10 +253,6 @@ func (p *Postgres) PruneEventsBefore(ctx context.Context, cutoff time.Time) (int
 // relies on that).
 func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 	batch := &pgx.Batch{}
-	conflict := "ON CONFLICT DO NOTHING"
-	if onUpdate {
-		conflict = `
-		ON CONFLICT (ledger, id) DO UPDATE SET
 	conflict := `ON CONFLICT (network, ledger, id) DO NOTHING`
 	if onUpdate {
 		conflict = `ON CONFLICT (network, ledger, id) DO UPDATE SET
@@ -270,8 +266,6 @@ func insertEventsBatch(events []Event, onUpdate bool) *pgx.Batch {
 			topics             = EXCLUDED.topics,
 			value              = EXCLUDED.value,
 			created_at         = EXCLUDED.created_at,
-			topics_xdr         = coalesce(EXCLUDED.topics_xdr, events.topics_xdr),
-			value_xdr          = coalesce(EXCLUDED.value_xdr, events.value_xdr)`
 			raw_topic_xdr      = COALESCE(EXCLUDED.raw_topic_xdr, events.raw_topic_xdr),
 			raw_value_xdr      = COALESCE(EXCLUDED.raw_value_xdr, events.raw_value_xdr)`
 	}
