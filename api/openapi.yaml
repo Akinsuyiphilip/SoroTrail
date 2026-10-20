@@ -1114,6 +1114,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
     post:
       operationId: createAPIKey
       summary: Create an API key
@@ -1167,6 +1169,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /apikeys/{id}:
     delete:
       operationId: revokeAPIKey
@@ -1204,6 +1208,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /contracts:
     get:
       operationId: listContracts
@@ -1272,6 +1278,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /livez:
     get:
       operationId: livez
@@ -1758,6 +1766,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /contracts/{id}/stats:
     get:
       operationId: contractStats
@@ -1974,6 +1984,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     get:
       operationId: getContractSpecOverride
       summary: Get a contract spec override
@@ -2015,6 +2027,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       operationId: deleteContractSpecOverride
       summary: Delete a contract spec override
@@ -2054,6 +2068,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /tenant:
     get:
       operationId: currentTenant
@@ -2215,7 +2231,10 @@ paths:
       operationId: removeTenantWatch
       summary: Remove a contract from the tenant's watch list
       description: >-
-        Removes a contract from the calling tenant's watch list.
+        Removes a contract from the calling tenant's watch list. Removing a
+        well-formed contract the tenant does not hold is a no-op that still
+        answers 200 with the unchanged list, so retries stay idempotent; only
+        a malformed contract_id is rejected with a 400.
       tags: [Operations]
       parameters:
         - name: contract_id
@@ -2238,6 +2257,8 @@ paths:
               example:
                 contract_ids:
                   - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -2536,6 +2557,12 @@ paths:
         The live broadcaster applies contract, event type, topic, ledger/time
         range and has-value filters; pagination and historical-only query
         parameters do not create a replay stream.
+
+        A handshake the websocket library refuses before the upgrade answers
+        with plain text rather than the JSON envelope: 426 when the request is
+        not an upgrade attempt at all (missing Connection/Upgrade headers, or
+        HTTP/1.0), 400 when it is an upgrade attempt with a malformed handshake
+        (unsupported protocol version, or a missing/invalid Sec-WebSocket-Key).
       tags: [Events]
       parameters:
         - $ref: "#/components/parameters/ContractID"
@@ -2555,6 +2582,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "426":
+          $ref: "#/components/responses/UpgradeRequired"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2603,6 +2632,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2734,6 +2765,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "429":
@@ -4267,6 +4300,20 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    UpgradeRequired:
+      description: >-
+        The websocket handshake was refused before the upgrade because the
+        request is not a valid upgrade attempt: HTTP/1.0, or the Connection
+        and Upgrade headers are missing or do not name `websocket`. Only
+        `/events/ws` can answer this, and — unlike every other error here —
+        the body is plain text written by the websocket library, not the JSON
+        envelope.
+      content:
+        text/plain:
+          schema:
+            type: string
+            examples:
+              - 'WebSocket protocol violation: Connection header "" does not contain Upgrade'
     TooManyRequests:
       description: |
         The caller exceeded its request quota, or asked to watch more

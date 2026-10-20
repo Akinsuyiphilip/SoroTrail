@@ -26,6 +26,30 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 	-ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Version=$VERSION -X github.com/sorotrail/sorotrail/internal/buildinfo.Commit=$COMMIT -X github.com/sorotrail/sorotrail/internal/buildinfo.BuildDate=$BUILD_DATE" \
 	-o /out/sorotrail ./cmd/sorotrail
 
+FROM alpine:3.24
+
+# OCI image metadata, so `docker inspect` reports where an image came from and
+# what went into it. The publish workflow also sets these keys through
+# docker/metadata-action; declaring them here means every build — compose, a
+# fork's CI, or a plain `docker build` — yields a self-describing image instead
+# of an anonymous one.
+#
+# The args are re-declared because an ARG belongs to the stage that declares it:
+# the values used to stamp the binary above are out of scope below the FROM. The
+# defaults keep an un-argumented build working instead of emitting empty labels,
+# and an image built that way honestly says "unknown" rather than inventing a
+# revision.
+ARG VERSION=unknown
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="sorotrail" \
+	org.opencontainers.image.description="Contract event indexer for Stellar/Soroban: stores events durably past the RPC's retention window and serves them over a JSON API." \
+	org.opencontainers.image.source="https://github.com/sorotrail/SoroTrail" \
+	org.opencontainers.image.revision="$COMMIT" \
+	org.opencontainers.image.version="$VERSION" \
+	org.opencontainers.image.created="$BUILD_DATE" \
+	org.opencontainers.image.licenses="Apache-2.0"
+
 # Runtime base, pinned by digest for the reason given at the top of the file.
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 RUN apk add --no-cache ca-certificates && adduser -D -u 10001 sorotrail

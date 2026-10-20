@@ -92,6 +92,7 @@ var scopeMethodsExpected = []string{
 	"CountEvents",
 	"EventExists",
 	"GetEvent",
+	"ListWatchedContractsScoped",
 	"QueryAddressEvents",
 	"QueryEvents",
 	"Stats",
@@ -421,6 +422,38 @@ func TestScopeEnforcement_Stats(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, int64(2), s.TotalEvents)
 			assert.Equal(t, int64(2), s.ContractCount)
+		}
+	})
+}
+
+// TestScopeEnforcement_ListWatchedContractsScoped covers ListWatchedContractsScoped
+// under all scope shapes (#1139).
+func TestScopeEnforcement_ListWatchedContractsScoped(t *testing.T) {
+	st := scopeStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractA, Network: "default"}))
+	require.NoError(t, st.AddWatchedContract(ctx, WatchedContract{ContractID: contractB, Network: "default"}))
+
+	t.Run("zero scope returns empty slice", func(t *testing.T) {
+		got, err := st.ListWatchedContractsScoped(ctx, Scope{})
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("contract scope returns only granted rows", func(t *testing.T) {
+		sc := NewScope([]string{contractA})
+		got, err := st.ListWatchedContractsScoped(ctx, sc)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, contractA, got[0].ContractID)
+	})
+
+	t.Run("wildcard scope returns everything", func(t *testing.T) {
+		for _, sc := range []Scope{WildcardScope(), SystemScope()} {
+			got, err := st.ListWatchedContractsScoped(ctx, sc)
+			require.NoError(t, err)
+			assert.Len(t, got, 2)
 		}
 	})
 }
