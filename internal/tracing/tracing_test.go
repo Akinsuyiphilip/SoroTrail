@@ -2,6 +2,7 @@ package tracing
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -10,6 +11,8 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"log/slog"
+	"go.opentelemetry.io/otel"
+
 	"github.com/sorotrail/sorotrail/internal/tracing/tracingtest"
 )
 
