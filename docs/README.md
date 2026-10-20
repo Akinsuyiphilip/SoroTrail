@@ -13,15 +13,24 @@ for operators and developers.
   and system topology.
 - [Multi-tenancy](multi-tenancy.md): Multi-tenant isolation model, tenant boundaries,
   contract grants, quotas, and accounting.
+- [ClickHouse Backend Support](clickhouse.md): Capability matrix for the optional
+  analytical backend, distinguishing implemented methods from refusals and silent
+  no-ops.
 
 ## Real-Time and Authentication APIs
 
+- [GraphQL API Guide](graphql.md): Read-only GraphQL endpoint (`/graphql`) and GraphiQL
+  playground, top-level query fields, Relay cursor pagination, depth/complexity limits,
+  filter parity with `GET /events`, and multi-tenant scope behavior.
 - [Live Subscriptions](subscriptions.md): Real-time event streaming over WebSocket,
   pub-sub broker architecture, at-most-once delivery semantics, backpressure handling,
   and the cursor catch-up pattern.
 - [API Keys and Scopes](api-keys.md): Key generation, storage hashing, startup
   bootstrap behavior, CLI management, scope enforcement, rotation procedures,
   and the PostgreSQL requirement.
+- [Contract Spec Overrides](spec-overrides.md): Uploading, inspecting, and deleting
+  user-supplied contract event specs (`PUT|GET|DELETE /contracts/{id}/spec`), JSON
+  schema validation, precedence over on-chain Wasm specs, and cache invalidation behavior.
 
 ## Ingestion, Backfill, and Replay
 

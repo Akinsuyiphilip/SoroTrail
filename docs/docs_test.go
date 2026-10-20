@@ -13,12 +13,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/store"
 )
 
 // readDoc loads a markdown file from this directory.
@@ -171,6 +174,7 @@ func TestRequiredSections(t *testing.T) {
 				"## RPC errors",
 				"## Database errors",
 				"## API errors",
+				"### A contract is watched but no events are ingested",
 				"## Replay errors",
 				"## First things to check",
 			},
@@ -184,6 +188,33 @@ func TestRequiredSections(t *testing.T) {
 				"### Request and ingest lifecycle",
 				"### Replay lifecycle",
 				"## Components",
+				"#### The watch list and its network dimension",
+			},
+		},
+		{
+			doc: "graphql.md",
+			headings: []string{
+				"## Enabling the endpoint and the playground",
+				"## Authentication",
+				"## Top-level query fields",
+				"## Pagination",
+				"## Limits: depth and complexity",
+				"## Filter parity with `GET /events`",
+				"## Multi-tenant behaviour by query field",
+				"## When to use GraphQL instead of REST",
+			},
+		},
+		{
+			doc: "spec-overrides.md",
+			headings: []string{
+				"## When an override is needed",
+				"## Authentication",
+				"## Endpoints",
+				"## Accepted JSON format",
+				"## Validation rules and error messages",
+				"## Wrapper vs. bare request body",
+				"## Precedence and contract upgrades",
+				"## Caching and propagation timing",
 			},
 		},
 	}
@@ -294,4 +325,109 @@ func TestTroubleshootingEntriesAreActionable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestClickHouseSupportMatrixMatchesStoreInterface keeps the ClickHouse
+// support matrix honest in both directions: every method it names must still
+// exist on store.Store, and every Store method must be named somewhere in the
+// matrix. The state column stays a human judgement, but adding a method to the
+// interface now fails CI until its ClickHouse behaviour is documented too.
+func TestClickHouseSupportMatrixMatchesStoreInterface(t *testing.T) {
+	doc := readDoc(t, "clickhouse.md")
+
+	// Scope the scan to the matrix section so examples and prose cannot
+	// satisfy the coverage check by accident.
+	_, section, ok := strings.Cut(doc, "## Support matrix")
+	require.True(t, ok, "clickhouse.md must have a ## Support matrix section")
+	if end := strings.Index(section, "\n## "); end >= 0 {
+		section = section[:end]
+	}
+
+	// Non-method identifiers are allowed in table cells; anything else
+	// backticked and capitalised is treated as a Store method name.
+	nonMethods := map[string]bool{
+		"ErrUnsupported": true,
+		"ErrNotFound":    true,
+	}
+
+	backtick := regexp.MustCompile("`([^`]+)`")
+	named := map[string]bool{}
+	for _, line := range strings.Split(section, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "|") {
+			continue
+		}
+		// The matrix layout is | Capability | Methods | State | Notes |,
+		// so only the Methods cell contributes method names. Restricting
+		// the scan here keeps SQL keywords and notes from being mistaken
+		// for interface methods.
+		cells := strings.Split(line, "|")
+		if len(cells) < 3 {
+			continue
+		}
+		methodCell := cells[2]
+		if strings.TrimSpace(methodCell) == "Methods" {
+			continue // header row
+		}
+		for _, m := range backtick.FindAllStringSubmatch(methodCell, -1) {
+			token := m[1]
+			if token == "" || nonMethods[token] {
+				continue
+			}
+			// Exported Go identifiers start uppercase; prose identifiers
+			// are not methods.
+			if token[0] < 'A' || token[0] > 'Z' {
+				continue
+			}
+			named[token] = true
+		}
+	}
+	require.NotEmpty(t, named, "the support matrix must name Store methods")
+
+	storeType := reflect.TypeOf((*store.Store)(nil)).Elem()
+	for name := range named {
+		_, ok := storeType.MethodByName(name)
+		assert.Truef(t, ok,
+			"clickhouse.md names %q as a Store method, but store.Store no longer has it", name)
+	}
+	for i := 0; i < storeType.NumMethod(); i++ {
+		name := storeType.Method(i).Name
+		assert.Truef(t, named[name],
+			"store.Store.%s is not named in the ClickHouse support matrix; document whether it is implemented, refuses, or silently does nothing", name)
+	}
+}
+
+// TestCommunityFiles guards the community-standard documents GitHub surfaces in
+// the contribution sidebar and the community-standards checklist. They live at
+// the repository root rather than in docs/, so the per-document checks above
+// cannot see them: a vanished code of conduct, a dropped link, or a reporting
+// contact that disappears would otherwise ship silently.
+func TestCommunityFiles(t *testing.T) {
+	rootFile := func(name string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join("..", name))
+		require.NoErrorf(t, err, "%s should exist at the repository root", name)
+		return string(b)
+	}
+
+	coc := rootFile("CODE_OF_CONDUCT.md")
+	assert.Contains(t, coc, "[Contributor Covenant]",
+		"CODE_OF_CONDUCT.md should keep the recognised Contributor Covenant text")
+	assert.Contains(t, coc, "reported to the SoroTrail maintainers",
+		"CODE_OF_CONDUCT.md must say who handles a report")
+	assert.Contains(t, coc, "@sorotrail.io",
+		"CODE_OF_CONDUCT.md must publish a real reporting contact")
+	assert.Regexpf(t, `within [0-9]+ (business )?(hour|day|week)`, coc,
+		"CODE_OF_CONDUCT.md must say how quickly a report is acknowledged")
+	// Vulnerability reports have their own channel in SECURITY.md; neither
+	// document should read as covering the other's reports.
+	assert.NotContains(t, strings.ToLower(coc), "vulnerabilit",
+		"CODE_OF_CONDUCT.md must not claim to cover vulnerability reports")
+
+	for _, name := range []string{"CONTRIBUTING.md", "README.md"} {
+		assert.Containsf(t, rootFile(name), "(CODE_OF_CONDUCT.md)",
+			"%s should link to CODE_OF_CONDUCT.md", name)
+	}
+	assert.Contains(t, rootFile("SECURITY.md"), "(CODE_OF_CONDUCT.md)",
+		"SECURITY.md should point conduct reports at the Code of Conduct")
 }

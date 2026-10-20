@@ -1620,6 +1620,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           }
         }
       },
@@ -1693,6 +1696,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           }
         }
       }
@@ -1742,6 +1748,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           }
         }
       }
@@ -1840,6 +1849,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           }
         }
       }
@@ -2620,6 +2632,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           }
         }
       }
@@ -2928,6 +2943,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       },
@@ -2993,6 +3011,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       },
@@ -3055,6 +3076,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       }
@@ -3290,7 +3314,7 @@
       "delete": {
         "operationId": "removeTenantWatch",
         "summary": "Remove a contract from the tenant's watch list",
-        "description": "Removes a contract from the calling tenant's watch list.",
+        "description": "Removes a contract from the calling tenant's watch list. Removing a well-formed contract the tenant does not hold is a no-op that still answers 200 with the unchanged list, so retries stay idempotent; only a malformed contract_id is rejected with a 400.",
         "tags": [
           "Operations"
         ],
@@ -3322,6 +3346,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -3753,7 +3780,7 @@
       "get": {
         "operationId": "eventStreamWS",
         "summary": "WebSocket live event stream",
-        "description": "Upgrades to a WebSocket connection that pushes ingested events as they\nare stored. The stream starts at \"now\" — no replay of historical events.\nThe live broadcaster applies contract, event type, topic, ledger/time\nrange and has-value filters; pagination and historical-only query\nparameters do not create a replay stream.\n",
+        "description": "Upgrades to a WebSocket connection that pushes ingested events as they\nare stored. The stream starts at \"now\" — no replay of historical events.\nThe live broadcaster applies contract, event type, topic, ledger/time\nrange and has-value filters; pagination and historical-only query\nparameters do not create a replay stream.\n\nA handshake the websocket library refuses before the upgrade answers\nwith plain text rather than the JSON envelope: 426 when the request is\nnot an upgrade attempt at all (missing Connection/Upgrade headers, or\nHTTP/1.0), 400 when it is an upgrade attempt with a malformed handshake\n(unsupported protocol version, or a missing/invalid Sec-WebSocket-Key).\n",
         "tags": [
           "Events"
         ],
@@ -3795,6 +3822,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "426": {
+            "$ref": "#/components/responses/UpgradeRequired"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -3863,6 +3893,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -4050,6 +4083,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -6170,6 +6206,19 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "UpgradeRequired": {
+        "description": "The websocket handshake was refused before the upgrade because the request is not a valid upgrade attempt: HTTP/1.0, or the Connection and Upgrade headers are missing or do not name `websocket`. Only `/events/ws` can answer this, and — unlike every other error here — the body is plain text written by the websocket library, not the JSON envelope.",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string",
+              "examples": [
+                "WebSocket protocol violation: Connection header \"\" does not contain Upgrade"
+              ]
             }
           }
         }
