@@ -34,6 +34,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/config"
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/ingester"
+	"github.com/sorotrail/sorotrail/internal/metrics"
 	"github.com/sorotrail/sorotrail/internal/pruner"
 	"github.com/sorotrail/sorotrail/internal/requestid"
 	"github.com/sorotrail/sorotrail/internal/rpc"
@@ -392,10 +393,49 @@ func runService(dryRun bool) error {
 	// the wasm-hash resolver so contract upgrades (a changed hash)
 	// invalidate the previously cached spec automatically.
 	specFetcher := spec.NewFetcher(rpcClient)
-	specCache := spec.NewCache(st,
+	cacheOpts := []spec.Option{
 		spec.WithWasmHashResolver(specFetcher),
-	)
+		spec.WithLogger(log),
+	}
+	// The spec cache is per-process, so a change that alters what a
+	// contract decodes to has to be published for the other replicas to
+	// pick up. Postgres is the shared dependency; the SQLite and
+	// ClickHouse deployments run single-process and keep working without
+	// it.
+	if pg != nil {
+		cacheOpts = append(cacheOpts, spec.WithInvalidationPublisher(pg))
+	}
+	specCache := spec.NewCache(st, cacheOpts...)
 	specEnricher := spec.NewEnricher(specFetcher, specCache, log, st)
+
+	// Subscribe to the invalidation channel: every replica evicts a
+	// contract's cached spec when another replica changes it. Without
+	// this, an override written through one replica is not seen by the
+	// others until their own cache expires, so the same request decodes
+	// differently depending on which replica served it.
+	if pg != nil {
+		listener := &store.SpecInvalidationListener{
+			DatabaseURL: cfg.DatabaseURL,
+			Logger:      log,
+			OnInvalidation: func(contractID string) {
+				specCache.ApplyRemoteInvalidation(contractID)
+				metrics.SpecInvalidationsReceived.Inc()
+				log.Debug("applied a spec cache invalidation from another replica",
+					"contract_id", contractID)
+			},
+			OnReconnect: func() {
+				// A reconnect may have missed notifications, so nothing
+				// the cache holds can be trusted.
+				specCache.Clear()
+				log.Info("cleared the spec cache after reconnecting to the invalidation channel")
+			},
+		}
+		go func() {
+			if err := listener.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("spec invalidation listener stopped", "error", err)
+			}
+		}()
+	}
 
 	// Wrap the raw RPC client so per-method error totals are tracked and
 	// surfaced via /stats. specFetcher already holds a reference to the
@@ -601,6 +641,12 @@ func runService(dryRun bool) error {
 	api.SetMaxLimit(cfg.APIMaxLimit)
 
 	apiServer := api.New(apiStore, countingClient, log, cfg.APIKey, specEnricher).WithBroadcaster(bcast)
+	// A spec override written here changes what a contract decodes to, so
+	// the other replicas have to be told — otherwise they keep serving the
+	// old spec until their own cache expires.
+	if pg != nil {
+		apiServer.SetSpecInvalidationPublisher(pg)
+	}
 	apiServer.SetStatsTTL(cfg.StatsCacheTTL)
 	apiServer.SetRateLimiter(limiter)
 	if cfg.APIKeyAuthEnabled {

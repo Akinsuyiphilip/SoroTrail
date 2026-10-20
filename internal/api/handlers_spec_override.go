@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -112,6 +113,7 @@ func (s *Server) handlePutContractSpecOverride(w http.ResponseWriter, r *http.Re
 	// The cached override would otherwise keep decoding events the old way
 	// for the life of the process: an override never expires on its own.
 	s.invalidateSpecContract(contractID)
+	s.publishSpecInvalidation(r.Context(), contractID)
 
 	// A write whose result depends on operator state must never be cached.
 	writeCacheHeaders(w, cacheNoStore, 0, "")
@@ -169,6 +171,7 @@ func (s *Server) handleDeleteContractSpecOverride(w http.ResponseWriter, r *http
 	}
 
 	s.invalidateSpecContract(contractID)
+	s.publishSpecInvalidation(r.Context(), contractID)
 
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, specOverrideDeleteResponse{ContractID: contractID, Deleted: true})
@@ -300,6 +303,7 @@ func (s *Server) handleRevertContractSpecOverride(w http.ResponseWriter, r *http
 	}
 
 	s.invalidateSpecContract(contractID)
+	s.publishSpecInvalidation(r.Context(), contractID)
 
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, specOverrideResponse{
@@ -339,4 +343,26 @@ func (s *Server) invalidateSpecContract(contractID string) {
 // assertion so the enricher stays an optional dependency.
 type SpecOverrideInvalidator interface {
 	InvalidateContract(contractID string)
+}
+
+// publishSpecInvalidation tells the other replicas that the contract's
+// cached spec must be evicted.
+//
+// The spec cache is per-process, so without this the replicas that did not
+// serve the write keep decoding the contract the old way until their own
+// cache expires — the same request would then decode differently depending
+// on which replica served it.
+func (s *Server) publishSpecInvalidation(ctx context.Context, contractID string) {
+	if s.specInvalidationPublisher == nil {
+		return
+	}
+	if err := s.specInvalidationPublisher.PublishSpecInvalidation(ctx, contractID); err != nil {
+		// The local cache is already correct; the other replicas fall back
+		// to their own expiry. It is logged rather than swallowed so the
+		// fan-out is observable when it breaks.
+		s.log.Warn("publishing the spec invalidation failed",
+			"contract_id", contractID,
+			"error", err,
+		)
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +74,13 @@ type Cache struct {
 	hashTTL  time.Duration
 	now      func() time.Time
 
+	// publisher tells the other replicas that a contract's cached spec
+	// changed. It is optional: a single-process deployment has nobody to
+	// tell.
+	publisher Invalidator
+	// log receives the cache's own diagnostics.
+	log *slog.Logger
+
 	mu     sync.Mutex
 	mem    map[string]*entry    // wasm_hash → spec entry
 	hashes map[string]hashEntry // contract_id → wasm hash mapping
@@ -82,6 +90,9 @@ type Cache struct {
 	fetches       atomic.Uint64
 	expiries      atomic.Uint64
 	invalidations atomic.Uint64
+	// invalidationsReceived counts the invalidations this process applied
+	// because another replica said so.
+	invalidationsReceived atomic.Uint64
 }
 
 // Option configures the cache.
@@ -186,14 +197,22 @@ func (c *Cache) GetForContract(ctx context.Context, contractID string) *Contract
 			return nil
 		}
 		c.mu.Lock()
+		upgraded := false
 		if known && he.hash != current {
 			// Contract upgrade: the wasm hash changed, so the old
 			// spec can no longer describe this contract's events.
 			delete(c.mem, he.hash)
 			c.invalidations.Add(1)
+			upgraded = true
 		}
 		c.hashes[contractID] = hashEntry{hash: current, checked: c.now()}
 		c.mu.Unlock()
+		if upgraded {
+			// The other replicas hold the old spec too, so they have to be
+			// told: otherwise the same request decodes differently depending
+			// on which replica served it.
+			c.publishInvalidation(ctx, contractID)
+		}
 		he = hashEntry{hash: current}
 	}
 

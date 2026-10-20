@@ -187,6 +187,11 @@ type Server struct {
 
 	httpRequestBodyLimit int64 // max accepted request body size, in bytes
 
+	// specInvalidationPublisher tells the other replicas that a contract's
+	// cached spec must be evicted after a write. Optional: a single-process
+	// deployment has nobody to tell.
+	specInvalidationPublisher SpecInvalidationPublisher
+
 	// GraphQL transport, injected by main after the server is built.
 	// internal/api/graphql imports this package for its ServerDeps, so
 	// the dependency has to run in this direction to avoid an import
@@ -234,6 +239,25 @@ type Server struct {
 // SetHTTPRequestBodyLimit sets the request body size limit, in bytes, for all handlers accepting a body.
 func (s *Server) SetHTTPRequestBodyLimit(n int64) {
 	s.httpRequestBodyLimit = n
+}
+
+// SpecInvalidationPublisher tells the other replicas that a contract's
+// cached spec must be evicted.
+//
+// The spec package declares the same shape, so a cache and an API server
+// can share one implementation without either depending on the other.
+type SpecInvalidationPublisher interface {
+	PublishSpecInvalidation(ctx context.Context, contractID string) error
+}
+
+// SetSpecInvalidationPublisher wires the publisher used after a write that
+// changes what a contract decodes to.
+//
+// Without it the other replicas keep serving the old spec until their own
+// cache expires, so the same request decodes differently depending on which
+// replica served it. A single-process deployment leaves it unset.
+func (s *Server) SetSpecInvalidationPublisher(pub SpecInvalidationPublisher) {
+	s.specInvalidationPublisher = pub
 }
 
 // SetCompressMinSize overrides the body size at which responses are

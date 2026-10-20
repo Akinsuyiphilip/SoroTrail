@@ -118,6 +118,13 @@ var metricCatalogue = []metricSpec{
 		Meaning: "Chain head minus last ingested ledger, updated after every ingestion pass that knows the chain head. The direct alert for a stalled pipeline: anything above zero for a sustained window means ingestion is falling behind.",
 	},
 
+	// --- Spec cache ---
+	{
+		Name: "sorotrail_spec_invalidations_received_total", Scope: scopeGlobal, Kind: "counter",
+		Help:    "Total number of spec cache invalidations received from other replicas.",
+		Meaning: "Spec-cache invalidations this process applied because another replica said the contract's decoded shape changed. A non-zero value proves the cross-replica fan-out is working; a replica that never invalidates anything while its peers change specs is serving stale decodes. Stays at zero on a single-replica deployment, where there is nobody to hear from.",
+	},
+
 	// --- RPC ---
 	{
 		Name: "sorotrail_rpc_call_duration_seconds", Scope: scopeGlobal, Kind: "histogram",

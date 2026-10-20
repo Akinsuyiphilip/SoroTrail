@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -244,4 +246,75 @@ func TestSpecOverrideHistory_RequiresTheManagementKey(t *testing.T) {
 		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
 			"%s %s must be gated: %s", tc.method, tc.path, body)
 	}
+}
+
+// recordingInvalidationPublisher captures the contract IDs the API publishes
+// for the other replicas to evict.
+type recordingInvalidationPublisher struct {
+	mu        sync.Mutex
+	published []string
+}
+
+func (p *recordingInvalidationPublisher) PublishSpecInvalidation(_ context.Context, contractID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.published = append(p.published, contractID)
+	return nil
+}
+
+func (p *recordingInvalidationPublisher) list() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.published...)
+}
+
+func (p *recordingInvalidationPublisher) reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.published = nil
+}
+
+// TestPutContractSpecOverride_PublishesInvalidation proves a write that
+// changes what a contract decodes to is published for the other replicas.
+//
+// The spec cache is per-process, so without this the replicas that did not
+// serve the write keep serving the old spec until their own cache expires.
+func TestPutContractSpecOverride_PublishesInvalidation(t *testing.T) {
+	st := &stubStore{}
+	srv := newTestServer(st, nil)
+	publisher := &recordingInvalidationPublisher{}
+	srv.SetSpecInvalidationPublisher(publisher)
+
+	resp, body := putOverride(t, srv, specOverrideBody)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body: %s", body)
+	assert.Equal(t, []string{testContract}, publisher.list(),
+		"the write must be published for the other replicas")
+}
+
+// TestDeleteContractSpecOverride_PublishesInvalidation proves a delete is
+// published too: the other replicas hold the override as well.
+func TestDeleteContractSpecOverride_PublishesInvalidation(t *testing.T) {
+	st := &stubStore{}
+	srv := newTestServer(st, nil)
+	publisher := &recordingInvalidationPublisher{}
+	srv.SetSpecInvalidationPublisher(publisher)
+
+	_, _ = putOverride(t, srv, specOverrideBody)
+	publisher.reset()
+
+	resp, body := doReq(t, srv, http.MethodDelete, "/contracts/"+testContract+"/spec", "",
+		map[string]string{"X-Api-Key": "test-key"})
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body: %s", body)
+	assert.Equal(t, []string{testContract}, publisher.list(),
+		"the delete must be published for the other replicas")
+}
+
+// TestSpecOverrideWithoutAPublisherStillWorks proves a single-process
+// deployment — no publisher wired — keeps working.
+func TestSpecOverrideWithoutAPublisherStillWorks(t *testing.T) {
+	st := &stubStore{}
+	srv := newTestServer(st, nil)
+
+	resp, body := putOverride(t, srv, specOverrideBody)
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "body: %s", body)
 }
