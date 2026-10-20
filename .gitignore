@@ -7,3 +7,7 @@ coverage.out
 .vscode/
 .claude/settings.local.json
 /sorotrail
+/pr_summary.md
+/lint_log.txt
+/patch_ingester.py
+/docs-issue-*.md
