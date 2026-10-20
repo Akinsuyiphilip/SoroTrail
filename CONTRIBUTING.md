@@ -60,6 +60,7 @@ and CI); don't drop that flag.
    compatibility with the previous workflow.
 7. `make cover` / `make cover-html` for coverage.
 8. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
+9. `make lint-fix` runs golangci-lint run --fix and applies the fixes in place.
 
 The full, copy-pasteable setup and testing walkthrough lives in
 [`docs/local-setup.md`](docs/local-setup.md).

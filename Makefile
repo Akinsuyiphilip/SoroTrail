@@ -76,6 +76,16 @@ vet: ## Run go vet on all packages
 vet-integration: ## Vet integration-tagged code too
 	go vet -tags=integration ./...
 
+# Auto-fix golangci-lint findings that can be resolved without human
+#
+# judgement (mostly goimports reorderings): writes the fixed files in
+# place, then re-runs the linter so a contributor can see the result.
+# `make lint-fix` does not exit 0 when files were changed; run it, then
+# `make lint` on the updated tree.
+
+lint-fix: ## Run golangci-lint run --fix and apply the fixes
+	golangci-lint run --fix
+
 # The guard runs first so a go.mod that outran the pinned linter fails with the
 # fix spelled out, instead of golangci-lint's "lower than the targeted Go
 # version" error. See CONTRIBUTING.md#lint-toolchain-drift.

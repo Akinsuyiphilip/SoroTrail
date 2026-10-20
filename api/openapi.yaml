@@ -3006,16 +3006,16 @@ components:
         a caller asking for more than it may have finds out instead of
         silently receiving a short page and assuming it reached the end.
 
-        The ceiling is 500. An operator can lower it with the API_MAX_LIMIT
-        environment variable, so a deployment may reject a value this schema
-        permits; the store never returns more than 500 rows in one page
-        regardless.
+        The maximum is configurable at deploy time: API_MAX_LIMIT lowers the
+        ceiling to whatever the operator sets, and the store never returns
+        more than 500 rows in one page regardless.
       schema:
         type: integer
         minimum: 1
         maximum: 500
         default: 50
       example: 100
+      default: 50
     ContractsLimit:
       name: limit
       in: query
