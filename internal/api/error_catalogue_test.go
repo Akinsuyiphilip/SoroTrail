@@ -145,7 +145,6 @@ var errorCatalogue = []errorCondition{
 	{File: "export.go", Func: "Server.handleContractExport", Status: 400, Arg: `fmt.Errorf("to_ledger %s", err.Error())`, Message: "to_ledger <detail>", Condition: "the export's to_ledger bound is not a positive integer"},
 	{File: "export.go", Func: "Server.handleEventsCSV", Status: 400, Arg: `err`, Message: "invalid format %q (want csv or ndjson)", Condition: "the CSV export's format parameter names something other than csv or ndjson"},
 	// --- handlers.go ---
-	{File: "handlers.go", Func: "Server.handleAddWatchedChain", Status: 400, Arg: `err`, Message: "request body is empty; request body exceeds 4096 bytes; invalid JSON body: <json error>; invalid JSON body: unexpected data after the JSON value; reading request body: <io error>", Condition: "POST /watched-contracts cannot decode its JSON body (the decodeJSONBody family)"},
 	{File: "handlers.go", Func: "Server.handleAddWatchedChain", Status: 400, Arg: `errors.New( "adding the first watched contract would switch ingestion from "+ "'all contract events' to a specific list — pass ?confirm=true to acknowledge")`, Message: "adding the first watched contract would switch ingestion from 'all contract events' to a specific list — pass ?confirm=true to acknowledge", Condition: "the first watch would silently narrow ingestion from all contracts to a list, and the caller did not pass ?confirm=true"},
 	{File: "handlers.go", Func: "Server.handleAddWatchedChain", Status: 400, Arg: `fmt.Errorf("invalid contract_id %q (want 56-char C... strkey)", req.ContractID)`, Message: "invalid contract_id %q (want 56-char C... strkey)", Condition: "the body's contract_id is not a strkey"},
 	{File: "handlers.go", Func: "Server.handleAddWatchedChain", Status: 500, Arg: `errors.New("adding watched contract failed")`, Message: "adding watched contract failed", Condition: "the store fails while adding the contract to the watch list"},
@@ -202,6 +201,13 @@ var errorCatalogue = []errorCondition{
 	{File: "handlers.go", Func: "Server.serveEvents", Status: 500, Arg: `errors.New("querying events failed")`, Message: "querying events failed", Condition: "the store fails while querying a page of events"},
 	{File: "handlers.go", Func: "writeFilterError", Status: 400, Arg: `err`, Message: "event-filter validation message (see \"Event-filter validation messages\" below)", Condition: "a list-shaped endpoint rejects a malformed query (shared filter validation); the forbidden-contract case is split out to 403 by the same helper"},
 	{File: "handlers.go", Func: "writeForbiddenContract", Status: 403, Arg: `errForbiddenContract{contractID: contractID}`, Message: "contract %s is not granted to this tenant", Condition: "the caller named a contract outside its grants — 403, not 404, because contract IDs are public and hiding an existing contract behind 404 would send operators debugging missing grants as missing data"},
+	// decodeJSONBody is the shared request-body decoder. Its two captured
+	// writeError sites (400 for a malformed/empty/trailing body, 413 for an
+	// oversized body) can surface on every body-accepting route, so both
+	// entries are SpecExempt + AnyNonProbe and are checked as status sets
+	// rather than per route.
+	{File: "handlers.go", Func: "Server.decodeJSONBody", Status: 400, Arg: `err`, Count: 2, Message: "request body is empty; invalid JSON body: <json error>; invalid JSON body: unexpected data after the JSON value; reading request body: <io error>", Condition: "the shared request-body decoder rejects a malformed, empty, or trailing-data body", SpecExempt: true, AnyNonProbe: true},
+	{File: "handlers.go", Func: "Server.decodeJSONBody", Status: 413, Arg: `err`, Message: "request body exceeds <limit> bytes", Condition: "the shared request-body decoder rejects an oversized body", SpecExempt: true, AnyNonProbe: true},
 	// --- handlers_contracts.go ---
 	{File: "handlers_contracts.go", Func: "Server.handleContractStats", Status: 400, Arg: `fmt.Errorf("invalid contract ID %q", contractID)`, Message: "invalid contract ID %q", Condition: "the {id} path segment is not a strkey"},
 	{File: "handlers_contracts.go", Func: "Server.handleContractStats", Status: 404, Arg: `fmt.Errorf("contract %q not found", contractID)`, Message: "contract %q not found", Condition: "the contract has no indexed events"},
@@ -214,6 +220,7 @@ var errorCatalogue = []errorCondition{
 	// --- handlers_spec_override.go ---
 	{File: "handlers_spec_override.go", Func: "Server.handleDeleteContractSpecOverride", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the {id} path segment is not a strkey"},
 	{File: "handlers_spec_override.go", Func: "Server.handleDeleteContractSpecOverride", Status: 500, Arg: `errors.New("deleting contract spec override failed")`, Message: "deleting contract spec override failed", Condition: "the store fails while deleting the override"},
+	{File: "handlers_spec_override.go", Func: "Server.handleDeleteContractSpecOverride", Status: 501, Arg: `err`, Message: "operation not supported by this store backend", Condition: "the store backend does not implement contract spec overrides (ErrUnsupported)"},
 	{File: "handlers_spec_override.go", Func: "Server.handleGetContractSpecOverride", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the {id} path segment is not a strkey"},
 	{File: "handlers_spec_override.go", Func: "Server.handleGetContractSpecOverride", Status: 404, Arg: `fmt.Errorf("no spec override for contract %q", contractID)`, Message: "no spec override for contract %q", Condition: "no override was ever stored for this contract"},
 	{File: "handlers_spec_override.go", Func: "Server.handleGetContractSpecOverride", Status: 500, Arg: `errors.New("loading contract spec override failed")`, Message: "loading contract spec override failed", Condition: "the store fails while loading the override"},
@@ -222,11 +229,22 @@ var errorCatalogue = []errorCondition{
 	{File: "handlers_spec_override.go", Func: "Server.handlePutContractSpecOverride", Status: 400, Arg: `fmt.Errorf("invalid JSON body: %w", err)`, Message: "invalid JSON body: <json error>", Condition: "neither wrapped nor bare body could be decoded as JSON"},
 	{File: "handlers_spec_override.go", Func: "Server.handlePutContractSpecOverride", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the {id} path segment is not a strkey"},
 	{File: "handlers_spec_override.go", Func: "Server.handlePutContractSpecOverride", Status: 500, Arg: `errors.New("saving contract spec override failed")`, Message: "saving contract spec override failed", Condition: "the store fails while persisting the override"},
+	{File: "handlers_spec_override.go", Func: "Server.handlePutContractSpecOverride", Status: 501, Arg: `err`, Message: "operation not supported by this store backend", Condition: "the store backend does not implement contract spec overrides (ErrUnsupported)"},
+	{File: "handlers_spec_override.go", Func: "Server.handleListContractSpecOverrideHistory", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the {id} path segment is not a strkey"},
+	{File: "handlers_spec_override.go", Func: "Server.handleListContractSpecOverrideHistory", Status: 400, Arg: `fmt.Errorf("limit must be an integer in [1,%d]", maxLimit)`, Message: "limit must be an integer in [1,%d]", Condition: "the history page size is outside [1, limit]"},
+	{File: "handlers_spec_override.go", Func: "Server.handleListContractSpecOverrideHistory", Status: 400, Arg: `err`, Message: "spec override history cursor is not valid base64url; spec override history cursor is not a version id", Condition: "the ?cursor= is not a cursor this endpoint produced"},
+	{File: "handlers_spec_override.go", Func: "Server.handleListContractSpecOverrideHistory", Status: 500, Arg: `errors.New("listing contract spec override history failed")`, Message: "listing contract spec override history failed", Condition: "the store fails while listing the override history"},
+	{File: "handlers_spec_override.go", Func: "Server.handleListContractSpecOverrideHistory", Status: 501, Arg: `err`, Message: "operation not supported by this store backend", Condition: "the store backend does not implement the override history (ErrUnsupported)"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 400, Arg: `fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", contractID)`, Message: "invalid contract id %q (want 56-char C... strkey)", Condition: "the {id} path segment is not a strkey"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 400, Arg: `errors.New("version must be a positive integer")`, Message: "version must be a positive integer", Condition: "the body names no history version to restore"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 404, Arg: `fmt.Errorf("no spec override version %d for contract %q", versionID, contractID)`, Message: "no spec override version %d for contract %q", Condition: "the named version is not in the contract's override history"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 500, Arg: `errors.New("listing contract spec override history failed")`, Message: "listing contract spec override history failed", Condition: "the store fails while listing the override history to find the version to restore"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 500, Arg: `errors.New("reverting contract spec override failed")`, Message: "reverting contract spec override failed", Condition: "the store fails while writing the restored override"},
+	{File: "handlers_spec_override.go", Func: "Server.handleRevertContractSpecOverride", Status: 501, Arg: `err`, Count: 2, Message: "operation not supported by this store backend", Condition: "the store backend does not implement the override history (ErrUnsupported)"},
 
 	// --- handlers_subscription.go ---
 	{File: "handlers_subscription.go", Func: "Server.handleCreateSubscription", Status: 400, Arg: `errors.New("secret is required")`, Message: "secret is required", Condition: "the subscription is created without the HMAC signing secret"},
 	{File: "handlers_subscription.go", Func: "Server.handleCreateSubscription", Status: 400, Arg: `errors.New("url is required")`, Message: "url is required", Condition: "the subscription is created without a webhook URL"},
-	{File: "handlers_subscription.go", Func: "Server.handleCreateSubscription", Status: 400, Arg: `fmt.Errorf("invalid JSON: %w", err)`, Message: "invalid JSON: <json error>", Condition: "POST /subscriptions cannot decode its JSON body"},
 	{File: "handlers_subscription.go", Func: "Server.handleCreateSubscription", Status: 500, Arg: `errors.New("creating subscription failed")`, Message: "creating subscription failed", Condition: "the store fails while creating the subscription"},
 	{File: "handlers_subscription.go", Func: "Server.handleDeleteSubscription", Status: 400, Arg: `err`, Message: "subscription id must be a positive integer, got %q", Condition: "DELETE /subscriptions/{id} is given a path id that is not a positive integer"},
 	{File: "handlers_subscription.go", Func: "Server.handleDeleteSubscription", Status: 404, Arg: `fmt.Errorf("subscription %d not found", id)`, Message: "subscription %d not found", Condition: "the subscription does not exist or is not visible to the caller"},
@@ -241,7 +259,6 @@ var errorCatalogue = []errorCondition{
 	{File: "handlers_subscription.go", Func: "Server.handleListSubscriptions", Status: 500, Arg: `errors.New("listing subscriptions failed")`, Message: "listing subscriptions failed", Condition: "the store fails while listing subscriptions"},
 	{File: "handlers_subscription.go", Func: "Server.handleUpdateSubscription", Status: 400, Arg: `err`, Message: "subscription id must be a positive integer, got %q", Condition: "PUT /subscriptions/{id} is given a path id that is not a positive integer"},
 	{File: "handlers_subscription.go", Func: "Server.handleUpdateSubscription", Status: 400, Arg: `errors.New("url must not be empty")`, Message: "url must not be empty", Condition: "the update would empty the subscription's webhook URL"},
-	{File: "handlers_subscription.go", Func: "Server.handleUpdateSubscription", Status: 400, Arg: `fmt.Errorf("invalid JSON: %w", err)`, Message: "invalid JSON: <json error>", Condition: "PUT /subscriptions/{id} cannot decode its JSON body"},
 	{File: "handlers_subscription.go", Func: "Server.handleUpdateSubscription", Status: 404, Arg: `fmt.Errorf("subscription %d not found", id)`, Message: "subscription %d not found", Condition: "the subscription does not exist or is not visible to the caller"},
 	{File: "handlers_subscription.go", Func: "Server.handleUpdateSubscription", Status: 500, Arg: `errors.New("getting subscription failed")`, Message: "getting subscription failed", Condition: "the store fails while loading the subscription before the merge"},
 	{File: "handlers_subscription.go", Func: "Server.handleUpdateSubscription", Status: 500, Arg: `errors.New("updating subscription failed")`, Message: "updating subscription failed", Condition: "the store fails while persisting the merged subscription"},
@@ -277,7 +294,6 @@ var errorCatalogue = []errorCondition{
 	{File: "handlers_tenant.go", Func: "Server.writeOwnWatched", Status: 500, Arg: `errors.New("listing watched contracts failed")`, Message: "listing watched contracts failed", Condition: "the store fails while listing the tenant's own watch list (on a read after the mutation, so the mutation itself may have landed)"},
 	{File: "handlers_tenant.go", Func: "Server.writeUsage", Status: 400, Arg: `fmt.Errorf("days must be an integer in [1,%d]", maxUsageDays)`, Message: "days must be an integer in [1,%d]", Condition: "the usage window is outside [1, days]"},
 	{File: "handlers_tenant.go", Func: "Server.writeUsage", Status: 500, Arg: `errors.New("listing usage failed")`, Message: "listing usage failed", Condition: "the store fails while tallying usage"},
-	{File: "handlers_tenant.go", Func: "decodeJSON", Status: 400, Arg: `fmt.Errorf("invalid JSON body: %w", err)`, Message: "invalid JSON body: <json error>", Condition: "a tenant control-plane body cannot be decoded — including a body over the request-body cap, which surfaces as 'http: request body too large'"},
 	{File: "handlers_tenant.go", Func: "pathInt64", Status: 400, Arg: `fmt.Errorf("invalid %s %q", name, raw)`, Message: "invalid %s %q", Condition: "an admin path id ({id} or {key_id}) is not an integer"},
 
 	// --- middleware.go ---
@@ -341,14 +357,16 @@ var funcRoutes = map[string][]string{
 	"Server.handleEventStreamWS":  {"GET /events/ws"},
 
 	// Operator watch list, spec overrides, dead letters.
-	"Server.handleListWatchedChains":          {"GET /watched-contracts"},
-	"Server.handleAddWatchedChain":            {"POST /watched-contracts"},
-	"Server.handleRemoveWatchedChain":         {"DELETE /watched-contracts/{id}"},
-	"Server.handlePutContractSpecOverride":    {"PUT /contracts/{id}/spec"},
-	"Server.handleGetContractSpecOverride":    {"GET /contracts/{id}/spec"},
-	"Server.handleDeleteContractSpecOverride": {"DELETE /contracts/{id}/spec"},
-	"Server.handleListDeadLetters":            {"GET /dead-letters"},
-	"Server.handleDeleteDeadLetter":           {"DELETE /dead-letters/{id}"},
+	"Server.handleListWatchedChains":               {"GET /watched-contracts"},
+	"Server.handleAddWatchedChain":                 {"POST /watched-contracts"},
+	"Server.handleRemoveWatchedChain":              {"DELETE /watched-contracts/{id}"},
+	"Server.handlePutContractSpecOverride":         {"PUT /contracts/{id}/spec"},
+	"Server.handleGetContractSpecOverride":         {"GET /contracts/{id}/spec"},
+	"Server.handleDeleteContractSpecOverride":      {"DELETE /contracts/{id}/spec"},
+	"Server.handleListContractSpecOverrideHistory": {"GET /contracts/{id}/spec/history"},
+	"Server.handleRevertContractSpecOverride":      {"POST /contracts/{id}/spec/revert"},
+	"Server.handleListDeadLetters":                 {"GET /dead-letters"},
+	"Server.handleDeleteDeadLetter":                {"DELETE /dead-letters/{id}"},
 
 	// API keys and subscriptions (requireAPIKey / protect groups).
 	"Server.handleCreateAPIKey":       {"POST /apikeys"},
@@ -364,7 +382,7 @@ var funcRoutes = map[string][]string{
 	"Server.handleListDeliveries":     {"GET /subscriptions/{id}/deliveries"},
 
 	// Operator management (apiKeyAuth group): fail-closed 503 + 401.
-	"apiKeyAuth": {"DELETE /events", "GET /watched-contracts", "POST /watched-contracts", "DELETE /watched-contracts/{id}", "PUT /contracts/{id}/spec", "GET /contracts/{id}/spec", "DELETE /contracts/{id}/spec", "GET /dead-letters", "DELETE /dead-letters/{id}"},
+	"apiKeyAuth": {"DELETE /events", "GET /watched-contracts", "POST /watched-contracts", "DELETE /watched-contracts/{id}", "PUT /contracts/{id}/spec", "GET /contracts/{id}/spec", "DELETE /contracts/{id}/spec", "GET /contracts/{id}/spec/history", "POST /contracts/{id}/spec/revert", "GET /dead-letters", "DELETE /dead-letters/{id}"},
 
 	// Tenant self-service.
 	"Server.handleWhoAmI":           {"GET /tenant"},
@@ -396,7 +414,9 @@ var funcRoutes = map[string][]string{
 	// address a non-tenant id directly.
 	"pathInt64":          {"GET /admin/tenants/{id}", "PATCH /admin/tenants/{id}", "GET /admin/tenants/{id}/usage", "GET /admin/tenants/{id}/grants", "POST /admin/tenants/{id}/grants", "DELETE /admin/tenants/{id}/grants/{contract_id}", "GET /admin/tenants/{id}/keys", "POST /admin/tenants/{id}/keys", "DELETE /admin/tenants/{id}", "DELETE /admin/keys/{key_id}"},
 	"Server.writeGrants": {"GET /admin/tenants/{id}/grants", "POST /admin/tenants/{id}/grants", "DELETE /admin/tenants/{id}/grants/{contract_id}"},
-	"decodeJSON":         {"POST /admin/tenants", "PATCH /admin/tenants/{id}", "POST /admin/tenants/{id}/grants", "POST /admin/tenants/{id}/keys", "POST /tenant/watch"},
+	// decodeJSONBody is the shared request-body decoder; its 400/413
+	// rejections can surface on any body-accepting route.
+	"Server.decodeJSONBody": nil,
 
 	// Scrape endpoint.
 	"Server.router": {"GET /metrics"},

@@ -79,6 +79,12 @@ it is documented. Regenerate it with:
 | `sorotrail_event_backpressure_total` | counter | — | Total number of throttle sleeps inserted between event batch writes. | How many times the ingester deliberately slept between writes because the store fell behind the latency budget. Non-zero proves backpressure is firing; paired with sorotrail_event_backpressure_seconds_total it separates brief hesitations from sustained throttling. |
 | `sorotrail_event_backpressure_seconds_total` | counter | — | Total seconds spent throttling event writes under backpressure. | Cumulative sleep time under backpressure — the surge priced in seconds. A long tail here means the database was slow for a sustained stretch, not just a burst. |
 
+## Other pipeline metrics
+
+| Metric | Type | Labels | Help (as served) | Meaning |
+| --- | --- | --- | --- | --- |
+| `sorotrail_spec_invalidations_received_total` | counter | — | Total number of spec cache invalidations received from other replicas. | Spec-cache invalidations this process applied because another replica said the contract's decoded shape changed. A non-zero value proves the cross-replica fan-out is working; a replica that never invalidates anything while its peers change specs is serving stale decodes. Stays at zero on a single-replica deployment, where there is nobody to hear from. |
+
 ## HTTP metrics (per-server registry)
 
 | Metric | Type | Labels | Help (as served) | Meaning |

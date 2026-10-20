@@ -1109,6 +1109,23 @@ func (c *ClickHouse) DeleteContractSpecOverride(ctx context.Context, contractID 
 	return errUnsupported("clickhouse", "DeleteContractSpecOverride")
 }
 
+// The override history is not implemented on ClickHouse: the backend has no
+// contract_spec_overrides table to begin with, and the history's rows are
+// written in the same transaction as the override itself. Refusing
+// explicitly keeps the API's answer honest — a 501 naming the backend,
+// rather than a history that silently comes back empty.
+func (c *ClickHouse) SetContractSpecOverrideWithHistory(ctx context.Context, contractID string, specJSON []byte, apiKeyPrefix string) error {
+	return errUnsupported("clickhouse", "SetContractSpecOverrideWithHistory")
+}
+
+func (c *ClickHouse) DeleteContractSpecOverrideWithHistory(ctx context.Context, contractID string, apiKeyPrefix string) error {
+	return errUnsupported("clickhouse", "DeleteContractSpecOverrideWithHistory")
+}
+
+func (c *ClickHouse) ListContractSpecOverrideHistory(ctx context.Context, contractID string, limit int, cursor string) ([]ContractSpecOverrideVersion, string, error) {
+	return nil, "", errUnsupported("clickhouse", "ListContractSpecOverrideHistory")
+}
+
 // DeleteEventsBeforeLedger deletes every event strictly below beforeLedger.
 // ClickHouse's ALTER TABLE ... DELETE is an asynchronous mutation with no
 // synchronous "rows affected" result over the HTTP interface, so the

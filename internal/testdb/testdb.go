@@ -180,6 +180,7 @@ func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 		contract_meta,
 		contract_specs,
 		contract_spec_overrides,
+		contract_spec_override_history,
 		event_addresses,
 		token_balances,
 		token_balance_state,

@@ -40,45 +40,72 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
-// maxJSONBodyBytes caps a JSON request body decoded by decodeJSONBody.
-// Every body it serves is a small control-plane object, so anything larger
-// is a client error, not something to buffer.
-const maxJSONBodyBytes = 4 << 10
+// errBodyTooLarge marks an oversized request body so handlers can report
+// 413 instead of 400. readJSONBody wraps it when the body exceeds the
+// configured limit, and decodeJSONBody reports it as 413.
+var errBodyTooLarge = errors.New("request body exceeds the configured limit")
 
-// decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
-// unknown fields so a typo like {"contractID": "..."} doesn't fall
-// through with an empty contract_id and a confusing 400 from a later
-// check. On success dst is overwritten with the decoded value; on any
-// error it is left untouched. Error text never quotes the body's values.
-func decodeJSONBody(r *http.Request, dst any) error {
-	body, err := readJSONBody(r)
+// decodeJSONBody reads a single JSON request body into dst, enforcing the
+// server's configured request-body limit (s.httpRequestBodyLimit). On
+// success dst holds the decoded value and the method returns false. On
+// failure it writes 413 for an oversized body or 400 for malformed JSON,
+// unknown fields, trailing data, or an empty body — using the shared error
+// envelope — and returns true so the handler stops. dst is never left
+// half-populated: a failed decode publishes nothing, and error text never
+// quotes the body's values.
+//
+// Every handler that reads a JSON body goes through this method, so a
+// malformed request gets the same status and message no matter which route
+// serves it.
+func (s *Server) decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	body, err := readJSONBody(r, s.httpRequestBodyLimit)
 	if err != nil {
-		return err
+		if errors.Is(err, errBodyTooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, err)
+		} else {
+			writeError(w, http.StatusBadRequest, err)
+		}
+		return true
 	}
-	return decodeJSONBytes(body, dst)
+	if err := decodeJSONBytes(body, dst); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return true
+	}
+	return false
 }
 
-// readJSONBody reads the request body once, bounded by the same cap
-// decodeJSONBody applies. Handlers that must inspect the body more than
-// once (the spec-override PUT tries a wrapped and a bare shape) read it
-// here and decode from the returned bytes: r.Body is a stream, so every
-// reread would see an empty request.
-func readJSONBody(r *http.Request) ([]byte, error) {
+// readJSONBody reads the request body once, bounded by limit. Handlers that
+// must inspect the body more than once (the spec-override PUT tries a wrapped
+// and a bare shape) read it here and decode from the returned bytes: r.Body
+// is a stream, so every reread would see an empty request.
+func readJSONBody(r *http.Request, limit int64) ([]byte, error) {
 	// Server requests always carry a non-nil Body, so an absent body shows
 	// up as zero bytes below; the nil check covers hand-built requests.
 	if r.Body == nil {
 		return nil, errors.New("request body is empty")
 	}
 
-	// Read one byte past the cap so an oversized body is reported as too
-	// large instead of being truncated into a misleading "unexpected EOF".
-	// At most maxJSONBodyBytes+1 bytes are ever buffered.
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes+1))
+	var body []byte
+	var err error
+	if limit > 0 {
+		// Read one byte past the cap so an oversized body is reported as too
+		// large instead of being truncated into a misleading "unexpected EOF".
+		// At most limit+1 bytes are ever buffered. The body-limit middleware
+		// wraps r.Body in http.MaxBytesReader with the same limit, so its own
+		// "request body too large" error is normalized here too.
+		body, err = io.ReadAll(io.LimitReader(r.Body, limit+1))
+	} else {
+		body, err = io.ReadAll(r.Body)
+	}
 	if err != nil {
+		tooLarge := errors.Is(err, errBodyTooLarge) || strings.Contains(err.Error(), "request body too large")
+		if tooLarge {
+			return nil, fmt.Errorf("request body exceeds %d bytes: %w", limit, errBodyTooLarge)
+		}
 		return nil, fmt.Errorf("reading request body: %w", err)
 	}
-	if len(body) > maxJSONBodyBytes {
-		return nil, fmt.Errorf("request body exceeds %d bytes", maxJSONBodyBytes)
+	if limit > 0 && int64(len(body)) > limit {
+		return nil, fmt.Errorf("request body exceeds %d bytes: %w", limit, errBodyTooLarge)
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
 		return nil, errors.New("request body is empty")
@@ -1798,12 +1825,8 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	var req addWatchedRequest
 
-	if err := decodeJSONBody(r, &req); err != nil {
-
-		writeError(w, http.StatusBadRequest, err)
-
+	if s.decodeJSONBody(w, r, &req) {
 		return
-
 	}
 
 	if !config.ValidContractID(req.ContractID) {

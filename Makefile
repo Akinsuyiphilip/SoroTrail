@@ -14,7 +14,7 @@ LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Versio
 
 .PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean
 .PHONY: build build-all build-all-integration run test test-fast test-db test-integration vet vet-integration test-ci lint cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check docker-up docker-down simtest simtest-long clean bench bench-ci seed spec spec-check client ci
-.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean
+.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean loadtest
 
 # ── Self-documenting help ────────────────────────────────────────────────────
 # Every target that starts with a double-hash comment (##) is listed by
@@ -61,6 +61,10 @@ test-ci: ## Mirror the CI test job exactly (race-enabled, serial, 120s timeout)
 
 test-integration: ## Run the integration-tagged suite against a real Postgres
 	go test -tags=integration -p 1 ./... -count=1
+
+loadtest: ## Run a short synthetic load test against a database (requires DATABASE_URL)
+	@if [ -z "$(DATABASE_URL)" ]; then echo "DATABASE_URL is required (set it or pass --db)"; exit 1; fi
+	go run ./cmd/sorotrail loadtest --ledgers=200 --events-per-ledger=25 --duration=15s
 
 simtest: ## Run the deterministic simulation suite (mock store, fast)
 	go test ./internal/simtest/... -count=1 -timeout 120s
