@@ -888,6 +888,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -1027,6 +1030,9 @@
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -1295,6 +1301,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -1512,6 +1521,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -1687,6 +1699,9 @@
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -2953,6 +2968,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -3310,6 +3328,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -3500,6 +3521,9 @@
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -3909,6 +3933,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -4098,6 +4125,9 @@
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -6286,6 +6316,16 @@
             }
           }
         },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "RequestEntityTooLarge": {
+        "description": "The request body exceeds the instance's configured limit (HTTP_REQUEST_BODY_LIMIT). Reduce the body size and retry.",
         "content": {
           "application/json": {
             "schema": {

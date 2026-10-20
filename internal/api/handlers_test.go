@@ -431,9 +431,10 @@ func (c *countingReader) Read(p []byte) (int, error) {
 }
 
 // TestDecodeJSONBody pins the boundary every JSON request body crosses
-// first: the 4 KiB cap, the unknown-field policy, the empty-body message,
-// and that a rejected body neither half-populates dst nor echoes its
-// values back in the error.
+// first: the configured request-body limit, the unknown-field policy, the
+// empty-body message, and that a rejected body neither half-populates dst
+// nor echoes its values back in the error. The decoder reports 413 for an
+// oversized body and 400 for anything else it cannot decode.
 func TestDecodeJSONBody(t *testing.T) {
 	type target struct {
 		ContractID string   `json:"contract_id"`
@@ -444,88 +445,84 @@ func TestDecodeJSONBody(t *testing.T) {
 	// appear in an error, which handlers pass straight to writeError.
 	const secret = "sk_live_DO_NOT_ECHO"
 	sentinel := target{ContractID: "untouched"}
+	const limit = 4096
+
+	newServer := func() *Server { return &Server{httpRequestBodyLimit: limit} }
 
 	valid := `{"contract_id":"` + secret + `","limit":5,"tags":["a","b"]}`
 	padTo := func(s string, n int) string { return s + strings.Repeat(" ", n-len(s)) }
 
 	tests := []struct {
-		name    string
-		body    string
-		nilBody bool
-		want    target
-		wantErr string
+		name     string
+		body     string
+		nilBody  bool
+		want     target
+		wantCode int
+		wantErr  string
 	}{
-		{
-			name: "valid body decodes into the struct",
-			body: valid,
-			want: target{ContractID: secret, Limit: 5, Tags: []string{"a", "b"}},
-		},
-		{
-			// dst is replaced, not merged, so a field absent from the body
-			// cannot carry a stale value into the handler.
-			name: "fields absent from the body are zero, not carried over",
-			body: `{"limit":1}`,
-			want: target{Limit: 1},
-		},
-		{
-			name: "surrounding whitespace is allowed",
-			body: "\n\t " + valid + " \n",
-			want: target{ContractID: secret, Limit: 5, Tags: []string{"a", "b"}},
-		},
-		{
-			name: "body exactly at the limit is accepted",
-			body: padTo(`{"limit":7}`, maxJSONBodyBytes),
-			want: target{Limit: 7},
-		},
+		{name: "valid body decodes into the struct", body: valid, want: target{ContractID: secret, Limit: 5, Tags: []string{"a", "b"}}, wantCode: http.StatusOK},
+		{name: "fields absent from the body are zero, not carried over", body: `{"limit":1}`, want: target{Limit: 1}, wantCode: http.StatusOK},
+		{name: "surrounding whitespace is allowed", body: "\n\t " + valid + " \n", want: target{ContractID: secret, Limit: 5, Tags: []string{"a", "b"}}, wantCode: http.StatusOK},
+		{name: "body exactly at the limit is accepted", body: padTo(`{"limit":7}`, limit), want: target{Limit: 7}, wantCode: http.StatusOK},
 
-		{name: "empty body", body: "", wantErr: "request body is empty"},
-		{name: "whitespace-only body", body: " \r\n\t ", wantErr: "request body is empty"},
-		{name: "nil body", nilBody: true, wantErr: "request body is empty"},
+		{name: "empty body", body: "", wantCode: http.StatusBadRequest, wantErr: "request body is empty"},
+		{name: "whitespace-only body", body: " \r\n\t ", wantCode: http.StatusBadRequest, wantErr: "request body is empty"},
+		{name: "nil body", nilBody: true, wantCode: http.StatusBadRequest, wantErr: "request body is empty"},
 
-		{name: "one byte over the limit", body: padTo(`{"limit":7}`, maxJSONBodyBytes+1), wantErr: "request body exceeds 4096 bytes"},
-		{name: "far over the limit", body: `{"contract_id":"` + strings.Repeat(secret, 1<<14) + `"}`, wantErr: "request body exceeds 4096 bytes"},
+		{name: "one byte over the limit", body: padTo(`{"limit":7}`, limit+1), wantCode: http.StatusRequestEntityTooLarge, wantErr: "request body exceeds 4096 bytes"},
+		{name: "far over the limit", body: `{"contract_id":"` + strings.Repeat(secret, 1<<14) + `"}`, wantCode: http.StatusRequestEntityTooLarge, wantErr: "request body exceeds 4096 bytes"},
 
-		{name: "malformed JSON", body: `{"contract_id":"` + secret + `", limit}`, wantErr: "invalid JSON body"},
-		{name: "truncated JSON", body: `{"contract_id":"` + secret, wantErr: "invalid JSON body: unexpected EOF"},
-		{name: "not an object", body: `"` + secret + `"`, wantErr: "invalid JSON body: json: cannot unmarshal string"},
+		{name: "malformed JSON", body: `{"contract_id":"` + secret + `", limit}`, wantCode: http.StatusBadRequest, wantErr: "invalid JSON body"},
+		{name: "truncated JSON", body: `{"contract_id":"` + secret, wantCode: http.StatusBadRequest, wantErr: "invalid JSON body: unexpected EOF"},
+		{name: "not an object", body: `"` + secret + `"`, wantCode: http.StatusBadRequest, wantErr: "invalid JSON body: json: cannot unmarshal string"},
 		{
 			// encoding/json fills contract_id before reaching the bad limit;
 			// that partial value must not leak into dst.
-			name:    "wrongly typed field leaves dst untouched",
-			body:    `{"contract_id":"` + secret + `","limit":"` + secret + `"}`,
-			wantErr: "cannot unmarshal string into Go struct field",
+			name:     "wrongly typed field leaves dst untouched",
+			body:     `{"contract_id":"` + secret + `","limit":"` + secret + `"}`,
+			wantCode: http.StatusBadRequest,
+			wantErr:  "cannot unmarshal string into Go struct field",
 		},
 		{
 			// A typo in a field name is rejected rather than silently
 			// dropped, per the doc comment's policy.
-			name:    "unknown field is rejected",
-			body:    `{"contract_id":"` + secret + `","contractID":"` + secret + `"}`,
-			wantErr: `invalid JSON body: json: unknown field "contractID"`,
+			name:     "unknown field is rejected",
+			body:     `{"contract_id":"` + secret + `","contractID":"` + secret + `"}`,
+			wantCode: http.StatusBadRequest,
+			wantErr:  `invalid JSON body: json: unknown field "contractID"`,
 		},
-		{name: "trailing garbage", body: valid + "garbage", wantErr: "unexpected data after the JSON value"},
-		{name: "second JSON value", body: valid + `{"limit":9}`, wantErr: "unexpected data after the JSON value"},
-		{name: "stray closing brace", body: valid + "}", wantErr: "unexpected data after the JSON value"},
+		{name: "trailing garbage", body: valid + "garbage", wantCode: http.StatusBadRequest, wantErr: "unexpected data after the JSON value"},
+		{name: "second JSON value", body: valid + `{"limit":9}`, wantCode: http.StatusBadRequest, wantErr: "unexpected data after the JSON value"},
+		{name: "stray closing brace", body: valid + "}", wantCode: http.StatusBadRequest, wantErr: "unexpected data after the JSON value"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			srv := newServer()
+			rec := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tt.body))
 			if tt.nilBody {
 				r.Body = nil
 			}
 			got := sentinel
 
-			err := decodeJSONBody(r, &got)
+			wrote := srv.decodeJSONBody(rec, r, &got)
 
 			if tt.wantErr == "" {
-				require.NoError(t, err)
+				require.False(t, wrote, "decoder must not write a response on success")
+				require.Equal(t, http.StatusOK, rec.Code)
 				assert.Equal(t, tt.want, got)
 				return
 			}
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.wantErr)
-			assert.NotContains(t, err.Error(), secret, "error must not echo body values")
+			require.True(t, wrote, "decoder must write an error response on failure")
+			require.Equal(t, tt.wantCode, rec.Code)
+			var env errorResponse
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+			assert.Contains(t, env.Error, tt.wantErr)
+			assert.NotContains(t, env.Error, secret, "error must not echo body values")
 			assert.Equal(t, sentinel, got, "dst must be untouched when decoding fails")
+			assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+			assert.Contains(t, rec.Header().Get("Cache-Control"), "no-store")
 		})
 	}
 }
@@ -533,161 +530,106 @@ func TestDecodeJSONBody(t *testing.T) {
 // TestDecodeJSONBody_OversizedBodyIsNotBuffered proves the cap bounds how
 // much of a hostile body is read, not just whether it is accepted.
 func TestDecodeJSONBody_OversizedBodyIsNotBuffered(t *testing.T) {
+	srv := &Server{httpRequestBodyLimit: 4096}
 	src := &countingReader{r: strings.NewReader(`{"contract_id":"` + strings.Repeat("A", 1<<20) + `"}`)}
 	r := httptest.NewRequest(http.MethodPost, "/", src)
 
 	var dst struct {
 		ContractID string `json:"contract_id"`
 	}
-	err := decodeJSONBody(r, &dst)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "request body exceeds")
-	assert.LessOrEqual(t, src.n, maxJSONBodyBytes+1, "must stop reading one byte past the cap")
+	rec := httptest.NewRecorder()
+	require.True(t, srv.decodeJSONBody(rec, r, &dst))
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	assert.Contains(t, rec.Body.String(), "request body exceeds")
+	assert.LessOrEqual(t, src.n, 4097, "must stop reading one byte past the cap")
 }
 
 // TestDecodeJSONBody_RejectsNonPointerDst guards the scratch-value copy:
 // decoding needs somewhere addressable to publish the result.
 func TestDecodeJSONBody_RejectsNonPointerDst(t *testing.T) {
+	srv := &Server{httpRequestBodyLimit: 4096}
 	var nilPtr *struct{}
 	for _, dst := range []any{nil, struct{}{}, nilPtr} {
 		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
-		err := decodeJSONBody(r, dst)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "dst must be a non-nil pointer")
+		rec := httptest.NewRecorder()
+		require.True(t, srv.decodeJSONBody(rec, r, dst))
+		require.Equal(t, http.StatusBadRequest, rec.Code)
 	}
 }
 
-// TestDecodeJSON covers decodeJSON directly: valid payload decoding,
-// malformed JSON yielding 400 with a writeError response, unknown field rejection,
-// and ensuring sensitive values are not echoed in the error output.
-func TestDecodeJSON(t *testing.T) {
-	type target struct {
-		Name  string `json:"name"`
-		Count int    `json:"count"`
-	}
-	const secret = "sk_live_TENANT_SECRET"
+// TestDecodeJSONBody_WiredToEveryHandlerFamily confirms each handler family
+// that reads a JSON body goes through the shared decoder, so a malformed or
+// oversized body gets a consistent 400/413 regardless of route.
+func TestDecodeJSONBody_WiredToEveryHandlerFamily(t *testing.T) {
+	const secret = "sk_live_DO_NOT_ECHO"
 
 	tests := []struct {
-		name       string
-		body       string
-		maxBody    int64
-		want       target
-		wantErr    bool
-		wantStatus int
-		errSubstr  string
+		name     string
+		method   string
+		path     string
+		body     string
+		wantCode int
+		wantErr  string
 	}{
 		{
-			name:       "valid body decodes into target struct",
-			body:       `{"name":"tenant-alpha","count":3}`,
-			maxBody:    1024,
-			want:       target{Name: "tenant-alpha", Count: 3},
-			wantStatus: http.StatusOK,
+			name:     "POST /watched-contracts rejects an oversized body with 413",
+			method:   http.MethodPost,
+			path:     "/watched-contracts?confirm=true",
+			body:     `{"contract_id":"` + strings.Repeat("x", 5000) + `","network":"testnet"}`,
+			wantCode: http.StatusRequestEntityTooLarge,
+			wantErr:  "request body exceeds",
 		},
 		{
-			name:       "surrounding whitespace is tolerated",
-			body:       " \r\n\t " + `{"name":"tenant-alpha","count":3}` + " \n ",
-			maxBody:    1024,
-			want:       target{Name: "tenant-alpha", Count: 3},
-			wantStatus: http.StatusOK,
+			name:     "POST /watched-contracts rejects malformed JSON with 400",
+			method:   http.MethodPost,
+			path:     "/watched-contracts?confirm=true",
+			body:     `{"contract_id":`,
+			wantCode: http.StatusBadRequest,
+			wantErr:  "invalid JSON body",
 		},
 		{
-			name:       "malformed JSON yields 400 never 500",
-			body:       `{"name":"tenant-alpha", count:`,
-			maxBody:    1024,
-			wantErr:    true,
-			wantStatus: http.StatusBadRequest,
-			errSubstr:  "invalid JSON body",
+			name:     "PUT /contracts/{id}/spec rejects an oversized body with 413",
+			method:   http.MethodPut,
+			path:     "/contracts/" + testContract + "/spec",
+			body:     `{"spec":{"events":[{"name":"` + strings.Repeat("x", 6000) + `"}]}}`,
+			wantCode: http.StatusRequestEntityTooLarge,
+			wantErr:  "request body exceeds",
 		},
 		{
-			name:       "truncated JSON yields 400",
-			body:       `{"name":"tenant-alpha"`,
-			maxBody:    1024,
-			wantErr:    true,
-			wantStatus: http.StatusBadRequest,
-			errSubstr:  "unexpected EOF",
+			name:     "PUT /contracts/{id}/spec rejects malformed JSON with 400",
+			method:   http.MethodPut,
+			path:     "/contracts/" + testContract + "/spec",
+			body:     `{"spec":`,
+			wantCode: http.StatusBadRequest,
+			wantErr:  "invalid JSON body",
 		},
 		{
-			name:       "unknown field is rejected with 400",
-			body:       `{"name":"tenant-alpha","unexpected":true}`,
-			maxBody:    1024,
-			wantErr:    true,
-			wantStatus: http.StatusBadRequest,
-			errSubstr:  `unknown field "unexpected"`,
-		},
-		{
-			name:       "field type mismatch yields 400",
-			body:       `{"name":"tenant-alpha","count":"three"}`,
-			maxBody:    1024,
-			wantErr:    true,
-			wantStatus: http.StatusBadRequest,
-			errSubstr:  "cannot unmarshal string into Go struct field",
-		},
-		{
-			name:       "oversized body exceeding maxBody yields 400 without 500",
-			body:       `{"name":"` + strings.Repeat("x", 200) + `"}`,
-			maxBody:    50,
-			wantErr:    true,
-			wantStatus: http.StatusBadRequest,
-			errSubstr:  "http: request body too large",
-		},
-		{
-			name:       "malformed JSON containing secret does not echo secret back",
-			body:       `{"name":"` + secret + `", malformed`,
-			maxBody:    1024,
-			wantErr:    true,
-			wantStatus: http.StatusBadRequest,
-			errSubstr:  "invalid JSON body",
+			name:     "POST /subscriptions rejects malformed JSON with 400",
+			method:   http.MethodPost,
+			path:     "/subscriptions",
+			body:     `{"url":`,
+			wantCode: http.StatusBadRequest,
+			wantErr:  "invalid JSON body",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			st := &stubStore{}
+			srv := newTestServer(st, nil)
+			srv.SetHTTPRequestBodyLimit(4096)
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("X-Api-Key", "test-key")
 			rec := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tt.body))
-			var got target
-
-			err := decodeJSON(rec, req, &got, tt.maxBody)
-
-			if !tt.wantErr {
-				require.NoError(t, err)
-				assert.Equal(t, tt.want, got)
-				assert.Equal(t, http.StatusOK, rec.Code)
-				return
-			}
-
-			require.Error(t, err)
-			assert.Equal(t, tt.wantStatus, rec.Code, "malformed JSON must yield 400, never 500")
+			srv.Router().ServeHTTP(rec, req)
+			require.Equal(t, tt.wantCode, rec.Code, "%s %s %s", tt.method, tt.path, tt.body)
 			var env errorResponse
-			unmarshalErr := json.Unmarshal(rec.Body.Bytes(), &env)
-			require.NoError(t, unmarshalErr)
-			if tt.errSubstr != "" {
-				assert.Contains(t, env.Error, tt.errSubstr)
-			}
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+			assert.Contains(t, env.Error, tt.wantErr)
 			assert.NotContains(t, rec.Body.String(), secret, "error response must never echo sensitive input values")
-			assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
 			assert.Contains(t, rec.Header().Get("Cache-Control"), "no-store")
 		})
 	}
-}
-
-// TestDecodeJSON_OversizedBodyIsNotBuffered asserts that decodeJSON stops reading
-// without buffering an oversized body into memory.
-func TestDecodeJSON_OversizedBodyIsNotBuffered(t *testing.T) {
-	const limit = 512
-	src := &countingReader{r: strings.NewReader(`{"name":"` + strings.Repeat("A", 1<<20) + `"}`)}
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/", src)
-
-	var dst struct {
-		Name string `json:"name"`
-	}
-	err := decodeJSON(rec, req, &dst, limit)
-
-	require.Error(t, err)
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
-	assert.Contains(t, rec.Body.String(), "http: request body too large")
-	assert.Less(t, src.n, 1<<20, "must stop reading without buffering the full 1MB body")
 }
 
 // TestWriteError verifies the error envelope format, status code, and no-store caching headers.
@@ -945,11 +887,11 @@ func TestWriteEndpoints_JSONRequestDecoding(t *testing.T) {
 			wantSubstr: "request body is empty",
 		},
 		{
-			name: "oversized body is rejected with 400 without being buffered",
+			name: "oversized body is rejected with 413 without being buffered",
 			makeBody: func() io.Reader {
 				return &countingReader{r: strings.NewReader(`{"contract_id":"` + strings.Repeat("A", 1<<20) + `"}`)}
 			},
-			wantStatus: http.StatusBadRequest,
+			wantStatus: http.StatusRequestEntityTooLarge,
 			wantSubstr: "request body exceeds",
 		},
 	}
@@ -960,6 +902,7 @@ func TestWriteEndpoints_JSONRequestDecoding(t *testing.T) {
 				watchedList: []store.WatchedContract{{ContractID: validC, Network: "testnet"}},
 			}
 			srv := newTestServer(st, nil)
+			srv.SetHTTPRequestBodyLimit(4096)
 
 			var r io.Reader
 			if tt.makeBody != nil {

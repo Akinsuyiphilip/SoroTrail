@@ -569,6 +569,8 @@ paths:
                 created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -673,6 +675,8 @@ paths:
                 created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -871,6 +875,8 @@ paths:
                   - "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1032,6 +1038,8 @@ paths:
                 created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1163,6 +1171,8 @@ paths:
                 key: "sorotrail_a1b2c3d4e5f60718_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -1989,6 +1999,8 @@ paths:
                     type: object
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -2227,6 +2239,8 @@ paths:
                   - "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -2360,6 +2374,8 @@ paths:
                 mode_transition: all_to_specific
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -2641,6 +2657,8 @@ paths:
                 created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -2774,6 +2792,8 @@ paths:
                 created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -4366,6 +4386,14 @@ components:
             type: integer
             format: int64
             examples: [1792512000]
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    RequestEntityTooLarge:
+      description: >-
+        The request body exceeds the instance's configured limit
+        (HTTP_REQUEST_BODY_LIMIT). Reduce the body size and retry.
       content:
         application/json:
           schema:
