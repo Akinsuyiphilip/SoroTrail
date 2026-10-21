@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -583,6 +584,147 @@ func TestLedgerMatches(t *testing.T) {
 			got, err := (&Auditor{}).ledgerMatches(l, tt.rpc, tt.stored)
 			require.NoError(t, err, "the comparison is arithmetic and cannot fail")
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestClusterIsClean pins the window-level verdict that decides whether a
+// finding is closed as repaired or retried: a false clean would retire a
+// real gap and advance the high-water mark over it, a false unclean would
+// re-repair a healthy window until it is declared unrecoverable. The
+// window's edges are part of it — a mismatch on either boundary ledger
+// must count, while events just outside the window must not — and a
+// window with nothing to compare is clean rather than an error, so an
+// empty range cannot wedge the repair loop.
+func TestClusterIsClean(t *testing.T) {
+	tests := []struct {
+		name      string
+		from, to  uint32
+		rpc       map[uint32]int // events the RPC reports for each ledger
+		rpcErr    error          // when set, the RPC fails instead of answering
+		stored    map[uint32]int // events the store holds for each ledger
+		wantClean bool
+	}{
+		{
+			name:      "a window with no mismatches is clean",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{100: 1, 101: 2, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 101: 2, 102: 1, 103: 1},
+			wantClean: true,
+		},
+		{
+			name:      "a ledger the store is missing makes the window unclean",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{100: 1, 101: 1, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 102: 1, 103: 1},
+			wantClean: false,
+		},
+		{
+			name:      "a ledger the store kept but the RPC forgot makes the window unclean",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{100: 1, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 101: 1, 102: 1, 103: 1},
+			wantClean: false,
+		},
+		{
+			name:      "a count that disagrees on one ledger makes the window unclean",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{101: 2},
+			stored:    map[uint32]int{101: 1},
+			wantClean: false,
+		},
+		{
+			name:      "a window with no events on either side is clean",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{},
+			stored:    map[uint32]int{},
+			wantClean: true,
+		},
+		{
+			name:      "an inverted range has nothing to compare and reads clean",
+			from:      200,
+			to:        100,
+			rpc:       map[uint32]int{},
+			stored:    map[uint32]int{},
+			wantClean: true,
+		},
+		{
+			name:      "a mismatch on the first ledger of the window counts",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{101: 1, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 101: 1, 102: 1, 103: 1},
+			wantClean: false,
+		},
+		{
+			name:      "a mismatch on the last ledger of the window counts",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{100: 1, 101: 1, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 101: 1, 102: 1},
+			wantClean: false,
+		},
+		{
+			name:      "events just outside the window are ignored",
+			from:      100,
+			to:        102,
+			rpc:       map[uint32]int{99: 1, 100: 1, 101: 1, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 101: 1, 102: 1},
+			wantClean: true,
+		},
+		{
+			name:      "an RPC failure surfaces as an error, not a clean verdict",
+			from:      100,
+			to:        103,
+			rpcErr:    errors.New("connection refused"),
+			wantClean: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, cli, st, _ := reconcileSetup(t, auditOptions())
+
+			// Both sides are seeded with the row-id format the RPC mock
+			// generates, so equal counts describe the same events.
+			var seeded []store.Event
+			for l, n := range tt.stored {
+				for _, e := range mkEvents(l, n, testContract) {
+					seeded = append(seeded, store.Event{
+						ID:         e.ID,
+						ContractID: e.ContractID,
+						Ledger:     int64(e.Ledger),
+						Type:       e.Type,
+					})
+				}
+			}
+			_, err := st.UpsertEvents(context.Background(), seeded)
+			require.NoError(t, err)
+
+			cli.extraResponses = func(int) (rpc.GetEventsResponse, error) {
+				if tt.rpcErr != nil {
+					return rpc.GetEventsResponse{}, tt.rpcErr
+				}
+				var evs []rpc.Event
+				for l, n := range tt.rpc {
+					evs = append(evs, mkEvents(l, n, testContract)...)
+				}
+				return rpc.GetEventsResponse{Events: evs, LatestLedger: 1_000}, nil
+			}
+
+			clean, err := a.clusterIsClean(context.Background(), tt.from, tt.to)
+			if tt.rpcErr != nil {
+				require.Error(t, err, "an unreachable RPC must surface, never read as clean")
+				assert.False(t, clean, "a failed check is not a clean verdict")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantClean, clean)
 		})
 	}
 }
