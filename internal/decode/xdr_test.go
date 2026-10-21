@@ -2,6 +2,7 @@ package decode
 
 import (
 	"encoding/json"
+	"math"
 	"math/big"
 	"strings"
 	"testing"
@@ -431,6 +432,37 @@ func TestUint128String(t *testing.T) {
 			got := uint128String(xdr.UInt128Parts{Hi: xdr.Uint64(tt.hi), Lo: xdr.Uint64(tt.lo)})
 			assert.Equal(t, tt.want, got, "decimal rendering")
 			assert.NotContains(t, got, "-", "unsigned rendering must never carry a minus sign")
+		})
+	}
+}
+
+// TestInt128String pins the decimal rendering of 128-bit signed Soroban
+// integers. The hi/lo words are two's complement, and JSON numbers cannot
+// carry the full range without loss, so token balances rely on this string
+// form being exact at every boundary — including values past the 2^53 that
+// a float64 JSON number would silently round, and the negative extremes
+// where the sign handling matters.
+func TestInt128String(t *testing.T) {
+	tests := []struct {
+		name string
+		hi   int64
+		lo   uint64
+		want string
+	}{
+		{"zero renders as 0", 0, 0, "0"},
+		{"small positive value", 0, 12345, "12345"},
+		{"small negative value is two's complement", -1, 0xFFFFFFFFFFFFFFFF, "-1"},
+		{"value above 2^53 stays exact", 0, 9007199254740993, "9007199254740993"},
+		// -2^64: the sign lives in the high word alone, the low word is zero.
+		{"value just below zero across words", -1, 0, "-18446744073709551616"},
+		{"maximum i128 renders without truncation", math.MaxInt64, math.MaxUint64, "170141183460469231731687303715884105727"},
+		{"minimum i128 renders with its sign", math.MinInt64, 0, "-170141183460469231731687303715884105728"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := int128String(xdr.Int128Parts{Hi: xdr.Int64(tt.hi), Lo: xdr.Uint64(tt.lo)})
+			assert.Equal(t, tt.want, got, "decimal rendering")
 		})
 	}
 }
