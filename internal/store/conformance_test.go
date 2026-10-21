@@ -9,12 +9,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/testskip"
 )
 
 const (
@@ -153,11 +156,25 @@ func conformanceBackendNamed(t *testing.T, name string) conformanceBackend {
 // runStoreTests runs the conformance suite against one backend. A backend
 // with a required server is skipped as a whole when its URL is unset, and any
 // operation it declares unsupported is skipped per test with that declaration.
+//
+// The skip goes through the shared convention (internal/testskip), so it
+// prints a notice naming what did not run instead of disappearing into the
+// default `go test` output, and so a CI job that needs the backend can set
+// the require variable and make the skip a failure.
 func runStoreTests(t *testing.T, backend conformanceBackend) {
 	t.Helper()
 
-	if backend.skipEnv != "" && os.Getenv(backend.skipEnv) == "" {
-		t.Skipf("%s: %s is not set; skipping this backend", backend.name, backend.skipEnv)
+	if backend.skipEnv != "" {
+		testskip.Skip(t, testskip.Tool{
+			Name:   backend.name,
+			EnvVar: backend.skipEnv,
+			Title:  "the " + backend.name + " store conformance suite",
+			Reason: backend.skipEnv + " is not set",
+			Cost: "the " + backend.name + " store implementation is only " +
+				"exercised against a live server, so its behaviour is unverified here",
+			Install:    "start one and set " + backend.skipEnv + ", then re-run the suite",
+			RequireEnv: "SOROTRAIL_REQUIRE_" + strings.ToUpper(backend.name),
+		})
 	}
 
 	tests := []struct {
