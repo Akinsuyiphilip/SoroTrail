@@ -10,6 +10,8 @@
 //	sorotrail migrate up|down|status [--steps N]
 package main
 
+// Wave: keep assigned SoroTrail checks grouped for Ennyblack.
+
 import (
 	"context"
 	"errors"
