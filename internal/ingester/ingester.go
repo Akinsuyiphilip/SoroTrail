@@ -79,6 +79,7 @@ type JitterFunc func(max time.Duration) time.Duration
 func RealJitter(max time.Duration) time.Duration { return rand.N(max) }
 
 // Options configure an Ingester.
+
 type Options struct {
 	// Clock supplies time and sleeping. Defaults to RealClock; simulations
 	// inject a virtual clock so a test can cover hours of ingestion without
@@ -163,7 +164,8 @@ type Options struct {
 	// so a severely degraded database cannot stretch a single ingestion
 	// cycle for minutes. Default 1s when batching is enabled.
 	BatchMaxBackoff time.Duration
-	// MinBackoff is the initial error backoff before exponential growth.
+	// MinBackoff is the initial error backoff before exponential growth,
+	// and the floor the backoff returns to after a successful cycle.
 	// Default 1s (matches INGESTER_MIN_BACKOFF).
 	MinBackoff time.Duration
 	// MaxBackoff caps the error backoff. Default 1m.
@@ -221,6 +223,11 @@ type Options struct {
 	// (e.g. "mainnet", "testnet"). Empty means callers should treat it as
 	// the store default ("default").
 	Network string
+	// DryRun fetches and decodes events, then logs the writes the normal
+	// ingester would perform without changing the store. It also keeps the
+	// preview frontier in memory, so draining multiple pages does not
+	// repeatedly fetch the first page.
+	DryRun bool
 }
 
 // LagMetrics is the optional sink for ingest-lag signals. The Ingester
@@ -331,6 +338,14 @@ type EventNotifier interface {
 	NotifyEvents(ctx context.Context, events []store.Event)
 }
 
+// dryRunPosition is the ephemeral cursor used by a preview. It deliberately
+// lives on the Ingester rather than in the store: advancing it lets a
+// multi-page dry run continue without creating a durable resume point.
+type dryRunPosition struct {
+	cursor             string
+	lastIngestedLedger int64
+}
+
 // Ingester pages events out of the RPC and into the store.
 type Ingester struct {
 	client               rpc.Client
@@ -383,6 +398,10 @@ type Ingester struct {
 	// top of each cycle and logs it in a deferred call; the fields are
 	// atomic because the concurrent window-sweep goroutines increment it.
 	cycle cycleCounters
+	// dryRunPosition is used only when Options.DryRun is true. It is
+	// accessed by the Run goroutine (or the single goroutine driving
+	// RunOnceForTest), so it needs no synchronization.
+	dryRunPosition *dryRunPosition
 }
 
 // cycleCounters holds the per-poll-cycle totals behind the structured
@@ -538,6 +557,7 @@ func (o *Options) logAttrs() []any {
 		"jitter_max", o.JitterMax,
 		"lag_warn_ledgers", o.LagWarnLedgers,
 		"reorg_confirmation_window", o.ReorgConfirmationWindow,
+		"dry_run", o.DryRun,
 	}
 }
 
@@ -555,6 +575,9 @@ func (ing *Ingester) backoffSleep(backoff time.Duration) time.Duration {
 
 // Run polls until ctx is canceled. Errors are logged and retried with
 // exponential backoff; the only terminal condition is context cancellation.
+// When Options.DryRun is set, Run instead performs a bounded read-only
+// preview via RunDryRun and returns when the currently available data has
+// been walked.
 //
 // On a clean cycle the loop also performs an optional reorg re-scan over
 // the ledger range [frontier-confWindow, frontier-1] using the existing
@@ -648,6 +671,44 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 	}
 }
 
+// RunDryRun performs a read-only preview of live ingestion. It walks pages
+// until the RPC says the current frontier is caught up, keeping its cursor
+// only in memory. No event, cursor, derived-index, dead-letter, broadcast,
+// or notifier write is performed. The method is intentionally separate
+// from the normal retrying loop so a CLI preview terminates instead of
+// leaving an operator with a second long-running process to supervise.
+func (ing *Ingester) RunDryRun(ctx context.Context) (err error) {
+	if !ing.opts.DryRun {
+		return errors.New("RunDryRun requires Options.DryRun")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	ing.log.Info("ingester dry-run started", ing.opts.logAttrs()...)
+	defer func() {
+		if err != nil {
+			ing.log.Info("ingester stopped", "reason", err.Error())
+			return
+		}
+		ing.log.Info("ingester stopped", "dry_run", true)
+	}()
+
+	for {
+		caughtUp, cycleErr := ing.runOnce(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if cycleErr != nil {
+			return cycleErr
+		}
+		if caughtUp {
+			ing.log.Info("ingester dry-run complete", "dry_run", true)
+			return nil
+		}
+	}
+}
+
 // rescanForReorg performs one reorg-detection pass over the recent
 // finalized window. It uses ReingestRange, which fans out across the
 // ingester's filter batches, re-fetches events for the closed range
@@ -658,6 +719,11 @@ func (ing *Ingester) Run(ctx context.Context) (err error) {
 // the caller. A no-op return is fine: it means there's not yet enough
 // history to have a finalized window.
 func (ing *Ingester) rescanForReorg(ctx context.Context) error {
+	if ing.opts.DryRun {
+		ing.log.Debug("dry-run: skipping reorg rescan (no database writes)")
+		return nil
+	}
+
 	state, err := ing.getIngestionState(ctx)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("loading ingestion state for reorg rescan: %w", err)
@@ -706,6 +772,19 @@ func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 		ing.logCycleSummary(caughtUp, err, time.Since(cycleStart))
 	}()
 
+	watched, err := ing.store.ListWatchedContracts(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(watched) == 0 {
+		return ing.runOnceUnwatched(ctx)
+	}
+	return ing.runOnceWatched(ctx)
+}
+
+// runOnceUnwatched preserves the existing single-cursor behavior for
+// the ingest-everything mode (empty watch list).
+func (ing *Ingester) runOnceUnwatched(ctx context.Context) (caughtUp bool, err error) {
 	startLedger, cursor, err := ing.resolvePosition(ctx)
 	if err != nil {
 		return false, err
@@ -717,7 +796,63 @@ func (ing *Ingester) runOnce(ctx context.Context) (caughtUp bool, err error) {
 	if len(batches) == 1 {
 		return ing.singlePage(ctx, startLedger, cursor, batches[0])
 	}
-	return ing.windowSweep(ctx, startLedger, batches)
+	return ing.windowSweepUnwatched(ctx, startLedger, batches)
+}
+
+// runOnceWatched advances per-contract cursors. Each watched contract
+// tracks its own resume position; a lagging contract does not delay others.
+func (ing *Ingester) runOnceWatched(ctx context.Context) (bool, error) {
+	batches, err := ing.buildFilterBatches(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(batches) == 1 {
+		return ing.singlePageWatched(ctx, batches[0])
+	}
+	return ing.windowSweepWatched(ctx, batches)
+}
+
+// singlePageWatched issues one getEvents call for a filter batch that
+// may contain multiple watched contracts. It advances each contract's
+// cursor independently based on the events it received.
+func (ing *Ingester) singlePageWatched(ctx context.Context, filters []rpc.EventFilter) (bool, error) {
+	contractIDs := contractIDsFromFilters(filters)
+	startLedger, cursor, err := ing.resolveBatchStart(ctx, contractIDs)
+	if err != nil {
+		return false, err
+	}
+
+	limit := ing.effectivePageLimit()
+	fetchCtx, fetchSpan := ing.tracer.Start(ctx, "ingester.fetch_page")
+	resp, err := ing.client.GetEvents(fetchCtx, rpc.GetEventsRequest{
+		StartLedger: startLedger,
+		Filters:     filters,
+		Pagination:  &rpc.Pagination{Cursor: cursor, Limit: limit},
+	})
+	fetchSpan.End()
+	if rpc.IsFailoverReanchor(err) {
+		ing.log.Warn("failover re-anchor: discarding cursor, re-scanning from last ingested ledger")
+		ing.discardCursor(ctx)
+		return false, err
+	}
+	if rpc.IsLedgerOutOfRange(err) {
+		return false, ing.reclampToOldest(ctx, startLedger, contractIDs...)
+	}
+	if err != nil {
+		return false, fmt.Errorf("getEvents from ledger %d: %w", startLedger, err)
+	}
+
+	ing.cycle.addFetched(len(resp.Events))
+	if err := ing.persistEvents(ctx, resp.Events, resp.LatestLedger); err != nil {
+		return false, err
+	}
+
+	if err := ing.advanceContractCursors(ctx, resp.Events); err != nil {
+		return false, err
+	}
+
+	caughtUp := uint(len(resp.Events)) < limit
+	return caughtUp, nil
 }
 
 func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor string, filters []rpc.EventFilter) (bool, error) {
@@ -751,7 +886,13 @@ func (ing *Ingester) singlePage(ctx context.Context, startLedger uint32, cursor 
 		state.LastIngestedLedger = int64(startLedger) - 1
 	}
 	state.Network = ing.opts.Network
-	if err := ing.store.SaveIngestionState(ctx, state); err != nil {
+	if ing.opts.DryRun {
+		ing.setDryRunPosition(state.LastCursor, state.LastIngestedLedger)
+		ing.log.Info("dry-run: would update ingestion state",
+			"last_ingested_ledger", state.LastIngestedLedger,
+			"last_cursor", state.LastCursor,
+			"latest_ledger", resp.LatestLedger)
+	} else if err := ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
 	}
 	ing.setIngestionLag(int64(resp.LatestLedger), state.LastIngestedLedger)
@@ -835,6 +976,18 @@ func (ing *Ingester) reingestBatch(ctx context.Context, client rpc.Client, fromL
 		ev.Network = ing.opts.Network
 		storeEvents = append(storeEvents, ev)
 	}
+	if ing.opts.DryRun {
+		ids := make([]string, len(storeEvents))
+		for i, event := range storeEvents {
+			ids[i] = event.ID
+		}
+		ing.log.Info("dry-run: would replace events",
+			"from_ledger", fromLedger,
+			"to_ledger", toLedger,
+			"count", len(storeEvents),
+			"event_ids", ids)
+		return len(storeEvents), nil
+	}
 	if err := ing.store.ReplaceEventsInRange(ctx, storeEvents, int64(fromLedger), int64(toLedger)); err != nil {
 		return 0, fmt.Errorf("ReplaceEventsInRange [%d,%d]: %w", fromLedger, toLedger, err)
 	}
@@ -872,7 +1025,12 @@ func (ing *Ingester) effectivePageLimit() uint {
 // window-sweep request chains. A nil return means no cap is configured
 // and every batch pages to completion as before.
 func (ing *Ingester) newCycleBudget() *atomic.Int64 {
-	if ing.opts.MaxEventsPerCycle == 0 {
+	// A preview is not a production ingestion cycle: the cap exists to
+	// bound live memory/latency, while a dry run should be able to walk the
+	// requested window and report the complete write plan. The single-page
+	// path still uses MaxEventsPerCycle as its page limit and advances via
+	// the ephemeral cursor.
+	if ing.opts.MaxEventsPerCycle == 0 || ing.opts.DryRun {
 		return nil
 	}
 	var budget atomic.Int64
@@ -1003,8 +1161,114 @@ func (ing *Ingester) windowSweep(ctx context.Context, start uint32, batches [][]
 		lastIngested = int64(end) - 1
 	}
 	now := time.Now().UTC()
-	err = ing.store.SaveIngestionState(ctx, store.IngestionState{Network: ing.opts.Network, LastIngestedLedger: lastIngested, LastSuccessfulPoll: &now})
+	state := store.IngestionState{Network: ing.opts.Network, LastIngestedLedger: lastIngested, LastSuccessfulPoll: &now}
+	if ing.opts.DryRun {
+		ing.setDryRunPosition("", lastIngested)
+		ing.log.Info("dry-run: would update ingestion state",
+			"last_ingested_ledger", lastIngested,
+			"last_cursor", "",
+			"latest_ledger", health.LatestLedger)
+	} else if err = ing.store.SaveIngestionState(ctx, state); err != nil {
+		return false, err
+	}
+	ing.setIngestionLag(int64(health.LatestLedger), lastIngested)
+	return end >= health.LatestLedger, nil
+}
+
+// windowSweepUnwatched delegates to the existing windowSweep that uses the
+// single global ingestion_state row — backward-compatible behavior unchanged.
+func (ing *Ingester) windowSweepUnwatched(ctx context.Context, start uint32, batches [][]rpc.EventFilter) (bool, error) {
+	return ing.windowSweep(ctx, start, batches)
+}
+
+// windowSweepWatched sweeps a ledger window across all watched contracts,
+// advancing each contract's per-contract cursor independently. It also
+// updates the global ingestion_state for backward compatibility with
+// unwatched-mode callers (e.g. the reorg rescan).
+func (ing *Ingester) windowSweepWatched(ctx context.Context, batches [][]rpc.EventFilter) (bool, error) {
+	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
+		return false, fmt.Errorf("getHealth for sweep window: %w", err)
+	}
+	start, err := ing.earliestStartLedger(ctx, health)
+	if err != nil {
+		return false, err
+	}
+	if start > health.LatestLedger {
+		return true, nil // nothing new yet
+	}
+	end := min(start+ing.opts.SweepWindow-1, health.LatestLedger)
+
+	remaining := ing.newCycleBudget()
+	var capHit atomic.Bool
+	var ledgerOutOfRange atomic.Bool
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(ing.opts.SweepConcurrency)
+	for _, filters := range batches {
+		filters := filters
+		g.Go(func() error {
+			return ing.sweepBatch(gctx, &ledgerOutOfRange, remaining, &capHit, start, end, filters)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		if ledgerOutOfRange.Load() || rpc.IsLedgerOutOfRange(err) {
+			// Collect all watched contract IDs and reclamp.
+			watched, wErr := ing.store.ListWatchedContracts(ctx)
+			if wErr != nil {
+				return false, wErr
+			}
+			ids := make([]string, len(watched))
+			for i, wc := range watched {
+				ids[i] = wc.ContractID
+			}
+			// reclampToOldest saves per-contract cursors.
+			if err := ing.reclampToOldest(ctx, start, ids...); err != nil {
+				return false, err
+			}
+			// Also update global ingestion state so existing callers
+			// (and tests) see the reclamped position.
+			clamped := int64(health.OldestLedger) - 1
+			state := store.IngestionState{Network: ing.opts.Network, LastIngestedLedger: clamped}
+			if err := ing.store.SaveIngestionState(ctx, state); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+		return false, err
+	}
+	if capHit.Load() {
+		ing.log.Info("per-cycle event cap reached; window incomplete",
+			"window_start", start, "window_end", end,
+			"max_events_per_cycle", ing.opts.MaxEventsPerCycle)
+		return false, nil
+	}
+
+	lastIngested := int64(end)
+	if end >= health.LatestLedger {
+		lastIngested = int64(end) - 1
+	}
+
+	// Save per-contract cursors for every watched contract.
+	watched, err := ing.store.ListWatchedContracts(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, wc := range watched {
+		if err := ing.store.SaveContractCursor(ctx, store.ContractCursor{
+			ContractID:         wc.ContractID,
+			LastIngestedLedger: lastIngested,
+		}); err != nil {
+			return false, fmt.Errorf("saving cursor for contract %s: %w", wc.ContractID, err)
+		}
+	}
+
+	// Also update the global ingestion state for backward compatibility
+	// (existing tests and the reorg rescan rely on it).
+	now := time.Now().UTC()
+	state := store.IngestionState{Network: ing.opts.Network, LastIngestedLedger: lastIngested, LastSuccessfulPoll: &now}
+	if ing.opts.DryRun {
+		ing.setDryRunPosition("", lastIngested)
+	} else if err := ing.store.SaveIngestionState(ctx, state); err != nil {
 		return false, err
 	}
 	ing.setIngestionLag(int64(health.LatestLedger), lastIngested)
@@ -1141,7 +1405,15 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 			// through it and continue with the rest of the page; otherwise
 			// fall back to the legacy "abort the cycle" behavior so
 			// unconfigured deployments catch the bug instead of silently
-			// dropping events.
+			// dropping events. A dry run reports the same disposition but
+			// never creates the durable dead-letter row.
+			if ing.opts.DryRun {
+				ing.log.Warn("dry-run: would dead-letter event",
+					"event_id", re.ID,
+					"ledger", re.Ledger,
+					"error", err)
+				continue
+			}
 			if ing.deadLetterStore == nil {
 				return err
 			}
@@ -1179,6 +1451,20 @@ func (ing *Ingester) persistEvents(ctx context.Context, rpcEvents []rpc.Event, l
 }
 
 func (ing *Ingester) persistEventBatch(ctx context.Context, events []store.Event, throughLedger, latestLedger uint32) error {
+	if ing.opts.DryRun {
+		ids := make([]string, len(events))
+		for i, event := range events {
+			ids[i] = event.ID
+		}
+		ing.log.Info("dry-run: would write events",
+			"count", len(events),
+			"event_ids", ids,
+			"through_ledger", throughLedger,
+			"latest_ledger", latestLedger)
+		ing.logDryRunAddressRefs(events)
+		return nil
+	}
+
 	persistCtx, persistSpan := ing.tracer.Start(ctx, "ingester.persist_events")
 	_, err := ing.writeEventsPersist(persistCtx, events)
 	persistSpan.End()
@@ -1216,6 +1502,9 @@ func (ing *Ingester) persistEventBatch(ctx context.Context, events []store.Event
 // a page split into.
 func (ing *Ingester) writeEventsPersist(ctx context.Context, events []store.Event) (int64, error) {
 	if len(events) == 0 {
+		return 0, nil
+	}
+	if ing.opts.DryRun {
 		return 0, nil
 	}
 
@@ -1377,7 +1666,43 @@ func (bc *batchController) recordAndBackoff(rows int, latency time.Duration) tim
 	}
 }
 
+func (ing *Ingester) setDryRunPosition(cursor string, lastIngestedLedger int64) {
+	if !ing.opts.DryRun {
+		return
+	}
+	ing.dryRunPosition = &dryRunPosition{
+		cursor:             cursor,
+		lastIngestedLedger: lastIngestedLedger,
+	}
+}
+
+func (ing *Ingester) logDryRunAddressRefs(events []store.Event) {
+	var refs []store.AddressRef
+	for _, ev := range events {
+		for _, ref := range decode.ExtractAddresses(ev.Topics, ev.Value) {
+			refs = append(refs, store.AddressRef{Address: ref.Address, EventID: ev.ID, Role: ref.Role})
+		}
+	}
+	if len(refs) == 0 {
+		return
+	}
+	ids := make([]string, len(refs))
+	for i, ref := range refs {
+		ids[i] = ref.EventID
+	}
+	ing.log.Info("dry-run: would write address references",
+		"count", len(refs),
+		"event_ids", ids)
+}
+
 func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, cursor string, err error) {
+	if ing.opts.DryRun && ing.dryRunPosition != nil {
+		if ing.dryRunPosition.cursor != "" {
+			return 0, ing.dryRunPosition.cursor, nil
+		}
+		return uint32(ing.dryRunPosition.lastIngestedLedger) + 1, "", nil
+	}
+
 	if !ing.startOverrideApplied && ing.opts.StartLedger > 0 {
 		ing.startOverrideApplied = true // Apply override exactly once on startup
 		health, hErr := ing.client.GetHealth(ctx)
@@ -1398,9 +1723,15 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 		return 0, "", err
 	}
 	if err == nil && state.LastCursor != "" {
+		if ing.opts.DryRun {
+			ing.setDryRunPosition(state.LastCursor, state.LastIngestedLedger)
+		}
 		return 0, state.LastCursor, nil
 	}
 	if err == nil && state.LastIngestedLedger > 0 {
+		if ing.opts.DryRun {
+			ing.setDryRunPosition("", state.LastIngestedLedger)
+		}
 		return uint32(state.LastIngestedLedger) + 1, "", nil
 	}
 
@@ -1438,6 +1769,9 @@ func (ing *Ingester) resolvePosition(ctx context.Context) (startLedger uint32, c
 	if resolved < 2 {
 		resolved = 2
 	}
+	if ing.opts.DryRun {
+		ing.setDryRunPosition("", int64(resolved)-1)
+	}
 	ing.log.Info("cold start", "start_ledger", resolved, "latest_ledger", health.LatestLedger)
 	return resolved, "", nil
 }
@@ -1462,17 +1796,44 @@ func resolveStartLedgerRaw(raw string, health rpc.Health) (uint32, error) {
 	return uint32(start), nil
 }
 
-func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) error {
+func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32, contractIDs ...string) error {
 	health, err := ing.client.GetHealth(ctx)
 	if err != nil {
 		return fmt.Errorf("getHealth while re-clamping: %w", err)
 	}
 	ing.log.Warn("resume ledger fell outside RPC retention window; skipping ahead — events in the gap are lost",
 		"requested_ledger", requested, "oldest_retained", health.OldestLedger)
-	return ing.store.SaveIngestionState(ctx, store.IngestionState{
+	clamped := int64(health.OldestLedger) - 1
+	if len(contractIDs) > 0 {
+		if ing.opts.DryRun {
+			ing.log.Info("dry-run: would reclamp contract cursors",
+				"last_ingested_ledger", clamped,
+				"contracts", contractIDs)
+			return nil
+		}
+		for _, id := range contractIDs {
+			if err := ing.store.SaveContractCursor(ctx, store.ContractCursor{
+				ContractID:         id,
+				LastIngestedLedger: clamped,
+				LastCursor:         "",
+			}); err != nil {
+				return fmt.Errorf("clamping cursor for %s: %w", id, err)
+			}
+		}
+		return nil
+	}
+	state := store.IngestionState{
 		Network:            ing.opts.Network,
-		LastIngestedLedger: int64(health.OldestLedger) - 1,
-	})
+		LastIngestedLedger: clamped,
+	}
+	if ing.opts.DryRun {
+		ing.setDryRunPosition("", state.LastIngestedLedger)
+		ing.log.Info("dry-run: would update ingestion state",
+			"last_ingested_ledger", state.LastIngestedLedger,
+			"last_cursor", "")
+		return nil
+	}
+	return ing.store.SaveIngestionState(ctx, state)
 }
 
 // discardCursor reads the persisted ingestion state and re-saves it without
@@ -1484,6 +1845,15 @@ func (ing *Ingester) reclampToOldest(ctx context.Context, requested uint32) erro
 // in that path — it guards against any future change that might persist a
 // cursor mid-sweep.
 func (ing *Ingester) discardCursor(ctx context.Context) {
+	if ing.opts.DryRun {
+		if ing.dryRunPosition == nil || ing.dryRunPosition.cursor == "" {
+			return
+		}
+		ing.setDryRunPosition("", ing.dryRunPosition.lastIngestedLedger)
+		ing.log.Info("dry-run: would discard ingestion cursor")
+		return
+	}
+
 	state, err := ing.getIngestionState(ctx)
 	if err != nil {
 		ing.log.Warn("discardCursor: could not read state", "error", err)
@@ -1521,6 +1891,9 @@ func (ing *Ingester) discardCursor(ctx context.Context) {
 // data we can't interpret; we leave hysteresis alone and republish the
 // current value so the gauge stays consistent.
 func (ing *Ingester) checkLag(ctx context.Context) {
+	if ing.opts.DryRun {
+		return
+	}
 	if ing.opts.LagWarnLedgers == 0 {
 		return // alarm disabled (operators opted out or test fixture)
 	}
@@ -1608,11 +1981,34 @@ func (ing *Ingester) checkLag(ctx context.Context) {
 // filters per request, so ≤25 watched contracts fit in one request. Larger
 // lists spill into additional batches, each requiring its own request chain.
 // An empty watch list means one type-only filter, i.e. all contract events.
+//
+// The watch list is keyed by (network, contract); only this ingester's own
+// network's entries become filters. A contract watched on testnet but not
+// on this ingester's network must not be fetched here — its RPC points at
+// one network, and fetching foreign-network contracts would fail the
+// ledger checks (or worse, silently index another chain's events under
+// this network's name). Entries carrying an empty network are treated as
+// "default", matching the store's normalization.
 func (ing *Ingester) buildFilterBatches(ctx context.Context) ([][]rpc.EventFilter, error) {
 	watched, err := ing.store.ListWatchedContracts(ctx)
 	if err != nil {
 		return nil, err
 	}
+	ingNetwork := ing.opts.Network
+	if ingNetwork == "" {
+		ingNetwork = "default"
+	}
+	kept := watched[:0:0]
+	for _, wc := range watched {
+		network := wc.Network
+		if network == "" {
+			network = "default"
+		}
+		if network == ingNetwork {
+			kept = append(kept, wc)
+		}
+	}
+	watched = kept
 	if len(watched) == 0 {
 		return [][]rpc.EventFilter{{{Type: "contract"}}}, nil
 	}
@@ -1671,6 +2067,9 @@ func (ing *Ingester) toStoreEvent(re rpc.Event) (store.Event, error) {
 // setIngestionLag updates the Prometheus gauge for ingestion lag.
 // chainHead can be 0 when unknown (no-op in that case).
 func (ing *Ingester) setIngestionLag(chainHead, lastIngested int64) {
+	if ing.opts.DryRun {
+		return
+	}
 	if chainHead <= 0 || lastIngested <= 0 {
 		return
 	}
@@ -1748,6 +2147,9 @@ func clampDuration(d, min, max time.Duration) time.Duration {
 // logged but do not fail the ingest pass, because the index can be rebuilt
 // from stored events via the index-addresses backfill command.
 func (ing *Ingester) indexEventAddresses(ctx context.Context, events []store.Event) error {
+	if ing.opts.DryRun {
+		return nil
+	}
 	if len(events) == 0 {
 		return nil
 	}
@@ -1775,4 +2177,145 @@ func (ing *Ingester) indexEventAddresses(ctx context.Context, events []store.Eve
 // this deliberately skips, so it is not a production entry point.
 func (ing *Ingester) RunOnceForTest(ctx context.Context) (bool, error) {
 	return ing.runOnce(ctx)
+}
+
+// contractIDsFromFilters extracts the unique contract IDs from a filter batch.
+func contractIDsFromFilters(filters []rpc.EventFilter) []string {
+	seen := map[string]struct{}{}
+	var ids []string
+	for _, f := range filters {
+		if f.Type == "contract" {
+			for _, id := range f.ContractIDs {
+				if _, ok := seen[id]; !ok {
+					seen[id] = struct{}{}
+					ids = append(ids, id)
+				}
+			}
+		}
+	}
+	return ids
+}
+
+// resolveContractPosition determines where a specific contract should resume.
+// Returns (startLedger, cursor). The cursor is always "" for watched-mode
+// batches — startLedger-based pagination is used for multi-contract calls.
+// A contract with no cursor row (newly added) gets the cold-start treatment.
+func (ing *Ingester) resolveContractPosition(ctx context.Context, contractID string) (uint32, error) {
+	cc, err := ing.store.GetContractCursor(ctx, contractID)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		// No cursor row → new contract, cold start from retention window.
+		start, err := ing.coldStartPosition(ctx)
+		if err != nil {
+			return 0, err
+		}
+		ing.log.Info("new watched contract — backfill from retention window",
+			"contract_id", contractID, "start_ledger", start)
+		return start, nil
+	case err != nil:
+		return 0, fmt.Errorf("loading contract cursor for %s: %w", contractID, err)
+	}
+
+	if cc.LastIngestedLedger > 0 {
+		return uint32(cc.LastIngestedLedger) + 1, nil
+	}
+	// Has a row but no progress yet — cold start.
+	start, err := ing.coldStartPosition(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return start, nil
+}
+
+// resolveBatchStart finds the earliest start ledger across all contracts
+// in a filter batch. Contracts already ahead are covered by idempotent
+// upserts — they may re-receive some of their own events, which is harmless.
+func (ing *Ingester) resolveBatchStart(ctx context.Context, contractIDs []string) (uint32, string, error) {
+	var earliest uint32
+	earliest = 0
+
+	for _, id := range contractIDs {
+		start, err := ing.resolveContractPosition(ctx, id)
+		if err != nil {
+			return 0, "", err
+		}
+		if earliest == 0 || start < earliest {
+			earliest = start
+		}
+	}
+
+	return earliest, "", nil
+}
+
+// coldStartPosition returns the retention-window start ledger,
+// clamped to RPC retention, same rules as resolvePosition in unwatched mode.
+func (ing *Ingester) coldStartPosition(ctx context.Context) (uint32, error) {
+	startLedger, _, err := ing.resolvePosition(ctx)
+	return startLedger, err
+}
+
+// advanceContractCursors updates each contract's per-contract cursor so its
+// last_ingested_ledger and last_cursor reflect the latest event it received
+// in the current batch. Contracts with no matching events keep their existing
+// cursor untouched.
+func (ing *Ingester) advanceContractCursors(ctx context.Context, events []rpc.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Track each contract's latest event in this batch.
+	type latestEvent struct {
+		ledger uint32
+		cursor string
+	}
+	latestByContract := make(map[string]latestEvent)
+
+	for _, e := range events {
+		cur := latestByContract[e.ContractID]
+		if e.Ledger > cur.ledger || (e.Ledger == cur.ledger && e.CursorValue() > cur.cursor) {
+			latestByContract[e.ContractID] = latestEvent{
+				ledger: e.Ledger,
+				cursor: e.CursorValue(),
+			}
+		}
+	}
+
+	// Upsert each contract's cursor.
+	for contractID, info := range latestByContract {
+		cc := store.ContractCursor{
+			ContractID:         contractID,
+			LastIngestedLedger: int64(info.ledger),
+			LastCursor:         info.cursor,
+		}
+		if err := ing.store.SaveContractCursor(ctx, cc); err != nil {
+			return fmt.Errorf("saving cursor for contract %s: %w", contractID, err)
+		}
+	}
+
+	return nil
+}
+
+// earliestStartLedger walks all watched contracts and returns the smallest
+// startLedger across them, driving the window sweep bound. Unwatched mode
+// callers should use resolvePosition instead.
+func (ing *Ingester) earliestStartLedger(ctx context.Context, health rpc.Health) (uint32, error) {
+	watched, err := ing.store.ListWatchedContracts(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var earliest uint32
+	for _, wc := range watched {
+		start, err := ing.resolveContractPosition(ctx, wc.ContractID)
+		if err != nil {
+			return 0, err
+		}
+		if earliest == 0 || start < earliest {
+			earliest = start
+		}
+	}
+	if earliest == 0 {
+		start, _, err := ing.resolvePosition(ctx)
+		return start, err
+	}
+	return earliest, nil
 }

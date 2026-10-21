@@ -45,9 +45,8 @@ func Generate(src []byte) ([]byte, error) {
 }
 
 // rawSpec mirrors the parts of the OpenAPI document the client needs.
-// Fields the client does not care about (descriptions, examples,
-// headers) are dropped at parse time, keeping the generator's surface
-// small and the diff loud when the spec gains something unhandled.
+// Examples and headers are dropped at parse time, but descriptions are kept so
+// the generated public client remains useful in Go documentation.
 type rawSpec struct {
 	OpenAPI string `yaml:"openapi"`
 	Info    struct {
@@ -87,6 +86,7 @@ type rawParameter struct {
 type rawSchema struct {
 	Type                 string                `yaml:"type"`
 	Format               string                `yaml:"format"`
+	Description          string                `yaml:"description"`
 	Ref                  string                `yaml:"$ref"`
 	Nullable             bool                  `yaml:"nullable"`
 	Properties           map[string]*rawSchema `yaml:"properties"`
@@ -216,6 +216,12 @@ func (g *generator) emitSchemaTypes(buf *bytes.Buffer) {
 }
 
 func (g *generator) emitNamedType(buf *bytes.Buffer, name string, s *rawSchema) {
+	doc := strings.TrimSpace(s.Description)
+	if doc == "" {
+		doc = "API schema used by the SoroTrail client."
+	}
+	doc = strings.Join(strings.Fields(doc), " ")
+	buf.WriteString("// " + name + " " + doc + "\n")
 	switch {
 	case s.Ref != "":
 		fmt.Fprintf(buf, "type %s = %s\n\n", name, schemaBase(s.Ref))
@@ -279,6 +285,10 @@ func (g *generator) structFields(owner string, s *rawSchema, depth int) []string
 		tag := fmt.Sprintf("`json:%q`", name)
 		if optional {
 			tag = fmt.Sprintf("`json:%q`", name+",omitempty")
+		}
+		if description := strings.TrimSpace(prop.Description); description != "" {
+			description = strings.Join(strings.Fields(description), " ")
+			out = append(out, fmt.Sprintf("// %s %s", field, description))
 		}
 		out = append(out, fmt.Sprintf("%s %s %s", field, ftype, tag))
 	}

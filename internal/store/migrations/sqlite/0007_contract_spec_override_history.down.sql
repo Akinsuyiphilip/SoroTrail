@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS idx_contract_spec_override_history_contract;
+DROP TABLE IF EXISTS contract_spec_override_history;

@@ -164,6 +164,25 @@ func (s *guardedStore) GetIngestionState(ctx context.Context) (IngestionState, e
 	return state, err
 }
 
+func (s *guardedStore) GetIngestionStateForNetwork(ctx context.Context, network string) (IngestionState, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.GetIngestionStateForNetwork")
+	defer cancel()
+	start := time.Now()
+	var state IngestionState
+	var err error
+	if r, ok := s.Store.(interface {
+		GetIngestionStateForNetwork(context.Context, string) (IngestionState, error)
+	}); ok {
+		state, err = r.GetIngestionStateForNetwork(ctx, network)
+	} else if defaultNetwork(network) == "default" {
+		state, err = s.Store.GetIngestionState(ctx)
+	} else {
+		err = ErrNotFound
+	}
+	s.logSlowQuery(ctx, "store.GetIngestionStateForNetwork", start, err)
+	return state, err
+}
+
 func (s *guardedStore) SaveIngestionState(ctx context.Context, state IngestionState) error {
 	ctx, cancel := s.wrapContext(ctx, "store.SaveIngestionState")
 	defer cancel()
@@ -245,20 +264,29 @@ func (s *guardedStore) ListWatchedContracts(ctx context.Context) ([]WatchedContr
 	return ids, err
 }
 
-func (s *guardedStore) AddWatchedContract(ctx context.Context, contractID string) error {
+func (s *guardedStore) ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error) {
+	ctx, cancel := s.wrapContext(ctx, "store.ListWatchedContractsScoped")
+	defer cancel()
+	start := time.Now()
+	ids, err := s.Store.ListWatchedContractsScoped(ctx, sc)
+	s.logSlowQuery(ctx, "store.ListWatchedContractsScoped", start, err)
+	return ids, err
+}
+
+func (s *guardedStore) AddWatchedContract(ctx context.Context, w WatchedContract) error {
 	ctx, cancel := s.wrapContext(ctx, "store.AddWatchedContract")
 	defer cancel()
 	start := time.Now()
-	err := s.Store.AddWatchedContract(ctx, contractID)
+	err := s.Store.AddWatchedContract(ctx, w)
 	s.logSlowQuery(ctx, "store.AddWatchedContract", start, err)
 	return err
 }
 
-func (s *guardedStore) RemoveWatchedContract(ctx context.Context, contractID string) error {
+func (s *guardedStore) RemoveWatchedContract(ctx context.Context, w WatchedContract) error {
 	ctx, cancel := s.wrapContext(ctx, "store.RemoveWatchedContract")
 	defer cancel()
 	start := time.Now()
-	err := s.Store.RemoveWatchedContract(ctx, contractID)
+	err := s.Store.RemoveWatchedContract(ctx, w)
 	s.logSlowQuery(ctx, "store.RemoveWatchedContract", start, err)
 	return err
 }

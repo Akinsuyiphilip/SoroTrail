@@ -25,7 +25,7 @@ func (r *Resolver) resolveContracts(ctx context.Context, args PageInput) (any, e
 		return nil, errors.New("graphQL server misconfigured: store not wired")
 	}
 
-	rows, err := r.store.ListWatchedContracts(ctx)
+	rows, err := r.store.ListWatchedContractsScoped(ctx, scopeFrom(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +100,7 @@ func (r *Resolver) resolveContract(ctx context.Context, id string) (any, error) 
 	if id == "" {
 		return nil, errors.New("contract id is required")
 	}
-	rows, err := r.store.ListWatchedContracts(ctx)
+	rows, err := r.store.ListWatchedContractsScoped(ctx, scopeFrom(ctx))
 	if err != nil {
 		return nil, err
 	}

@@ -265,6 +265,104 @@ func TestArgumentValue(t *testing.T) {
 	}
 }
 
+// firstField parses q and returns its first root-level field, so the
+// table below exercises the same AST shape executeOperation hands to
+// fieldArguments rather than a hand-built approximation of it.
+func firstField(t *testing.T, q string) *ast.Field {
+	t.Helper()
+	f, ok := parseOp(t, q).SelectionSet[0].(*ast.Field)
+	require.True(t, ok, "first selection is not a field")
+	return f
+}
+
+// TestFieldArguments pins how fieldArguments turns a parsed field's
+// argument list into the JSON object resolvers unmarshal. A dropped or
+// widened argument here silently changes what a query filters on, so
+// every rule is asserted exactly.
+func TestFieldArguments(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		vars    map[string]any
+		want    map[string]any
+		wantErr string
+	}{
+		// Every kind the executor accepts must survive into the JSON
+		// object, not only the string/int pair the happy path usually hits.
+		{
+			name:  "all supplied arguments are collected",
+			query: `{ events(contract: "CABC", first: 10, live: true, status: OPEN, tags: ["a", "b"], meta: { page: 2 }) }`,
+			want: map[string]any{
+				"contract": "CABC",
+				"first":    float64(10),
+				"live":     true,
+				"status":   "OPEN",
+				"tags":     []any{"a", "b"},
+				"meta":     map[string]any{"page": float64(2)},
+			},
+		},
+
+		// Resolvers rely on non-nil JSON, so the no-argument case must
+		// stay the literal empty object rather than a nil RawMessage.
+		{
+			name:  "field with no arguments yields an empty map rather than nil",
+			query: `{ events }`,
+			want:  map[string]any{},
+		},
+
+		// Nothing upstream rejects a duplicated argument name before this
+		// function, so the map assignment is the whole rule: the last
+		// occurrence wins. Pinning that keeps a silent switch to
+		// first-wins from changing what queries filter on.
+		{
+			name:  "duplicate argument names keep the last occurrence",
+			query: `{ events(limit: 5, limit: 9) }`,
+			want:  map[string]any{"limit": float64(9)},
+		},
+
+		// Variables are resolved against the operation's variables, both
+		// as whole values and inside composites like lists.
+		{
+			name:  "variable references are resolved against the operation's variables",
+			query: `query Q($c: String!, $n: Int!) { events(contract: $c, first: $n, tags: [$c, "fixed"]) }`,
+			vars:  map[string]any{"c": "CABC", "n": float64(10)},
+			want: map[string]any{
+				"contract": "CABC",
+				"first":    float64(10),
+				"tags":     []any{"CABC", "fixed"},
+			},
+		},
+
+		// An unresolvable value must fail the field with the argument
+		// named in the error, never collapse into a dropped filter that
+		// silently widens the query.
+		{
+			name:    "unknown variable is reported with the argument's name",
+			query:   `{ events(contract: $absent) }`,
+			wantErr: `argument "contract": missing variable "absent"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := fieldArguments(firstField(t, tc.query), tc.vars)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				assert.Nil(t, got, "a failed conversion must not return partial arguments")
+				return
+			}
+			require.NoError(t, err)
+			// json.RawMessage("{}") is non-nil; unmarshalling also proves
+			// the payload is valid JSON before it reaches a resolver.
+			require.NotNil(t, got)
+			var decoded map[string]any
+			require.NoError(t, json.Unmarshal(got, &decoded))
+			assert.Equal(t, tc.want, decoded)
+		})
+	}
+}
+
 func TestFieldArguments_CoercionAndErrors(t *testing.T) {
 	// Verify fieldArguments orchestrates argument extraction and validation
 	// using the coercion routines.

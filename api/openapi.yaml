@@ -6,7 +6,14 @@ info:
     a Stellar RPC endpoint, stores contract events durably in Postgres, and
     serves them back through a queryable HTTP API long after the RPC has
     forgotten them.
-  version: "0.1.0"
+
+    JSON-producing operations accept the shared `pretty=true` query
+    parameter to indent responses for human inspection; it does not change
+    the response data.
+  version: "0.2.0"
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
 servers:
   - url: http://localhost:8080
     description: Local development
@@ -24,6 +31,18 @@ paths:
     get:
       operationId: health
       summary: Dependency health check
+      description: >-
+        Report whether the API process can reach its database and RPC
+        dependencies, with each dependency's state reported individually.
+        This probe is public and does not expose tenant data.
+
+        Every check runs concurrently under its own 5-second timeout, so
+        one hung dependency cannot starve another's budget. Each check
+        reports `status` (`ok`, `degraded` or `unready`), a `detail`
+        explaining any non-ok status, and how long that check alone took.
+        200 only when every check is `ok`; a `degraded` or `unready` check
+        answers 503. Ingestion freshness is deliberately not part of this
+        probe — see `/readyz`.
       tags: [System]
       security: []
       responses:
@@ -36,19 +55,22 @@ paths:
               example:
                 status: ok
                 checks:
-                  database: ok
-                  rpc: ok
+                  database: {status: ok, latency_ms: 1}
+                  rpc: {status: ok, latency_ms: 84}
         "503":
-          description: One or more dependencies degraded
+          description: At least one dependency is degraded or unready
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
               example:
-                status: degraded
+                status: unready
                 checks:
-                  database: ok
-                  rpc: unavailable
+                  database: {status: ok, latency_ms: 1}
+                  rpc:
+                    status: unready
+                    detail: "Get \"https://rpc.example/\": connection refused"
+                    latency_ms: 12
   /events:
     get:
       operationId: listEvents
@@ -56,7 +78,7 @@ paths:
       description: |
         Paginated list of stored events, filterable by contract, type, topic,
         ledger range, time range, and sort order. Supports cursor-based
-        pagination and optional spec-driven enrichment.
+        pagination, field/XDR projections, and optional spec-driven enrichment.
       tags: [Events]
       parameters:
         - $ref: "#/components/parameters/ContractID"
@@ -75,6 +97,20 @@ paths:
         - $ref: "#/components/parameters/Order"
         - $ref: "#/components/parameters/OrderBy"
         - $ref: "#/components/parameters/Decoded"
+        - $ref: "#/components/parameters/ContractIDPrefix"
+        - $ref: "#/components/parameters/TopicContains"
+        - $ref: "#/components/parameters/TxHash"
+        - $ref: "#/components/parameters/TxIndex"
+        - $ref: "#/components/parameters/OpIndex"
+        - $ref: "#/components/parameters/InSuccessfulCall"
+        - $ref: "#/components/parameters/HasValue"
+        - $ref: "#/components/parameters/Recent"
+        - $ref: "#/components/parameters/Fields"
+        - $ref: "#/components/parameters/IncludeXDR"
+        - $ref: "#/components/parameters/Stream"
+        - $ref: "#/components/parameters/Envelope"
+        - $ref: "#/components/parameters/Pretty"
+        - $ref: "#/components/parameters/IfNoneMatch"
       responses:
         "200":
           description: A page of events
@@ -87,10 +123,16 @@ paths:
               schema:
                 type: integer
                 minimum: 0
+            ETag:
+              $ref: "#/components/headers/ETag"
+            Link:
+              $ref: "#/components/headers/Link"
+            Cache-Control:
+              $ref: "#/components/headers/CacheControl"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/EventsResponse"
+                $ref: "#/components/schemas/EventListResponse"
               example:
                 events:
                   - id: "0001099511627776-0000000001"
@@ -105,7 +147,12 @@ paths:
                       - {"symbol":"transfer"}
                     value: {"address":"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}
                     created_at: "2026-07-21T12:00:00Z"
+                    network: public
                 cursor: "MjU2MDAwLTAwMDAwMDAwMDE="
+            application/x-ndjson:
+              schema:
+                type: string
+                description: One JSON event per line when stream=true.
         "304":
           $ref: "#/components/responses/NotModified"
         "400":
@@ -167,6 +214,10 @@ paths:
     get:
       operationId: getEvent
       summary: Get a single event by ID
+      description: >-
+        Return one stored event. The decoded parameter controls optional
+        spec-driven enrichment, while include_xdr returns the stored XDR
+        projection instead of decoded columns.
       tags: [Events]
       parameters:
         - name: id
@@ -182,15 +233,22 @@ paths:
             pattern: "^[0-9]{16}-[0-9]{10}$"
           example: "0001099511627776-0000000001"
         - $ref: "#/components/parameters/Decoded"
+        - $ref: "#/components/parameters/Fields"
+        - $ref: "#/components/parameters/IncludeXDR"
+        - $ref: "#/components/parameters/Pretty"
+        - $ref: "#/components/parameters/IfNoneMatch"
       responses:
         "200":
           description: The requested event
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+            Cache-Control:
+              $ref: "#/components/headers/CacheControl"
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: "#/components/schemas/Event"
-                  - $ref: "#/components/schemas/EnrichedEvent"
+                $ref: "#/components/schemas/Event"
               example:
                 id: "0001099511627776-0000000001"
                 contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
@@ -204,6 +262,7 @@ paths:
                   - {"symbol":"transfer"}
                 value: {"address":"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}
                 created_at: "2026-07-21T12:00:00Z"
+                network: public
         "304":
           $ref: "#/components/responses/NotModified"
         "400":
@@ -220,7 +279,10 @@ paths:
     get:
       operationId: contractEvents
       summary: List events for a contract
-      description: Convenience wrapper around GET /events with contract_id={id}
+      description: >-
+        Convenience wrapper around GET /events with contract_id={id}. It
+        accepts the same filters, pagination controls and response projections
+        as the general event listing.
       tags: [Events]
       parameters:
         - name: id
@@ -246,6 +308,17 @@ paths:
         - $ref: "#/components/parameters/Order"
         - $ref: "#/components/parameters/OrderBy"
         - $ref: "#/components/parameters/Decoded"
+        - $ref: "#/components/parameters/TopicContains"
+        - $ref: "#/components/parameters/TxHash"
+        - $ref: "#/components/parameters/TxIndex"
+        - $ref: "#/components/parameters/OpIndex"
+        - $ref: "#/components/parameters/InSuccessfulCall"
+        - $ref: "#/components/parameters/HasValue"
+        - $ref: "#/components/parameters/Recent"
+        - $ref: "#/components/parameters/Fields"
+        - $ref: "#/components/parameters/IncludeXDR"
+        - $ref: "#/components/parameters/Envelope"
+        - $ref: "#/components/parameters/Pretty"
       responses:
         "200":
           description: A page of events for the contract
@@ -258,10 +331,16 @@ paths:
               schema:
                 type: integer
                 minimum: 0
+            ETag:
+              $ref: "#/components/headers/ETag"
+            Link:
+              $ref: "#/components/headers/Link"
+            Cache-Control:
+              $ref: "#/components/headers/CacheControl"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/EventsResponse"
+                $ref: "#/components/schemas/EventListResponse"
               example:
                 events:
                   - id: "0001099511627776-0000000001"
@@ -307,27 +386,47 @@ paths:
             type: string
             pattern: "^[GC][A-Z2-7]{55}$"
           example: "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
+        - $ref: "#/components/parameters/EventType"
+        - $ref: "#/components/parameters/ContractID"
         - $ref: "#/components/parameters/FromLedger"
         - $ref: "#/components/parameters/ToLedger"
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"
         - $ref: "#/components/parameters/Order"
+        - name: order_by
+          in: query
+          description: >-
+            Address activity is always ordered by event ID; this is the only
+            accepted value.
+          schema:
+            type: string
+            enum: [id]
+            default: id
+        - $ref: "#/components/parameters/Recent"
+        - $ref: "#/components/parameters/Envelope"
+        - $ref: "#/components/parameters/Pretty"
       responses:
         "200":
           description: A page of events involving the address
           headers:
             X-Total-Count:
               description: >-
-                The total number of events matching the request's filters,
-                ignoring pagination. Omitted when the count could not be
-                computed; the page itself is still returned.
+                The total number of address events. The count endpoint used
+                by the handler does not apply optional filters, so use the
+                page's cursor for reliable filtered traversal.
               schema:
                 type: integer
                 minimum: 0
+            ETag:
+              $ref: "#/components/headers/ETag"
+            Link:
+              $ref: "#/components/headers/Link"
+            Cache-Control:
+              $ref: "#/components/headers/CacheControl"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/EventsResponse"
+                $ref: "#/components/schemas/EventListResponse"
               example:
                 events:
                   - id: "0001099511627776-0000000001"
@@ -356,7 +455,8 @@ paths:
       summary: Summarise an address's event history
       description: >-
         Aggregate view of an address's activity: first and last ledger it was
-        seen in, total event count, and the contracts it interacted with.
+        seen in, total event count, and the distinct contracts it interacted
+        with.
       tags: [Events]
       parameters:
         - name: address
@@ -375,13 +475,13 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/AddressSummary"
               example:
                 address: "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"
-                first_ledger: 256000
-                last_ledger: 256050
+                first_seen_ledger: 256000
+                last_seen_ledger: 256050
                 event_count: 12
-                contracts:
+                distinct_contracts:
                   - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
         "400":
           $ref: "#/components/responses/BadRequest"
@@ -415,14 +515,15 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/TenantList"
               example:
                 tenants:
                   - id: 1
                     name: "acme-corp"
+                    wildcard: false
+                    admin: false
                     enabled: true
                     created_at: "2026-07-21T00:00:00Z"
-                count: 1
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -438,22 +539,38 @@ paths:
       summary: Create a tenant
       description: >-
         Administrative endpoint, available only when MULTI_TENANT is enabled
-        and gated behind the admin credential.
+        and gated behind the admin credential. A name is required; quota
+        overrides are optional and inherit the instance defaults when omitted.
       tags: [Admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TenantCreateRequest"
+            example:
+              name: "acme-corp"
+              wildcard: false
+              admin: false
+              enabled: true
       responses:
         "201":
           description: Success
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/Tenant"
               example:
                 id: 1
                 name: "acme-corp"
+                wildcard: false
+                admin: false
                 enabled: true
                 created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -492,10 +609,12 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/Tenant"
               example:
                 id: 1
                 name: "acme-corp"
+                wildcard: false
+                admin: false
                 enabled: true
                 created_at: "2026-07-21T00:00:00Z"
         "400":
@@ -515,7 +634,8 @@ paths:
       summary: Update a tenant
       description: >-
         Administrative endpoint, available only when MULTI_TENANT is enabled
-        and gated behind the admin credential.
+        and gated behind the admin credential. PATCH semantics apply: fields
+        omitted from the JSON object retain their stored values.
       tags: [Admin]
       parameters:
         - name: id
@@ -529,20 +649,34 @@ paths:
             format: int64
             minimum: 1
           example: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TenantUpdateRequest"
+            example:
+              enabled: false
+              rate_limit_rps: 10
+              rate_limit_burst: 20
       responses:
         "200":
           description: Success
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/Tenant"
               example:
                 id: 1
                 name: "acme-corp"
+                wildcard: false
+                admin: false
                 enabled: true
                 created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -597,7 +731,8 @@ paths:
       summary: Get a tenant's recorded usage
       description: >-
         Administrative endpoint, available only when MULTI_TENANT is enabled
-        and gated behind the admin credential.
+        and gated behind the admin credential. The response contains one row
+        per UTC day in the requested history window.
       tags: [Admin]
       parameters:
         - name: id
@@ -628,12 +763,14 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/UsagePage"
               example:
-                tenant_id: 1
-                period_days: 7
-                requests: 12345
-                events_served: 67890
+                usage:
+                  - tenant_id: 1
+                    day: "2026-07-21T00:00:00Z"
+                    requests: 12345
+                    events_served: 67890
+                    stream_seconds: 3600
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -680,11 +817,10 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/GrantList"
               example:
-                grants:
+                contract_ids:
                   - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                count: 1
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -716,6 +852,14 @@ paths:
             format: int64
             minimum: 1
           example: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrantContractRequest"
+            example:
+              contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
       responses:
         "200":
           description: >-
@@ -724,14 +868,15 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/GrantList"
               example:
-                grants:
+                contract_ids:
                   - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                  - "CAAAA..."
-                count: 2
+                  - "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -778,11 +923,10 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/GrantList"
               example:
-                grants:
+                contract_ids:
                   - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                count: 1
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -801,7 +945,8 @@ paths:
       summary: List a tenant's API keys
       description: >-
         Administrative endpoint, available only when MULTI_TENANT is enabled
-        and gated behind the admin credential.
+        and gated behind the admin credential. Plaintext secrets are never
+        returned by this listing.
       tags: [Admin]
       parameters:
         - name: id
@@ -829,14 +974,14 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/TenantAPIKeysPage"
               example:
                 keys:
                   - id: 7
-                    prefix: "st_abc12"
-                    enabled: true
+                    tenant_id: 1
+                    name: "ci-reader"
+                    prefix: "ABCDEFGHIJKLMNOP"
                     created_at: "2026-07-21T00:00:00Z"
-                count: 1
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -854,7 +999,8 @@ paths:
       summary: Issue an API key for a tenant
       description: >-
         Administrative endpoint, available only when MULTI_TENANT is enabled
-        and gated behind the admin credential.
+        and gated behind the admin credential. The plaintext tenant key is
+        returned only in this response.
       tags: [Admin]
       parameters:
         - name: id
@@ -868,21 +1014,32 @@ paths:
             format: int64
             minimum: 1
           example: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TenantAPIKeyRequest"
+            example:
+              name: "ci-reader"
       responses:
         "201":
           description: Success
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/TenantAPIKey"
               example:
                 id: 7
-                prefix: "st_abc12"
-                key: "st_abc12_xylophone12345678"
-                enabled: true
+                tenant_id: 1
+                name: "ci-reader"
+                prefix: "ABCDEFGHIJKLMNOP"
+                secret: "st_ABCDEFGHIJKLMNOP_xylophone12345678"
                 created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -934,9 +1091,9 @@ paths:
       operationId: listAPIKeys
       summary: List API keys
       description: >-
-        Returns the metadata for every API key on this instance. The
-        plaintext key is never returned — it is visible only in the
-        response to POST /apikeys, at creation time.
+        Returns the metadata for every global API key on this instance. The
+        plaintext key is never returned — it is visible only in the response
+        to POST /apikeys, at creation time.
 
         This endpoint is authenticated regardless of API_KEY_AUTH_ENABLED:
         an unauthenticated key-management surface would let any caller mint
@@ -944,8 +1101,7 @@ paths:
         out of band with `sorotrail apikey`.
       tags: [Auth]
       security:
-        - TenantAuth: []
-        - TenantAuthHeader: []
+        - InstanceAPIKey: []
       responses:
         "200":
           description: Success
@@ -958,7 +1114,7 @@ paths:
               example:
                 - id: 1
                   name: "ci-reader"
-                  prefix: "a1b2c3d4e5f6g7h8"
+                  prefix: "a1b2c3d4e5f60718"
                   created_at: "2026-09-01T12:00:00Z"
         "401":
           $ref: "#/components/responses/Unauthorized"
@@ -966,36 +1122,29 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
     post:
       operationId: createAPIKey
       summary: Create an API key
       description: >-
-        Mints a new API key and returns it. The `key` field in the response
-        is the only time the plaintext key is ever available — only a
-        bcrypt hash of its secret half is persisted, so a lost key cannot
+        Mints a new global API key and returns it. The `key` field in the
+        response is the only time the plaintext key is ever available — only
+        a bcrypt hash of its secret half is persisted, so a lost key cannot
         be recovered and must be revoked and reissued.
 
         The request body is optional; omitting it creates an unnamed key.
       tags: [Auth]
       security:
-        - TenantAuth: []
-        - TenantAuthHeader: []
+        - InstanceAPIKey: []
       requestBody:
         required: false
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                name:
-                  type: string
-                  maxLength: 100
-                  description: >-
-                    A human-readable label for the key, to make it
-                    identifiable in the list response. At most 100
-                    characters.
-              example:
-                name: "ci-reader"
+              $ref: "#/components/schemas/APIKeyRequest"
+            example:
+              name: "ci-reader"
       responses:
         "201":
           description: Created
@@ -1011,34 +1160,38 @@ paths:
                         type: string
                         description: >-
                           The plaintext key, in the form
-                          `st_<prefix>_<secret>`. Returned once and never
-                          again; store it before discarding the response.
+                          `sorotrail_<16-hex-prefix>_<64-hex-secret>`.
+                          Returned once and never again; store it before
+                          discarding the response.
               example:
                 id: 1
                 name: "ci-reader"
-                prefix: "a1b2c3d4e5f6g7h8"
+                prefix: "a1b2c3d4e5f60718"
                 created_at: "2026-09-01T12:00:00Z"
-                key: "st_a1b2c3d4e5f6g7h8_Zm9vYmFyYmF6cXV4..."
+                key: "sorotrail_a1b2c3d4e5f60718_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /apikeys/{id}:
     delete:
       operationId: revokeAPIKey
       summary: Revoke an API key
       description: >-
-        Marks the key revoked. The row is kept so the key's history stays
-        auditable, but the key stops authenticating immediately. Revoking
-        an already-revoked key is not an error.
+        Marks the global key revoked. The row is kept so the key's history
+        stays auditable, but the key stops authenticating immediately.
+        Revoking an already-revoked key is not an error.
       tags: [Auth]
       security:
-        - TenantAuth: []
-        - TenantAuthHeader: []
+        - InstanceAPIKey: []
       parameters:
         - name: id
           in: path
@@ -1065,6 +1218,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /contracts:
     get:
       operationId: listContracts
@@ -1099,6 +1254,8 @@ paths:
             type: string
             pattern: "^C[A-Z2-7]{0,55}$"
           example: "CDLZ"
+        - $ref: "#/components/parameters/Envelope"
+        - $ref: "#/components/parameters/Pretty"
       responses:
         "200":
           description: A page of indexed contracts
@@ -1114,7 +1271,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ContractsPage"
+                $ref: "#/components/schemas/ContractListResponse"
               example:
                 contracts:
                   - contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
@@ -1131,14 +1288,20 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /livez:
     get:
       operationId: livez
       summary: Liveness probe
       description: >-
-        Reports only that the process is up. Never touches the database or RPC.
-        It therefore has no failure response: a process that cannot answer 200
-        here cannot answer at all.
+        Reports only that the process is up. Never touches the database or
+        RPC — the `checks` object carries the single `process` check and
+        nothing else, and that independence is the contract: a dependency
+        outage must not fail a liveness probe, or the orchestrator would
+        restart the one component that could have reported the outage. A
+        process that cannot answer 200 here cannot answer at all, so there
+        is no failure response.
       tags: [Operations]
       security: []
       responses:
@@ -1150,19 +1313,39 @@ paths:
                 $ref: "#/components/schemas/HealthResponse"
               example:
                 status: ok
-                checks: {}
+                checks:
+                  process: {status: ok, latency_ms: 0}
   /readyz:
     get:
       operationId: readyz
       summary: Readiness probe
       description: >-
-        Reports whether the database, RPC and schema are usable, and whether
-        ingestion has fallen more than 100 ledgers behind the chain head.
+        Reports whether the database, RPC and ingestion freshness are usable,
+        with each dependency's state reported individually so a failing probe
+        names the dependency that failed without anyone reading logs.
+
+        Every check runs concurrently under its own 5-second timeout. The
+        thresholds that separate the states:
+
+        - `unready` — a dependency gave no answer (it errored, or blew its
+          5-second per-check budget): the database is unreachable, the RPC
+          is unreachable, the ingestion state row cannot be read, or the
+          chain head is needed but unavailable.
+        - `degraded` — everything answered, but a dependency reports a
+          suboptimal state: the RPC answers `getHealth` with something
+          other than "healthy", or ingestion is more than 100 ledgers
+          behind the chain head (`readinessLagThreshold`, evaluated only
+          once at least one ledger has been ingested).
+        - `ok` — everything answered and is within threshold.
+
+        Both `degraded` and `unready` answer 503: staleness and failure
+        both remove the instance from rotation, and the split lives in the
+        body so an operator knows whether to wait or to intervene.
       tags: [Operations]
       security: []
       responses:
         "200":
-          description: Every dependency is usable and ingestion is current
+          description: Every dependency is answering and ingestion is current
           content:
             application/json:
               schema:
@@ -1170,13 +1353,15 @@ paths:
               example:
                 status: ok
                 checks:
-                  database: ok
-                  rpc: ok
-                  ingestion: current
+                  database: {status: ok, latency_ms: 1}
+                  rpc: {status: ok, latency_ms: 84}
+                  ingestion_lag:
+                    status: ok
+                    detail: no ingestion state recorded yet
         "503":
           description: >-
-            A dependency is unusable or ingestion is lagging. The body names
-            the failing check so the instance can be pulled from the load
+            A dependency is degraded or unready. The body names the failing
+            check and its state so the instance can be pulled from the load
             balancer without reading the logs. This is a degraded-readiness
             report rather than the shared error envelope.
           content:
@@ -1186,9 +1371,12 @@ paths:
               example:
                 status: degraded
                 checks:
-                  database: ok
-                  rpc: unavailable
-                  ingestion: lagging (150 ledgers behind)
+                  database: {status: ok, latency_ms: 1}
+                  rpc: {status: ok, latency_ms: 86}
+                  ingestion_lag:
+                    status: degraded
+                    detail: "150 ledgers behind (last ingested: 260000, chain head: 260150)"
+                    latency_ms: 3
   /version:
     get:
       operationId: version
@@ -1261,6 +1449,14 @@ paths:
         - $ref: "#/components/parameters/ToLedger"
         - $ref: "#/components/parameters/FromTime"
         - $ref: "#/components/parameters/ToTime"
+        - $ref: "#/components/parameters/ContractIDPrefix"
+        - $ref: "#/components/parameters/TopicContains"
+        - $ref: "#/components/parameters/TxHash"
+        - $ref: "#/components/parameters/TxIndex"
+        - $ref: "#/components/parameters/OpIndex"
+        - $ref: "#/components/parameters/InSuccessfulCall"
+        - $ref: "#/components/parameters/HasValue"
+        - $ref: "#/components/parameters/Pretty"
       responses:
         "200":
           description: Success
@@ -1303,6 +1499,13 @@ paths:
         - $ref: "#/components/parameters/ToLedger"
         - $ref: "#/components/parameters/FromTime"
         - $ref: "#/components/parameters/ToTime"
+        - $ref: "#/components/parameters/ContractIDPrefix"
+        - $ref: "#/components/parameters/TopicContains"
+        - $ref: "#/components/parameters/TxHash"
+        - $ref: "#/components/parameters/TxIndex"
+        - $ref: "#/components/parameters/OpIndex"
+        - $ref: "#/components/parameters/InSuccessfulCall"
+        - $ref: "#/components/parameters/HasValue"
         - name: bucket
           in: query
           required: true
@@ -1321,29 +1524,19 @@ paths:
             hourly:
               summary: One bucket per hour
               value: 1h
+        - $ref: "#/components/parameters/Pretty"
       responses:
         "200":
           description: Success
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  buckets:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        key:
-                          type: string
-                        count:
-                          type: integer
-                          format: int64
+                $ref: "#/components/schemas/AggregateResponse"
               example:
                 buckets:
-                  - key: "256000"
+                  - bucket: "256000"
                     count: 5
-                  - key: "256001"
+                  - bucket: "256001"
                     count: 3
         "400":
           $ref: "#/components/responses/BadRequest"
@@ -1358,7 +1551,8 @@ paths:
       operationId: eventsCSV
       summary: Export events as CSV
       description: >-
-        Streaming CSV export of matching events.
+        Streaming CSV export of matching events. Pagination controls are
+        intentionally ignored; the server walks the complete result set.
       tags: [Operations]
       parameters:
         - $ref: "#/components/parameters/ContractID"
@@ -1372,11 +1566,33 @@ paths:
         - $ref: "#/components/parameters/ToLedger"
         - $ref: "#/components/parameters/FromTime"
         - $ref: "#/components/parameters/ToTime"
+        - $ref: "#/components/parameters/ContractIDPrefix"
+        - $ref: "#/components/parameters/TopicContains"
+        - $ref: "#/components/parameters/TxHash"
+        - $ref: "#/components/parameters/TxIndex"
+        - $ref: "#/components/parameters/OpIndex"
+        - $ref: "#/components/parameters/InSuccessfulCall"
+        - $ref: "#/components/parameters/HasValue"
         - $ref: "#/components/parameters/Order"
         - $ref: "#/components/parameters/OrderBy"
+        - $ref: "#/components/parameters/Recent"
       responses:
         "200":
-          description: Success
+          description: CSV rows streamed until the complete result set is written.
+          headers:
+            Content-Disposition:
+              description: Attachment filename for the generated CSV.
+              schema:
+                type: string
+            Cache-Control:
+              description: Caching policy for the streamed export.
+              schema:
+                type: string
+          content:
+            text/csv:
+              schema:
+                type: string
+                description: CSV text with id, ledger, type, tx_hash, topics and value columns.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1407,9 +1623,15 @@ paths:
             type: string
             pattern: "^[0-9]{16}-[0-9]{10}$"
           example: "0001099511627776-0000000001"
+        - $ref: "#/components/parameters/IfNoneMatch"
       responses:
         "200":
           description: Success
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+            Cache-Control:
+              $ref: "#/components/headers/CacheControl"
           content:
             application/json:
               schema:
@@ -1457,28 +1679,31 @@ paths:
             pattern: "^[0-9]{16}-[0-9]{10}$"
           example: "0001099511627776-0000000001"
         - $ref: "#/components/parameters/Decoded"
+        - $ref: "#/components/parameters/Fields"
+        - $ref: "#/components/parameters/IncludeXDR"
+        - $ref: "#/components/parameters/Pretty"
       responses:
         "200":
           description: Success
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/Event"
+                $ref: "#/components/schemas/EventsResponse"
               example:
-                - id: "0001099511627776-0000000002"
-                  contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                  ledger: 256000
-                  type: contract
-                  tx_hash: "9f5c7a2b..."
-                  tx_index: 0
-                  op_index: 1
-                  in_successful_call: true
-                  topics:
-                    - {"symbol":"transfer"}
-                  value: {"address":"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}
-                  created_at: "2026-07-21T12:00:00Z"
+                events:
+                  - id: "0001099511627776-0000000002"
+                    contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    ledger: 256000
+                    type: contract
+                    tx_hash: "9f5c7a2b..."
+                    tx_index: 0
+                    op_index: 1
+                    in_successful_call: true
+                    topics:
+                      - {"symbol":"transfer"}
+                    value: {"address":"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}
+                    created_at: "2026-07-21T12:00:00Z"
+                    network: public
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1551,6 +1776,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /contracts/{id}/stats:
     get:
       operationId: contractStats
@@ -1611,17 +1838,28 @@ paths:
                           type: integer
                           format: int64
                           description: Number of events of this type
-              example:
-                contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                name: "Soroban Token"
-                symbol: "STOK"
-                decimals: 7
-                event_count: 42
-                type_breakdown:
-                  - type: contract
-                    count: 38
-                  - type: diagnostic
-                    count: 4
+              examples:
+                token_contract:
+                  summary: Contract with cached token metadata
+                  value:
+                    contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    name: "Soroban Token"
+                    symbol: "STOK"
+                    decimals: 7
+                    event_count: 42
+                    type_breakdown:
+                      - type: contract
+                        count: 38
+                      - type: diagnostic
+                        count: 4
+                plain_contract:
+                  summary: Contract without cached token metadata
+                  value:
+                    contract_id: "CAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSBFLM"
+                    event_count: 19
+                    type_breakdown:
+                      - type: contract
+                        count: 19
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1632,6 +1870,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /contracts/{id}/export:
     get:
       operationId: contractExport
@@ -1676,14 +1916,34 @@ paths:
           example: 256999
         - name: format
           in: query
-          description: Serialisation of the exported stream.
+          description: >-
+            Serialisation of the exported stream. The value is matched
+            case-insensitively after surrounding whitespace is trimmed.
           schema:
             type: string
             enum: [csv, ndjson]
             default: csv
       responses:
         "200":
-          description: Success
+          description: The requested export stream.
+          headers:
+            Content-Disposition:
+              description: Attachment filename containing the contract and ledger range.
+              schema:
+                type: string
+            Cache-Control:
+              description: Caching policy for the streamed export.
+              schema:
+                type: string
+          content:
+            text/csv:
+              schema:
+                type: string
+                description: CSV rows when format=csv.
+            application/x-ndjson:
+              schema:
+                type: string
+                description: One JSON event per line when format=ndjson.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1701,8 +1961,8 @@ paths:
       description: >-
         Stores a user-supplied contract spec (SEP-0041 JSON) for a contract
         that exposes no fetchable spec. The enricher prefers the override
-        over the RPC-fetched spec whenever one exists. Accepts either
-        {"spec": {...}} or a bare spec object.
+        over the RPC-fetched spec whenever one exists. Send the JSON body as
+        {"spec": {...}}.
       tags: [Operations]
       security:
         - ManagementKey: []
@@ -1720,7 +1980,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
+              $ref: "#/components/schemas/ContractSpecOverrideRequest"
             example:
               spec:
                 events:
@@ -1741,12 +2001,18 @@ paths:
                     type: object
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     get:
       operationId: getContractSpecOverride
       summary: Get a contract spec override
@@ -1788,6 +2054,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       operationId: deleteContractSpecOverride
       summary: Delete a contract spec override
@@ -1827,6 +2095,127 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /contracts/{id}/spec/history:
+    get:
+      operationId: listContractSpecOverrideHistory
+      summary: List a contract's spec override history
+      description: >-
+        Lists every recorded change to a contract's spec override, newest
+        first. Each entry records the spec that was in force, the API key
+        prefix that made the change, and when — so "did someone change the
+        override?" has an answer.
+
+        An entry with no `spec` is a tombstone: the override was deleted at
+        that point rather than replaced. The history is append-only and is
+        retained in full; it is never consulted when decoding an event.
+
+        Paginated with an opaque cursor over the version id.
+      tags: [Operations]
+      security:
+        - ManagementKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The contract whose override history is being read.
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of override history, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [versions, count]
+                properties:
+                  versions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ContractSpecOverrideVersion"
+                  count:
+                    type: integer
+                  cursor:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /contracts/{id}/spec/revert:
+    post:
+      operationId: revertContractSpecOverride
+      summary: Restore a previous contract spec override
+      description: >-
+        Restores a previous version of a contract's spec override, named by
+        the `version` in the request body — the id of an entry in the
+        override history.
+
+        The revert is itself a change, so it is recorded as a new history
+        entry: the history stays append-only and keeps the whole sequence,
+        including the way back.
+      tags: [Operations]
+      security:
+        - ManagementKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The contract whose spec override is being restored.
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContractSpecOverrideRevertRequest"
+            example:
+              version: 3
+      responses:
+        "200":
+          description: The restored override
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_id, spec]
+                properties:
+                  contract_id:
+                    type: string
+                  spec:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /tenant:
     get:
       operationId: currentTenant
@@ -1840,12 +2229,17 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/CurrentTenant"
               example:
-                id: 1
-                name: "acme-corp"
-                enabled: true
-                grants:
+                tenant:
+                  id: 1
+                  name: "acme-corp"
+                  wildcard: false
+                  admin: false
+                  enabled: true
+                  created_at: "2026-07-21T00:00:00Z"
+                wildcard: false
+                granted_contract_ids:
                   - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
         "401":
           $ref: "#/components/responses/Unauthorized"
@@ -1862,7 +2256,7 @@ paths:
       operationId: currentTenantUsage
       summary: Usage for the calling tenant
       description: >-
-        Recorded request and event-served counters for the caller.
+        Recorded request, event-served and stream-time counters for the caller.
       tags: [Operations]
       parameters:
         - name: days
@@ -1876,18 +2270,21 @@ paths:
             maximum: 365
             default: 30
           example: 7
+        - $ref: "#/components/parameters/Pretty"
       responses:
         "200":
           description: Success
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/UsagePage"
               example:
-                tenant_id: 1
-                period_days: 7
-                requests: 12345
-                events_served: 67890
+                usage:
+                  - tenant_id: 1
+                    day: "2026-07-21T00:00:00Z"
+                    requests: 12345
+                    events_served: 67890
+                    stream_seconds: 3600
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1921,11 +2318,10 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/TenantWatchList"
               example:
-                contracts:
+                contract_ids:
                   - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                count: 1
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1940,8 +2336,17 @@ paths:
       operationId: addTenantWatch
       summary: Add a contract to the tenant's watch list
       description: >-
-        Adds a contract to the calling tenant's watch list.
+        Adds a contract to the calling tenant's watch list. The contract must
+        be a valid Stellar contract ID; the response is the refreshed list.
       tags: [Operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WatchedContractRequest"
+            example:
+              contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
       responses:
         "200":
           description: >-
@@ -1950,14 +2355,15 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/TenantWatchList"
               example:
-                contracts:
+                contract_ids:
                   - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                  - "CAAAA..."
-                count: 2
+                  - "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1973,7 +2379,10 @@ paths:
       operationId: removeTenantWatch
       summary: Remove a contract from the tenant's watch list
       description: >-
-        Removes a contract from the calling tenant's watch list.
+        Removes a contract from the calling tenant's watch list. Removing a
+        well-formed contract the tenant does not hold is a no-op that still
+        answers 200 with the unchanged list, so retries stay idempotent; only
+        a malformed contract_id is rejected with a 400.
       tags: [Operations]
       parameters:
         - name: contract_id
@@ -1992,11 +2401,12 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/TenantWatchList"
               example:
-                contracts:
+                contract_ids:
                   - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                count: 1
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -2030,11 +2440,11 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/WatchedContractsPage"
               example:
                 contracts:
                   - contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                    start_ledger: 256000
+                    added_at: "2026-07-21T12:00:00Z"
                 count: 1
         "401":
           $ref: "#/components/responses/Unauthorized"
@@ -2048,29 +2458,47 @@ paths:
       operationId: addWatchedContract
       summary: Add a watched contract
       description: >-
-        Starts ingesting a contract on the next poll.
+        Starts ingesting a contract on the next poll. When this is the first
+        watched contract, pass confirm=true to acknowledge switching from
+        all-contract ingestion to the explicit list.
       tags: [Operations]
       security:
         - ManagementKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WatchedContractRequest"
+            example:
+              contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+      parameters:
+        - name: confirm
+          in: query
+          description: >-
+            Required when adding the first watched contract, because that
+            changes ingestion from all contracts to the explicit list. The
+            exact value "true" acknowledges the transition.
+          schema:
+            type: string
+            enum: ["true"]
+          example: "true"
       responses:
         "200":
-          description: >-
-            The refreshed watch list, plus the ledger ingestion for the new
-            contract will start from. Not a 201: the response is the whole
-            list, not the created row.
+          description: The newly watched contract and its ingestion frontier.
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/WatchedContractAdded"
               example:
-                contracts:
-                  - contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                    start_ledger: 256000
-                  - contract_id: "CAAAA..."
-                    start_ledger: 256000
-                count: 2
+                contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                added_at: "2026-07-21T12:00:00Z"
+                history_from_ledger: 256000
+                mode_transition: all_to_specific
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -2104,22 +2532,30 @@ paths:
           schema:
             type: string
             enum: ["true"]
+        - name: network
+          in: query
+          description: >-
+            The network whose watch-list entry to remove. Omit to remove
+            from the deployment's configured NETWORK (falling back to
+            "default"). A contract watched on several networks keeps its
+            other entries.
+          schema:
+            type: string
+          example: testnet
       security:
         - ManagementKey: []
       responses:
         "200":
-          description: >-
-            The refreshed watch list. Not a 204: the response carries the
-            remaining contracts.
+          description: The removed contract and the resulting ingestion mode.
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/WatchedContractRemoved"
               example:
-                contracts:
-                  - contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                    start_ledger: 256000
-                count: 1
+                contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                removed_at: "2026-07-21T12:00:00Z"
+                history_preserved: true
+                mode_transition: specific_to_all
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -2153,6 +2589,8 @@ paths:
           example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Envelope"
+        - $ref: "#/components/parameters/Pretty"
       responses:
         "200":
           description: Success
@@ -2168,15 +2606,25 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                oneOf:
+                  - $ref: "#/components/schemas/DeadLettersPage"
+                  - $ref: "#/components/schemas/DeadLettersEnvelope"
               example:
                 dead_letters:
                   - id: 42
+                    event_id: "0001099511627776-0000000001"
                     contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
                     ledger: 256000
+                    type: contract
+                    tx_hash: "9f5c7a2b..."
+                    topic_xdr: ["AAAAA"]
+                    value_xdr: "CCCCC"
                     error: "unexpected end of JSON input"
+                    attempts: 3
+                    last_attempt: "2026-07-21T12:00:00Z"
                     created_at: "2026-07-21T12:00:00Z"
                 count: 1
+                cursor: "42"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -2225,6 +2673,9 @@ paths:
     get:
       operationId: stats
       summary: Indexer statistics
+      description: >-
+        Return ingestion, audit, pruner, RPC and decoder counters for the
+        running indexer.
       tags: [System]
       responses:
         "200":
@@ -2253,20 +2704,25 @@ paths:
       description: |
         Upgrades to a WebSocket connection that pushes ingested events as they
         are stored. The stream starts at "now" — no replay of historical events.
-        Use the same EventFilter query parameters as GET /events.
+        The live broadcaster applies contract, event type, topic, ledger/time
+        range and has-value filters; pagination and historical-only query
+        parameters do not create a replay stream.
+
+        A handshake the websocket library refuses before the upgrade answers
+        with plain text rather than the JSON envelope: 426 when the request is
+        not an upgrade attempt at all (missing Connection/Upgrade headers, or
+        HTTP/1.0), 400 when it is an upgrade attempt with a malformed handshake
+        (unsupported protocol version, or a missing/invalid Sec-WebSocket-Key).
       tags: [Events]
       parameters:
         - $ref: "#/components/parameters/ContractID"
         - $ref: "#/components/parameters/EventType"
         - $ref: "#/components/parameters/Topic"
-        - $ref: "#/components/parameters/Topic0"
-        - $ref: "#/components/parameters/Topic1"
-        - $ref: "#/components/parameters/Topic2"
-        - $ref: "#/components/parameters/Topic3"
         - $ref: "#/components/parameters/FromLedger"
         - $ref: "#/components/parameters/ToLedger"
         - $ref: "#/components/parameters/FromTime"
         - $ref: "#/components/parameters/ToTime"
+        - $ref: "#/components/parameters/HasValue"
       responses:
         "101":
           description: WebSocket upgrade successful
@@ -2276,6 +2732,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "426":
+          $ref: "#/components/responses/UpgradeRequired"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2286,6 +2744,9 @@ paths:
     post:
       operationId: createSubscription
       summary: Register a new webhook subscription
+      description: >-
+        Register a callback and an event filter. The signing secret is
+        returned in the response and must be stored by the caller.
       tags: [Webhooks]
       requestBody:
         required: true
@@ -2319,8 +2780,12 @@ paths:
                 created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2328,6 +2793,9 @@ paths:
     get:
       operationId: listSubscriptions
       summary: List all webhook subscriptions
+      description: >-
+        Return every webhook subscription visible to the authenticated
+        caller. Responses include the signing secret and are not cacheable.
       tags: [Webhooks]
       responses:
         "200":
@@ -2365,6 +2833,7 @@ paths:
     get:
       operationId: getSubscription
       summary: Get a single subscription by ID
+      description: Return one webhook subscription and its current filter.
       tags: [Webhooks]
       parameters:
         - name: id
@@ -2405,7 +2874,9 @@ paths:
     put:
       operationId: updateSubscription
       summary: Update a subscription
-      description: Only fields present in the request body are changed.
+      description: >-
+        Update a webhook subscription. Only fields present in the request
+        body are changed; omitted fields retain their stored values.
       tags: [Webhooks]
       parameters:
         - name: id
@@ -2444,8 +2915,12 @@ paths:
                 created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "429":
@@ -2455,6 +2930,7 @@ paths:
     delete:
       operationId: deleteSubscription
       summary: Delete a subscription and its delivery history
+      description: Remove a webhook subscription and its stored delivery attempts.
       tags: [Webhooks]
       parameters:
         - name: id
@@ -2483,6 +2959,7 @@ paths:
     get:
       operationId: listDeliveries
       summary: List delivery attempts for a subscription
+      description: Return the delivery attempts recorded for one subscription.
       tags: [Webhooks]
       parameters:
         - name: id
@@ -2495,6 +2972,8 @@ paths:
             minimum: 1
           example: 1
         - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Envelope"
+        - $ref: "#/components/parameters/Pretty"
       responses:
         "200":
           description: Delivery attempts, newest first
@@ -2510,9 +2989,11 @@ paths:
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/DeliveryAttempt"
+                oneOf:
+                  - type: array
+                    items:
+                      $ref: "#/components/schemas/DeliveryAttempt"
+                  - $ref: "#/components/schemas/DeliveryEnvelopeResponse"
               example:
                 - id: 1
                   subscription_id: 1
@@ -2668,16 +3149,16 @@ components:
         a caller asking for more than it may have finds out instead of
         silently receiving a short page and assuming it reached the end.
 
-        The ceiling is 500. An operator can lower it with the API_MAX_LIMIT
-        environment variable, so a deployment may reject a value this schema
-        permits; the store never returns more than 500 rows in one page
-        regardless.
+        The maximum is configurable at deploy time: API_MAX_LIMIT lowers the
+        ceiling to whatever the operator sets, and the store never returns
+        more than 500 rows in one page regardless.
       schema:
         type: integer
         minimum: 1
         maximum: 500
         default: 50
       example: 100
+      default: 50
     ContractsLimit:
       name: limit
       in: query
@@ -2743,6 +3224,161 @@ components:
       schema:
         type: string
         enum: ["true", "false"]
+    ContractIDPrefix:
+      name: contract_id_prefix
+      in: query
+      description: >-
+        Match contracts whose ID starts with this prefix. This is a prefix
+        filter, not a complete contract ID, and cannot be combined with
+        contract_id.
+      schema:
+        type: string
+        minLength: 1
+      example: "CDLZ"
+    TopicContains:
+      name: topic_contains
+      in: query
+      description: >-
+        Match events whose topics array contains the supplied JSON value
+        using JSONB containment. The value must be valid JSON; unlike topic,
+        bare text is not automatically quoted.
+      schema:
+        type: string
+      example: '[{"address":"GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}]'
+    TxHash:
+      name: tx_hash
+      in: query
+      description: Match events emitted by this Stellar transaction hash.
+      schema:
+        type: string
+        minLength: 1
+      example: "9f5c7a2b"
+    TxIndex:
+      name: tx_index
+      in: query
+      description: Match the transaction's zero-based index within its ledger.
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+      example: 0
+    OpIndex:
+      name: op_index
+      in: query
+      description: Match the operation's zero-based index within its transaction.
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+      example: 0
+    InSuccessfulCall:
+      name: in_successful_call
+      in: query
+      description: >-
+        Filter by whether the event was emitted inside a successful call.
+        Omit the parameter when either outcome is acceptable.
+      schema:
+        type: string
+        enum: ["true", "false"]
+      example: "true"
+    HasValue:
+      name: has_value
+      in: query
+      description: Filter events by whether they have a non-empty value field.
+      schema:
+        type: string
+        enum: ["true", "false"]
+      example: "true"
+    Recent:
+      name: recent
+      in: query
+      description: >-
+        Shorthand for the newest events. Use "true" for the default of 20,
+        or a positive integer for a custom page size. It cannot be combined
+        with order, order_by or limit.
+      schema:
+        oneOf:
+          - type: string
+            enum: ["true"]
+          - type: integer
+            minimum: 1
+            maximum: 500
+      example: 20
+    Fields:
+      name: fields
+      in: query
+      description: >-
+        Comma-separated allowlist of event properties to return. Supported
+        names are id, contract_id, ledger, type, tx_hash, tx_index, op_index,
+        in_successful_call, topics, value and created_at. Omit the parameter
+        to return the complete event.
+      schema:
+        type: string
+        pattern: "^(id|contract_id|ledger|type|tx_hash|tx_index|op_index|in_successful_call|topics|value|created_at)(,(id|contract_id|ledger|type|tx_hash|tx_index|op_index|in_successful_call|topics|value|created_at))*$"
+      example: "id,contract_id,ledger"
+    IncludeXDR:
+      name: include_xdr
+      in: query
+      description: >-
+        Return the stored base64 XDR projection (topics_xdr and, when
+        present, value_xdr) instead of the decoded event columns. The exact
+        value "true" enables this projection.
+      schema:
+        type: string
+        enum: ["true"]
+      example: "true"
+    Stream:
+      name: stream
+      in: query
+      description: >-
+        Return matching events as a streaming NDJSON response instead of a
+        JSON page. The exact value "true" enables streaming.
+      schema:
+        type: string
+        enum: ["true"]
+      example: "true"
+    Envelope:
+      name: envelope
+      in: query
+      description: >-
+        Return list data in the common {data, next_cursor} envelope. The
+        exact value "true" enables the alternate response shape.
+      schema:
+        type: string
+        enum: ["true"]
+      example: "true"
+    Pretty:
+      name: pretty
+      in: query
+      description: >-
+        Pretty-print JSON responses for human use. The exact value "true"
+        enables indentation; it does not change the response data.
+      schema:
+        type: string
+        enum: ["true"]
+      example: "true"
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      description: >-
+        Optional entity tag from a previous response. A matching tag causes
+        a 304 response when the resource supports cache validation.
+      schema:
+        type: string
+      example: '"0001099511627776-0000000001"'
+  headers:
+    ETag:
+      description: Entity tag for conditional requests and cache validation.
+      schema:
+        type: string
+    Link:
+      description: RFC 5988 pagination links for the next and previous pages.
+      schema:
+        type: string
+    CacheControl:
+      description: Caching policy for this response.
+      schema:
+        type: string
   schemas:
     APIKey:
       type: object
@@ -2760,9 +3396,10 @@ components:
           description: Human-readable label, empty for an unnamed key.
         prefix:
           type: string
+          pattern: "^[0-9a-f]{16}$"
           description: >-
-            The non-secret 16-character lookup handle stored in the clear.
-            It identifies the key without revealing it.
+            The non-secret 16-character hexadecimal lookup handle stored in
+            the clear. It identifies the key without revealing it.
         created_at:
           type: string
           format: date-time
@@ -2772,6 +3409,69 @@ components:
           description: >-
             When the key was revoked. Absent while the key is active.
       required: [id, name, prefix, created_at]
+    APIKeyRequest:
+      type: object
+      description: Optional body for creating an API key.
+      properties:
+        name:
+          type: string
+          maxLength: 100
+          description: Human-readable label for the key.
+          example: "ci-reader"
+    ContractSpecOverrideRequest:
+      type: object
+      description: >-
+        Wrapper containing a SEP-0041 contract specification JSON. Send the
+        specification under the spec property.
+      required: [spec]
+      additionalProperties: false
+      properties:
+        spec:
+          type: object
+          description: SEP-0041 contract specification JSON.
+    ContractSpecOverrideRevertRequest:
+      type: object
+      description: >-
+        Names the override-history entry to restore. The id is the one
+        listed by GET /contracts/{id}/spec/history.
+      required: [version]
+      additionalProperties: false
+      properties:
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+          description: The id of the history entry to restore.
+          example: 3
+    ContractSpecOverrideVersion:
+      type: object
+      description: >-
+        One recorded change to a contract's spec override. The spec is
+        absent for a tombstone entry, which means the override was deleted
+        at that point rather than replaced.
+      required: [id, contract_id, api_key_prefix, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: The version number. It is also the pagination cursor.
+        contract_id:
+          type: string
+          description: The contract whose override changed.
+        spec:
+          type: object
+          description: >-
+            The override document that was in force. Absent for a tombstone
+            entry.
+        api_key_prefix:
+          type: string
+          description: >-
+            The public prefix of the API key that made the change. The
+            secret half of the key is never stored.
+        created_at:
+          type: string
+          format: date-time
+          description: When the change was recorded.
     ErrorResponse:
       type: object
       description: Standard error envelope
@@ -2782,18 +3482,49 @@ components:
       required: [error]
     HealthResponse:
       type: object
+      description: >-
+        Envelope shared by /health, /livez and /readyz. status aggregates
+        the checks: unready dominates degraded, which dominates ok.
       properties:
         status:
           type: string
-          enum: [ok, degraded]
+          enum: [ok, degraded, unready]
         checks:
           type: object
+          description: >-
+            One entry per dependency the endpoint consulted; empty of
+            dependency entries on /livez, which reports only `process`.
           additionalProperties:
-            type: string
+            $ref: "#/components/schemas/DependencyCheck"
           example:
-            database: ok
-            rpc: ok
+            database: {status: ok, latency_ms: 1}
+            rpc: {status: ok, latency_ms: 84}
       required: [status, checks]
+    DependencyCheck:
+      type: object
+      description: >-
+        One dependency's state inside a health envelope: what state it is
+        in, why it isn't ok, and how long its own probe took.
+      properties:
+        status:
+          type: string
+          description: >-
+            `ok` — answered within its budget and healthy. `degraded` —
+            answered, but reports a suboptimal state (a non-healthy RPC,
+            or ingestion past the lag threshold). `unready` — did not
+            answer at all: it errored or exceeded its per-check timeout.
+          enum: [ok, degraded, unready]
+          example: ok
+        detail:
+          type: string
+          description: Human-readable cause, present only when status is not ok.
+          example: "150 ledgers behind (last ingested: 260000, chain head: 260150)"
+        latency_ms:
+          type: integer
+          format: int64
+          description: Wall time of this check alone, in milliseconds.
+          example: 84
+      required: [status, latency_ms]
     Event:
       type: object
       description: A Stellar/Soroban contract event
@@ -2828,25 +3559,32 @@ components:
           description: Whether the event was emitted in a successful call
         topics:
           type: array
-          description: Event topic values (JSON-encoded)
-          items:
-            schema:
-              type: object
+          description: Event topic values; each item is arbitrary JSON.
+          items: {}
         value:
-          description: Event value (JSON-encoded)
+          description: Event value as arbitrary JSON.
         created_at:
           type: string
           format: date-time
           description: When the event was persisted
-      required: [id, contract_id, ledger, type, tx_hash, tx_index, op_index, in_successful_call, topics, value, created_at]
+        network:
+          type: string
+          description: Stellar network on which the event was observed.
+        sep41_event:
+          description: >-
+            Optional additive SEP-41 normalized event envelope. Omitted for
+            events that do not match a SEP-41 event shape.
+      required: [id, contract_id, ledger, type, tx_hash, tx_index, op_index, in_successful_call, topics, value, created_at, network]
     EnrichedEvent:
       allOf:
         - $ref: "#/components/schemas/Event"
         - type: object
+          required: [decoded]
           properties:
             decoded_event:
-              type: object
-              nullable: true
+              oneOf:
+                - type: object
+                - type: "null"
               properties:
                 event:
                   type: string
@@ -2855,50 +3593,573 @@ components:
                   additionalProperties: true
             decoded:
               type: boolean
+              description: Whether spec-driven decoding succeeded.
+            decode_error:
+              type: string
+              description: Human-readable reason when decoding failed.
+    EventWithXDR:
+      type: object
+      description: >-
+        XDR-only projection returned by include_xdr=true. The projection
+        contains the stored raw topic/value fields rather than the decoded
+        event columns.
+      required: [topics_xdr]
+      properties:
+        topics_xdr:
+          oneOf:
+            - type: array
+            - type: "null"
+          items:
+            type: string
+        value_xdr:
+          oneOf:
+            - type: string
+            - type: "null"
+    ProjectedEvent:
+      type: object
+      description: Event object containing only fields selected by fields=.
+      additionalProperties: true
     EventsResponse:
       type: object
+      description: A page of decoded, enriched, projected or XDR events.
       properties:
         events:
           type: array
           items:
-            oneOf:
-              - $ref: "#/components/schemas/Event"
-              - $ref: "#/components/schemas/EnrichedEvent"
+            $ref: "#/components/schemas/Event"
         cursor:
           type: string
           description: Present when more results exist; pass back as ?cursor=
       required: [events]
+    EventEnvelopeResponse:
+      type: object
+      description: Alternate list shape returned when envelope=true.
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            anyOf:
+              - $ref: "#/components/schemas/Event"
+              - $ref: "#/components/schemas/EnrichedEvent"
+              - $ref: "#/components/schemas/EventWithXDR"
+              - $ref: "#/components/schemas/ProjectedEvent"
+        next_cursor:
+          type: string
+          description: Cursor for the next page, omitted at the end.
+    EventListResponse:
+      description: Default event page or the alternate envelope page.
+      oneOf:
+        - $ref: "#/components/schemas/EventsResponse"
+        - $ref: "#/components/schemas/EventEnvelopeResponse"
+    EventResponse:
+      description: A single decoded, enriched, projected or XDR event.
+      anyOf:
+        - $ref: "#/components/schemas/Event"
+        - $ref: "#/components/schemas/EnrichedEvent"
+        - $ref: "#/components/schemas/EventWithXDR"
+        - $ref: "#/components/schemas/ProjectedEvent"
+    AggregateBucket:
+      type: object
+      required: [bucket, count]
+      properties:
+        bucket:
+          type: string
+          description: Ledger number or time-bucket key.
+        count:
+          type: integer
+          format: int64
+    AggregateResponse:
+      type: object
+      required: [buckets]
+      properties:
+        buckets:
+          type: array
+          items:
+            $ref: "#/components/schemas/AggregateBucket"
+    AddressSummary:
+      type: object
+      description: Aggregate activity for one Stellar address.
+      required: [address, first_seen_ledger, last_seen_ledger, event_count, distinct_contracts]
+      properties:
+        address:
+          type: string
+        first_seen_ledger:
+          type: integer
+          format: int64
+        last_seen_ledger:
+          type: integer
+          format: int64
+        event_count:
+          type: integer
+          format: int64
+        distinct_contracts:
+          type: array
+          items:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
     Stats:
       type: object
+      description: Ingestion, audit, RPC, cache and decoder counters.
       properties:
         total_events:
           type: integer
+          format: int64
         last_ingested_ledger:
           type: integer
+          format: int64
         verified_through_ledger:
           type: integer
+          format: int64
+        oldest_stored_ledger:
+          type: integer
+          format: int64
+        chain_head_ledger:
+          oneOf:
+            - type: integer
+              format: int64
+            - type: "null"
+        ingest_lag_ledgers:
+          oneOf:
+            - type: integer
+              format: int64
+            - type: "null"
+        last_successful_poll:
+          type: string
+          format: date-time
         contract_count:
           type: integer
+          format: int64
         watched_contracts:
           type: integer
-        auditor:
+          format: int64
+        table_size_bytes:
+          type: integer
+          format: int64
+        query_errors:
+          type: integer
+          format: int64
+        events_ingested_total:
+          type: integer
+          format: int64
+        panics_recovered:
+          type: integer
+          format: int64
+        rpc_errors:
           type: object
-          nullable: true
+          properties:
+            getEvents:
+              type: integer
+              format: int64
+            getLatestLedger:
+              type: integer
+              format: int64
+            getHealth:
+              type: integer
+              format: int64
+            getLedgerEntries:
+              type: integer
+              format: int64
+        auditor:
+          oneOf:
+            - type: object
+            - type: "null"
           properties:
             passes_run:
               type: integer
+              format: int64
             ledgers_checked:
               type: integer
+              format: int64
             findings_opened:
               type: integer
+              format: int64
             findings_repaired:
               type: integer
+              format: int64
             findings_unverifiable:
               type: integer
+              format: int64
             findings_unrecoverable:
               type: integer
+              format: int64
             rpc_requests:
               type: integer
+              format: int64
+        decode:
+          oneOf:
+            - type: object
+            - type: "null"
+          properties:
+            decodes:
+              type: integer
+              format: int64
+            decode_failures:
+              type: integer
+              format: int64
+        spec_cache:
+          type: object
+          properties:
+            cached_specs:
+              type: integer
+            hits:
+              type: integer
+              format: int64
+            misses:
+              type: integer
+              format: int64
+            fetches:
+              type: integer
+              format: int64
+            expiries:
+              type: integer
+              format: int64
+            invalidations:
+              type: integer
+              format: int64
+        pruner:
+          type: object
+          properties:
+            runs_completed:
+              type: integer
+              format: int64
+            total_rows_purged:
+              type: integer
+              format: int64
+        ingester:
+          type: object
+          properties:
+            effective_poll_interval_ms:
+              type: integer
+              format: int64
+    TenantUsage:
+      type: object
+      description: One UTC day of tenant usage counters.
+      required: [tenant_id, day, requests, events_served, stream_seconds]
+      properties:
+        tenant_id:
+          type: integer
+          format: int64
+        day:
+          type: string
+          format: date-time
+        requests:
+          type: integer
+          format: int64
+        events_served:
+          type: integer
+          format: int64
+        stream_seconds:
+          type: integer
+          format: int64
+    UsagePage:
+      type: object
+      required: [usage]
+      properties:
+        usage:
+          type: array
+          items:
+            $ref: "#/components/schemas/TenantUsage"
+    TenantAPIKey:
+      type: object
+      description: Tenant API key metadata; secret is returned only on creation.
+      required: [id, tenant_id, name, prefix, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        tenant_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        prefix:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+        secret:
+          type: string
+          description: Plaintext tenant key, returned only by the create endpoint.
+    TenantAPIKeysPage:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/TenantAPIKey"
+    TenantCreateRequest:
+      type: object
+      description: JSON body used to create a tenant.
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Unique human-readable tenant name.
+          example: "acme-corp"
+        wildcard:
+          type: boolean
+          description: When true, the tenant can read events for every contract.
+        admin:
+          type: boolean
+          description: When true, the tenant may use the administrative API.
+        enabled:
+          type: boolean
+          default: true
+          description: Whether the tenant is enabled for requests.
+        rate_limit_rps:
+          type: number
+          format: double
+          minimum: 0
+          description: >-
+            Optional requests-per-second override. Set together with
+            rate_limit_burst; omit both to inherit the instance limit.
+        rate_limit_burst:
+          type: integer
+          format: int32
+          minimum: 0
+          description: >-
+            Optional burst-size override. Set together with rate_limit_rps.
+        max_watched_contracts:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Maximum number of contracts this tenant may watch.
+    TenantUpdateRequest:
+      type: object
+      description: >-
+        JSON body for a partial tenant update. Every property is optional;
+        omitted properties retain their current value.
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          description: Replacement tenant name.
+          example: "acme-corp"
+        wildcard:
+          type: boolean
+          description: When true, the tenant can read events for every contract.
+        admin:
+          type: boolean
+          description: When true, the tenant may use the administrative API.
+        enabled:
+          type: boolean
+          description: Whether the tenant is enabled for requests.
+        rate_limit_rps:
+          type: number
+          format: double
+          minimum: 0
+          description: >-
+            Requests-per-second override. Set together with
+            rate_limit_burst; omit both to inherit the instance limit.
+        rate_limit_burst:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Burst-size override. Set together with rate_limit_rps.
+        max_watched_contracts:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Maximum number of contracts this tenant may watch.
+    GrantContractRequest:
+      type: object
+      description: JSON body used to grant one contract to a tenant.
+      required: [contract_id]
+      additionalProperties: false
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+          description: Stellar contract ID to grant to the tenant.
+          example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+    TenantAPIKeyRequest:
+      type: object
+      description: JSON body used to issue an API key for a tenant.
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          maxLength: 100
+          description: Human-readable label for the generated key.
+          example: "ci-reader"
+    WatchedContractRequest:
+      type: object
+      description: JSON body used to add a contract to a watch list.
+      required: [contract_id]
+      additionalProperties: false
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+          description: Stellar contract ID to add to the watch list.
+          example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        network:
+          type: string
+          description: >-
+            The Stellar network this entry is watched on. Omit to file the
+            contract on the deployment's configured NETWORK (falling back
+            to "default" when that is unset). The same contract watched on
+            two networks is two independent watch-list entries.
+          example: testnet
+    Tenant:
+      type: object
+      description: Tenant identity, access scope and quota configuration.
+      required: [id, name, wildcard, admin, enabled, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Tenant database ID.
+        name:
+          type: string
+        wildcard:
+          type: boolean
+        admin:
+          type: boolean
+        enabled:
+          type: boolean
+        rate_limit_rps:
+          oneOf:
+            - type: number
+              format: double
+            - type: "null"
+        rate_limit_burst:
+          oneOf:
+            - type: integer
+              format: int32
+            - type: "null"
+        max_watched_contracts:
+          oneOf:
+            - type: integer
+              format: int32
+            - type: "null"
+        created_at:
+          type: string
+          format: date-time
+    TenantList:
+      type: object
+      description: All tenants visible to the administrative caller.
+      required: [tenants]
+      properties:
+        tenants:
+          type: array
+          items:
+            $ref: "#/components/schemas/Tenant"
+    GrantList:
+      type: object
+      description: Contract IDs currently readable by a tenant.
+      required: [contract_ids]
+      properties:
+        contract_ids:
+          type: array
+          items:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+    TenantWatchList:
+      type: object
+      description: Contract IDs currently watched by the calling tenant.
+      required: [contract_ids]
+      properties:
+        contract_ids:
+          type: array
+          items:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+    CurrentTenant:
+      type: object
+      description: The authenticated tenant and its effective read scope.
+      required: [tenant, wildcard]
+      properties:
+        tenant:
+          $ref: "#/components/schemas/Tenant"
+        wildcard:
+          type: boolean
+          description: Whether the caller has unrestricted contract visibility.
+        granted_contract_ids:
+          type: array
+          description: Contract IDs granted to a non-wildcard tenant.
+          items:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+    WatchedContract:
+      type: object
+      description: One contract in the global ingestion watch list.
+      required: [contract_id, added_at]
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+        network:
+          type: string
+          description: >-
+            The network this entry is watched on. Always present in
+            responses; entries written without a network are reported as
+            "default".
+          example: testnet
+        added_at:
+          type: string
+          format: date-time
+          description: When the contract was added to the watch list.
+    WatchedContractsPage:
+      type: object
+      description: The complete global contract watch list.
+      required: [contracts, count]
+      properties:
+        contracts:
+          type: array
+          items:
+            $ref: "#/components/schemas/WatchedContract"
+        count:
+          type: integer
+    WatchedContractAdded:
+      type: object
+      description: Result of adding a contract to the global watch list.
+      required: [contract_id, network, added_at, history_from_ledger]
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+        network:
+          type: string
+          description: The network the entry was filed on (echoes the request's network or the deployment default).
+        added_at:
+          type: string
+          format: date-time
+        history_from_ledger:
+          type: integer
+          format: int64
+        mode_transition:
+          type: string
+          enum: [all_to_specific]
+    WatchedContractRemoved:
+      type: object
+      description: Result of removing a contract from the global watch list.
+      required: [contract_id, network, removed_at, history_preserved]
+      properties:
+        contract_id:
+          type: string
+          pattern: "^C[A-Z2-7]{55}$"
+        network:
+          type: string
+          description: The network the entry was removed from.
+        removed_at:
+          type: string
+          format: date-time
+        history_preserved:
+          type: boolean
+        mode_transition:
+          type: string
+          enum: [specific_to_all]
     CreateSubscriptionRequest:
       type: object
       required: [url, secret]
@@ -2942,13 +4203,19 @@ components:
           description: Exact JSON match against any topic position
         from_ledger:
           type: integer
+          format: int64
         to_ledger:
           type: integer
+          format: int64
+        network:
+          type: string
+          description: Restrict delivery to one Stellar network.
     Subscription:
       type: object
       properties:
         id:
           type: integer
+          format: int64
         url:
           type: string
         filters:
@@ -2962,6 +4229,10 @@ components:
         created_at:
           type: string
           format: date-time
+        tenant_id:
+          type: integer
+          format: int64
+          description: Owning tenant; omitted for operator-owned subscriptions.
       required: [id, url, filters, secret, enabled, failure_count, created_at]
     DeliveryAttempt:
       type: object
@@ -2984,6 +4255,75 @@ components:
           type: string
           format: date-time
       required: [id, subscription_id, event_id, status, response_code, duration_ms, created_at]
+    DeliveryEnvelopeResponse:
+      type: object
+      description: Alternate delivery-attempt page returned when envelope=true.
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeliveryAttempt"
+        next_cursor:
+          type: string
+    DeadLetter:
+      type: object
+      description: An event that could not be decoded or persisted.
+      required: [id, event_id, contract_id, ledger, type, tx_hash, error, attempts, last_attempt, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        event_id:
+          type: string
+        contract_id:
+          type: string
+        ledger:
+          type: integer
+          format: int64
+        type:
+          type: string
+          enum: [contract, system, diagnostic]
+        tx_hash:
+          type: string
+        topic_xdr:
+          type: array
+          items:
+            type: string
+        value_xdr:
+          type: string
+        error:
+          type: string
+        attempts:
+          type: integer
+        last_attempt:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+    DeadLettersPage:
+      type: object
+      required: [dead_letters, count]
+      properties:
+        dead_letters:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeadLetter"
+        count:
+          type: integer
+        cursor:
+          type: string
+    DeadLettersEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeadLetter"
+        next_cursor:
+          type: string
     ContractSummary:
       type: object
       properties:
@@ -3003,6 +4343,22 @@ components:
           format: date-time
           description: Wall-clock time the most recent event was ingested
       required: [contract_id, event_count, first_ledger, last_ledger, last_seen]
+    ContractListEnvelope:
+      type: object
+      description: Alternate contract-list page returned when envelope=true.
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractSummary"
+        next_cursor:
+          type: string
+    ContractListResponse:
+      description: Default contract page or alternate envelope page.
+      oneOf:
+        - $ref: "#/components/schemas/ContractsPage"
+        - $ref: "#/components/schemas/ContractListEnvelope"
     ContractsPage:
       type: object
       properties:
@@ -3038,6 +4394,16 @@ components:
       description: >-
         The same tenant API key as TenantAuth, presented in a header instead
         of a Bearer token.
+    InstanceAPIKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >-
+        Global SoroTrail API key used by /apikeys and, when
+        API_KEY_AUTH_ENABLED is true, protected streaming and webhook
+        operations. The same key may be presented as an Authorization: Bearer
+        token; the X-API-Key form is shown here because it is the canonical
+        management-header form.
     ManagementKey:
       type: apiKey
       in: header
@@ -3131,6 +4497,20 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    UpgradeRequired:
+      description: >-
+        The websocket handshake was refused before the upgrade because the
+        request is not a valid upgrade attempt: HTTP/1.0, or the Connection
+        and Upgrade headers are missing or do not name `websocket`. Only
+        `/events/ws` can answer this, and — unlike every other error here —
+        the body is plain text written by the websocket library, not the JSON
+        envelope.
+      content:
+        text/plain:
+          schema:
+            type: string
+            examples:
+              - 'WebSocket protocol violation: Connection header "" does not contain Upgrade'
     TooManyRequests:
       description: |
         The caller exceeded its request quota, or asked to watch more
@@ -3152,6 +4532,34 @@ components:
             type: integer
             minimum: 1
             examples: [1]
+        X-RateLimit-Limit:
+          description: The caller's configured burst capacity.
+          schema:
+            type: integer
+            minimum: 1
+            examples: [20]
+        X-RateLimit-Remaining:
+          description: The caller's remaining request budget; always 0 on a 429.
+          schema:
+            type: integer
+            minimum: 0
+            examples: [0]
+        X-RateLimit-Reset:
+          description: >-
+            Unix timestamp in seconds when the next request token is expected
+            to become available, or the quota window resets.
+          schema:
+            type: integer
+            format: int64
+            examples: [1792512000]
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    RequestEntityTooLarge:
+      description: >-
+        The request body exceeds the instance's configured limit
+        (HTTP_REQUEST_BODY_LIMIT). Reduce the body size and retry.
       content:
         application/json:
           schema:

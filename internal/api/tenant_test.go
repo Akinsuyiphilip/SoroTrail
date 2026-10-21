@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -153,6 +154,91 @@ func (s *scopedStore) GetEventsByTxHash(_ context.Context, txHash, excludeID str
 	return out, nil
 }
 
+func (s *scopedStore) ListContracts(_ context.Context, f store.ContractsFilter) ([]store.ContractSummary, string, error) {
+	s.record(f.Scope)
+	counts := map[string]*store.ContractSummary{}
+	var order []string
+	for _, e := range s.visible(f.Scope) {
+		if f.ContractIDPrefix != "" && !strings.HasPrefix(e.ContractID, f.ContractIDPrefix) {
+			continue
+		}
+		cs, ok := counts[e.ContractID]
+		if !ok {
+			cs = &store.ContractSummary{
+				ContractID:  e.ContractID,
+				FirstLedger: e.Ledger,
+				LastLedger:  e.Ledger,
+			}
+			counts[e.ContractID] = cs
+			order = append(order, e.ContractID)
+		}
+		cs.EventCount++
+		if e.Ledger < cs.FirstLedger {
+			cs.FirstLedger = e.Ledger
+		}
+		if e.Ledger > cs.LastLedger {
+			cs.LastLedger = e.Ledger
+		}
+	}
+	out := make([]store.ContractSummary, 0, len(order))
+	for _, id := range order {
+		out = append(out, *counts[id])
+	}
+	return out, "", nil
+}
+
+func (s *scopedStore) CountContracts(ctx context.Context, f store.ContractsFilter) (int64, error) {
+	items, _, err := s.ListContracts(ctx, f)
+	return int64(len(items)), err
+}
+
+func (s *scopedStore) GetContractSummary(_ context.Context, contractID string) (store.ContractSummary, error) {
+	var cs store.ContractSummary
+	for _, e := range s.events {
+		if e.ContractID != contractID {
+			continue
+		}
+		if cs.ContractID == "" {
+			cs.ContractID = contractID
+			cs.FirstLedger = e.Ledger
+			cs.LastLedger = e.Ledger
+		}
+		cs.EventCount++
+	}
+	if cs.ContractID == "" {
+		return store.ContractSummary{}, store.ErrNotFound
+	}
+	return cs, nil
+}
+
+func (s *scopedStore) CountContractEvents(_ context.Context, contractID string) (int64, error) {
+	var n int64
+	for _, e := range s.events {
+		if e.ContractID == contractID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *scopedStore) GetContractMeta(context.Context, string) (store.ContractMeta, error) {
+	return store.ContractMeta{}, store.ErrNotFound
+}
+
+func (s *scopedStore) ContractEventTypeCounts(_ context.Context, contractID string) ([]store.ContractEventTypeCount, error) {
+	byType := map[string]int64{}
+	for _, e := range s.events {
+		if e.ContractID == contractID {
+			byType[e.Type]++
+		}
+	}
+	var out []store.ContractEventTypeCount
+	for typ, count := range byType {
+		out = append(out, store.ContractEventTypeCount{Type: typ, Count: count})
+	}
+	return out, nil
+}
+
 // fakeTenants is an in-memory TenantStore covering the parts the API needs.
 type fakeTenants struct {
 	store.TenantStore
@@ -160,7 +246,7 @@ type fakeTenants struct {
 	tenants map[int64]store.Tenant
 	grants  map[int64][]string
 	keys    map[string]keyRecord
-	watched map[int64][]string
+	watched map[int64]map[string][]string
 
 	usage map[int64][]store.TenantUsage
 }
@@ -179,7 +265,7 @@ func newFakeTenants() *fakeTenants {
 		tenants: map[int64]store.Tenant{},
 		grants:  map[int64][]string{},
 		keys:    map[string]keyRecord{},
-		watched: map[int64][]string{},
+		watched: map[int64]map[string][]string{},
 		usage:   map[int64][]store.TenantUsage{},
 	}
 }
@@ -239,22 +325,39 @@ func (f *fakeTenants) ListTenantAPIKeys(_ context.Context, tenantID int64) ([]st
 	}
 	return out, nil
 }
-func (f *fakeTenants) ListTenantWatchedContracts(_ context.Context, tenantID int64) ([]string, error) {
-	return f.watched[tenantID], nil
+func (f *fakeTenants) ListTenantWatchedContracts(_ context.Context, tenantID int64, network string) ([]string, error) {
+	network = defaultNetworkLabel(network)
+	if f.watched[tenantID] == nil {
+		return nil, nil
+	}
+	return f.watched[tenantID][network], nil
 }
-func (f *fakeTenants) AddTenantWatchedContract(_ context.Context, t store.Tenant, contractID string, _ int) error {
-	f.watched[t.ID] = append(f.watched[t.ID], contractID)
+func (f *fakeTenants) AddTenantWatchedContract(_ context.Context, t store.Tenant, network, contractID string, _ int) error {
+	network = defaultNetworkLabel(network)
+	if f.watched[t.ID] == nil {
+		f.watched[t.ID] = map[string][]string{}
+	}
+	for _, c := range f.watched[t.ID][network] {
+		if c == contractID {
+			return nil
+		}
+	}
+	f.watched[t.ID][network] = append(f.watched[t.ID][network], contractID)
 	return nil
 }
-func (f *fakeTenants) RemoveTenantWatchedContract(_ context.Context, tenantID int64, contractID string) error {
-	list := f.watched[tenantID]
+func (f *fakeTenants) RemoveTenantWatchedContract(_ context.Context, tenantID int64, network, contractID string) error {
+	network = defaultNetworkLabel(network)
+	if f.watched[tenantID] == nil {
+		return nil
+	}
+	list := f.watched[tenantID][network]
 	out := list[:0]
 	for _, c := range list {
 		if c != contractID {
 			out = append(out, c)
 		}
 	}
-	f.watched[tenantID] = out
+	f.watched[tenantID][network] = out
 	return nil
 }
 func (f *fakeTenants) TouchTenantAPIKey(context.Context, int64) error { return nil }
@@ -322,6 +425,7 @@ func newTenantFixtureWithStatsTTL(t *testing.T, ttl time.Duration) *tenantFixtur
 	srv := New(st, &stubRPC{health: rpc.Health{Status: "healthy"}},
 		slog.New(slog.NewTextHandler(io.Discard, nil)), "test-key").
 		WithMultiTenancy(tenants, MultiTenantOptions{MaxWatchedContracts: 10})
+	srv.SetHTTPRequestBodyLimit(1 << 20)
 	srv.SetStatsTTL(ttl)
 	f.srv = srv.Router()
 	return f
@@ -494,6 +598,51 @@ func TestCrossTenantLeakMatrix(t *testing.T) {
 			path:       "/events/ev-a1/transaction",
 			wantStatus: http.StatusOK,
 			wantHidden: []string{"ev-b1", contractB},
+		},
+		{
+			name:        "list contracts is scoped to tenant grants",
+			path:        "/contracts",
+			wantStatus:  http.StatusOK,
+			wantVisible: []string{contractA},
+			wantHidden:  []string{contractB, contractC},
+		},
+		{
+			name:        "get contract summary for own contract",
+			path:        "/contracts/" + contractA,
+			wantStatus:  http.StatusOK,
+			wantVisible: []string{contractA},
+			wantHidden:  []string{contractB, contractC},
+		},
+		{
+			name:       "get contract summary for another tenant's contract is refused",
+			path:       "/contracts/" + contractB,
+			wantStatus: http.StatusForbidden,
+			wantHidden: []string{`"event_count"`},
+		},
+		{
+			name:       "get contract summary for an ungranted contract is refused",
+			path:       "/contracts/" + contractC,
+			wantStatus: http.StatusForbidden,
+			wantHidden: []string{`"event_count"`},
+		},
+		{
+			name:        "contract stats for own contract",
+			path:        "/contracts/" + contractA + "/stats",
+			wantStatus:  http.StatusOK,
+			wantVisible: []string{contractA, `"event_count":2`},
+			wantHidden:  []string{contractB, contractC},
+		},
+		{
+			name:       "contract stats for another tenant's contract is refused",
+			path:       "/contracts/" + contractB + "/stats",
+			wantStatus: http.StatusForbidden,
+			wantHidden: []string{`"event_count"`},
+		},
+		{
+			name:       "contract stats for an ungranted contract is refused",
+			path:       "/contracts/" + contractC + "/stats",
+			wantStatus: http.StatusForbidden,
+			wantHidden: []string{`"event_count"`},
 		},
 	}
 
@@ -1286,10 +1435,92 @@ func TestTenantListEndpoints_TotalCountHeader(t *testing.T) {
 
 	t.Run("tenant watch list reports the number of watched contracts", func(t *testing.T) {
 		// Seed two claims directly, then read them back through the API.
-		f.tenants.watched[1] = []string{contractA, contractB}
+		f.tenants.watched[1] = map[string][]string{"default": {contractA, contractB}}
 		rec := f.get(t, f.keyA, "/tenant/watch")
 		require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
 		assert.Equal(t, "2", rec.Header().Get("X-Total-Count"))
+	})
+}
+
+func TestTenantWatch_MultiNetwork(t *testing.T) {
+	f := newTenantFixture(t)
+
+	// Watch contractA on default network (omitting network).
+	rec := f.post(t, f.keyA, "/tenant/watch", fmt.Sprintf(`{"contract_id":%q}`, contractA))
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+
+	// Watch the same contractA on testnet, plus contractB on testnet.
+	rec = f.post(t, f.keyA, "/tenant/watch", fmt.Sprintf(`{"contract_id":%q,"network":"testnet"}`, contractA))
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+	rec = f.post(t, f.keyA, "/tenant/watch", fmt.Sprintf(`{"contract_id":%q,"network":"testnet"}`, contractB))
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+
+	// Default network list contains only contractA.
+	rec = f.get(t, f.keyA, "/tenant/watch")
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+	var defaultWatched struct {
+		ContractIDs []string `json:"contract_ids"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &defaultWatched))
+	assert.Equal(t, []string{contractA}, defaultWatched.ContractIDs)
+
+	// Testnet list contains both contractA and contractB.
+	rec = f.get(t, f.keyA, "/tenant/watch?network=testnet")
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+	var testnetWatched struct {
+		ContractIDs []string `json:"contract_ids"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &testnetWatched))
+	assert.Equal(t, []string{contractA, contractB}, testnetWatched.ContractIDs)
+
+	// Removing contractA on testnet leaves contractA on default intact.
+	rec = f.do(t, http.MethodDelete, f.keyA, "/tenant/watch/"+contractA+"?network=testnet", "")
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &testnetWatched))
+	assert.Equal(t, []string{contractB}, testnetWatched.ContractIDs)
+
+	rec = f.get(t, f.keyA, "/tenant/watch")
+	require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &defaultWatched))
+	assert.Equal(t, []string{contractA}, defaultWatched.ContractIDs)
+}
+
+// TestRemoveOwnWatchedValidatesTheContractID pins the outcomes the issue
+// asks about: a malformed id is a client error reported exactly like the
+// POST handler's, and a well-formed id the tenant does not hold is the
+// documented idempotent no-op (see the OpenAPI description of the
+// operation) rather than a silent success that hides the typo.
+func TestRemoveOwnWatchedValidatesTheContractID(t *testing.T) {
+	f := newTenantFixture(t)
+	// The fake store keys watched contracts tenant -> network; these calls
+	// omit network, so the seeded contract lives under the default label.
+	def := defaultNetworkLabel("")
+	f.tenants.watched[1] = map[string][]string{def: {contractA}}
+
+	t.Run("a malformed contract id is rejected before the store", func(t *testing.T) {
+		rec := f.do(t, http.MethodDelete, f.keyA, "/tenant/watch/not-a-strkey", "")
+		require.Equal(t, http.StatusBadRequest, rec.Code, bodyString(t, rec))
+		var env struct {
+			Error string `json:"error"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+		assert.Equal(t, `invalid contract_id "not-a-strkey"`, env.Error,
+			"the message must match the POST handler's format")
+		assert.Equal(t, []string{contractA}, f.tenants.watched[1][def],
+			"a malformed id must never reach the store")
+	})
+
+	t.Run("removing a contract the tenant does not hold is a 200 no-op", func(t *testing.T) {
+		rec := f.do(t, http.MethodDelete, f.keyA, "/tenant/watch/"+contractB, "")
+		require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+		assert.Equal(t, []string{contractA}, f.tenants.watched[1][def],
+			"the list must be unchanged")
+	})
+
+	t.Run("a held contract is removed", func(t *testing.T) {
+		rec := f.do(t, http.MethodDelete, f.keyA, "/tenant/watch/"+contractA, "")
+		require.Equal(t, http.StatusOK, rec.Code, bodyString(t, rec))
+		assert.Empty(t, f.tenants.watched[1][def])
 	})
 }
 
@@ -1333,15 +1564,12 @@ func TestRevokedKeyRejectedOnNextRequest(t *testing.T) {
 	rec := f.get(t, f.keyA, "/events")
 	assert.Equal(t, http.StatusOK, rec.Code)
 
-	// Simulate revocation by removing the key's exact prefix entry from
-	// the lookup table, so the next request cannot resolve it.
-	for prefix, rec := range f.tenants.keys {
-		if rec.plaintext == f.keyA {
-			delete(f.tenants.keys, prefix)
-			break
-		}
-	}
-	// The prefix-based lookup will no longer find this key.
+	// Simulate revocation by dropping the key's record. Tenant lookup is
+	// keyed on the prefix segment of the plaintext key, so that entry is
+	// the single thing that has to disappear for the key to stop resolving.
+	prefix, _, ok := parseAPIKey(f.keyA)
+	require.True(t, ok, "fixture key must be well-formed")
+	delete(f.tenants.keys, prefix)
 
 	// Next request must be rejected.
 	rec = f.get(t, f.keyA, "/events")
@@ -1353,8 +1581,7 @@ func TestRevokedKeyRejectedOnNextRequest(t *testing.T) {
 // only receive events for contracts it is granted.
 func TestWebSocketSubscriptionsHonourBoundary(t *testing.T) {
 	f := newTenantFixture(t)
-	st := f.st
-	st.seenScopes = nil
+
 	// Verify that the store's scope filtering applies to subscription
 	// paths the same way it does to read endpoints.
 	for _, path := range []string{
@@ -1430,4 +1657,253 @@ func TestAdminEndpointsRequireAdminCredentials(t *testing.T) {
 				"wildcard tenant must be rejected from admin endpoint %s", path)
 		})
 	}
+}
+
+// --- Per-tenant rate limiting ---
+//
+// The isolation property these tests exist for is the reason per-tenant
+// budgets exist at all: a tenant that burns through its quota must not spend
+// anyone else's, and must not escape its own by changing source address.
+// They drive the middleware the way the router does — a request carrying the
+// Principal authenticate installs — so the resolver, the bucket map and the
+// 429 response are all exercised rather than a hand-picked bucket key.
+
+// tenantWithQuota builds a tenant carrying its own rate-limit override. The
+// resolver reads these pointer fields, so the override has to sit on the
+// Tenant exactly as the admin handler stores it.
+func tenantWithQuota(id int64, rps float64, burst int) store.Tenant {
+	return store.Tenant{
+		ID:             id,
+		Name:           fmt.Sprintf("tenant-%d", id),
+		Enabled:        true,
+		RateLimitRPS:   &rps,
+		RateLimitBurst: &burst,
+	}
+}
+
+// newTenantRateLimiter builds a limiter whose only limits are per-tenant: no
+// instance-wide RPS/BURST is configured, so every authenticated request below
+// takes the tenant branch and every credential-less one takes the documented
+// IP fallback.
+func newTenantRateLimiter(opts ...LimiterOption) *RateLimiter {
+	return NewRateLimiter(0, 0, false,
+		append([]LimiterOption{WithLimitResolver(TenantLimitResolver(0, 0))}, opts...)...)
+}
+
+// sendAsTenant drives one request through the limiter as p from a fixed
+// address; tests that care about the source address use sendAsTenantFrom.
+func sendAsTenant(lim *RateLimiter, p Principal) *httptest.ResponseRecorder {
+	return sendAsTenantFrom(lim, "203.0.113.70:443", p)
+}
+
+// sendAsTenantFrom pins the source address so a test can prove identity, not
+// network position, decides which budget a request spends.
+func sendAsTenantFrom(lim *RateLimiter, addr string, p Principal) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	req.RemoteAddr = addr
+	req = req.WithContext(WithPrincipal(req.Context(), p))
+	rec := httptest.NewRecorder()
+	middlewareFor(lim).ServeHTTP(rec, req)
+	return rec
+}
+
+// TestPerTenantRateLimitIsolation is the deliverable: one tenant driven past
+// its limit must leave every other tenant unaffected.
+func TestPerTenantRateLimitIsolation(t *testing.T) {
+	tenantA := tenantWithQuota(1, 0.5, 1)
+	tenantB := tenantWithQuota(2, 0.5, 1)
+
+	t.Run("a spent budget belongs to the tenant that spent it", func(t *testing.T) {
+		lim := newTenantRateLimiter()
+
+		require.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+			"tenant A's first request must be admitted")
+		require.Equal(t, http.StatusTooManyRequests, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+			"tenant A's second request must exhaust its one-token budget")
+
+		assert.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantB}).Code,
+			"tenant B must be admitted while tenant A is throttled")
+
+		assert.Equal(t, http.StatusTooManyRequests, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+			"tenant A must stay throttled; tenant B's traffic must not refill it")
+		assert.Equal(t, 2, lim.Size(), "each tenant must own exactly one bucket")
+	})
+
+	t.Run("tenant identity separates budgets behind a shared address", func(t *testing.T) {
+		// Both tenants call from one egress — the NAT/corporate-proxy case
+		// IP keying gets wrong in both directions: a shared bucket would
+		// throttle one tenant for the other's spend, and a tenant changing
+		// address would be handed a fresh budget per address.
+		const egress = "198.51.100.20:5000"
+		lim := newTenantRateLimiter()
+
+		require.Equal(t, http.StatusOK, sendAsTenantFrom(lim, egress, Principal{Tenant: tenantA}).Code)
+		require.Equal(t, http.StatusTooManyRequests, sendAsTenantFrom(lim, egress, Principal{Tenant: tenantA}).Code)
+
+		assert.Equal(t, http.StatusOK, sendAsTenantFrom(lim, egress, Principal{Tenant: tenantB}).Code,
+			"a second tenant behind the same egress must keep its own budget")
+	})
+
+	t.Run("same tenant on a new address keeps spending the same budget", func(t *testing.T) {
+		// The other half of keying on identity: a new source address must
+		// not mint a fresh bucket, or a caller could rotate addresses and
+		// never run out.
+		lim := newTenantRateLimiter()
+
+		require.Equal(t, http.StatusOK,
+			sendAsTenantFrom(lim, "203.0.113.80:1000", Principal{Tenant: tenantA}).Code)
+		assert.Equal(t, http.StatusTooManyRequests,
+			sendAsTenantFrom(lim, "203.0.113.81:2000", Principal{Tenant: tenantA}).Code,
+			"tenant A's budget must follow its identity across addresses")
+		assert.Equal(t, 1, lim.Size(),
+			"the same tenant must not accumulate one bucket per address")
+	})
+
+	t.Run("an override applies only to the tenant that carries it", func(t *testing.T) {
+		// Tenant A buys a burst of three; tenant B inherits the instance
+		// default of one. A's extra capacity must not widen B's budget,
+		// and B's spend must not consume A's.
+		generous := tenantWithQuota(1, 0.5, 3)
+		lim := NewRateLimiter(0, 0, false, WithLimitResolver(TenantLimitResolver(0.5, 1)))
+
+		for i := 0; i < 3; i++ {
+			require.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: generous}).Code,
+				"request %d must be admitted within tenant A's burst", i+1)
+		}
+		require.Equal(t, http.StatusTooManyRequests, sendAsTenant(lim, Principal{Tenant: generous}).Code)
+
+		assert.Equal(t, http.StatusOK,
+			sendAsTenant(lim, Principal{Tenant: store.Tenant{ID: 2}}).Code,
+			"tenant B's default burst must be untouched by tenant A's override")
+		assert.Equal(t, http.StatusTooManyRequests,
+			sendAsTenant(lim, Principal{Tenant: store.Tenant{ID: 2}}).Code,
+			"tenant B must be held to its own default budget")
+	})
+}
+
+// TestPerTenantRateLimitRejectionCarriesRetryAfter pins the rejection
+// contract: a throttled tenant gets the documented 429 envelope and a
+// Retry-After it can act on, while another tenant keeps being served.
+func TestPerTenantRateLimitRejectionCarriesRetryAfter(t *testing.T) {
+	tenantA := tenantWithQuota(1, 0.5, 1)
+	tenantB := tenantWithQuota(2, 0.5, 1)
+	lim := newTenantRateLimiter()
+
+	require.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantA}).Code)
+	rec := sendAsTenant(lim, Principal{Tenant: tenantA})
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+
+	raw := rec.Header().Get("Retry-After")
+	require.NotEmpty(t, raw, "a 429 must tell the caller when to come back")
+	secs, err := strconv.Atoi(raw)
+	require.NoError(t, err, "Retry-After must be integer delta-seconds (RFC 7231 §7.1.3)")
+	assert.Equal(t, 2, secs,
+		"a tenant limited to 0.5 rps waits two seconds for its next token; rounding down would invite an immediate retry")
+
+	assert.Equal(t, "0", rec.Header().Get("X-RateLimit-Remaining"))
+	assert.Equal(t, "1", rec.Header().Get("X-RateLimit-Limit"),
+		"the tenant's own burst must be advertised")
+
+	reset, err := strconv.ParseInt(rec.Header().Get("X-RateLimit-Reset"), 10, 64)
+	require.NoError(t, err, "X-RateLimit-Reset must be a unix timestamp")
+	assert.InDelta(t, time.Now().Add(2*time.Second).Unix(), reset, 1)
+
+	var envelope errorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &envelope))
+	assert.Contains(t, envelope.Error, "rate limit exceeded")
+
+	assert.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantB}).Code,
+		"tenant B must still be served while tenant A is told to retry later")
+}
+
+// TestPerTenantRateLimitBudgetRefills covers the documented refill path
+// without sleeping: the idle sweep retires a quiet bucket, and the tenant's
+// next request starts from a fresh one carrying its full burst. The sweep's
+// explicit `now` is the same time seam the IP-keyed refill test uses.
+func TestPerTenantRateLimitBudgetRefills(t *testing.T) {
+	tenantA := tenantWithQuota(1, 0.5, 2)
+	lim := newTenantRateLimiter(WithIdleTTL(time.Minute))
+
+	for i := 0; i < 2; i++ {
+		require.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+			"request %d must be admitted within the burst", i+1)
+	}
+	require.Equal(t, http.StatusTooManyRequests, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+		"the budget must be empty once the burst is spent")
+
+	// An hour of quiet is well past both the one-minute idle TTL and the
+	// two-token refill period, so the sweep retires the bucket.
+	require.Equal(t, 1, lim.evictIdle(time.Now().Add(time.Hour)),
+		"an idle tenant bucket must be evicted")
+	require.Zero(t, lim.Size())
+
+	assert.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+		"after the refill window the tenant must be admitted again")
+	assert.Equal(t, http.StatusOK, sendAsTenant(lim, Principal{Tenant: tenantA}).Code,
+		"the refilled bucket must carry the full burst, not a single token")
+	assert.Equal(t, http.StatusTooManyRequests, sendAsTenant(lim, Principal{Tenant: tenantA}).Code)
+}
+
+// TestTenantRateLimitWithoutCredentialUsesIPFallback covers the documented
+// path for requests that carry no tenant identity: the resolver declines and
+// the limiter falls back to the instance-wide IP-keyed bucket. That traffic
+// must neither be rejected outright nor spend a tenant's budget.
+func TestTenantRateLimitWithoutCredentialUsesIPFallback(t *testing.T) {
+	cases := []struct {
+		name string
+		send func(*RateLimiter, string) *httptest.ResponseRecorder
+	}{
+		{
+			name: "no principal at all",
+			send: func(l *RateLimiter, addr string) *httptest.ResponseRecorder {
+				return sendFrom(l, addr)
+			},
+		},
+		{
+			name: "untenanted principal in single-tenant mode",
+			send: func(l *RateLimiter, addr string) *httptest.ResponseRecorder {
+				return sendAsTenantFrom(l, addr, Principal{Untenanted: true})
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lim := NewRateLimiter(0.5, 1, false,
+				WithLimitResolver(TenantLimitResolver(0.5, 1)))
+			const addr = "203.0.113.90:7000"
+
+			require.Equal(t, http.StatusOK, tc.send(lim, addr).Code,
+				"the first credential-less request must be admitted by the IP bucket")
+			rec := tc.send(lim, addr)
+			require.Equal(t, http.StatusTooManyRequests, rec.Code,
+				"the instance-wide IP bucket must bind once its burst is spent")
+			assert.NotEmpty(t, rec.Header().Get("Retry-After"))
+			assert.Equal(t, 1, lim.Size(), "credential-less traffic must key on the source IP")
+
+			// A different address is a different bucket...
+			assert.Equal(t, http.StatusOK, tc.send(lim, "203.0.113.91:7000").Code)
+
+			// ...and the exhausted IP bucket must not touch the
+			// authenticated tenant's budget at the same address.
+			assert.Equal(t, http.StatusOK,
+				sendAsTenantFrom(lim, addr, Principal{Tenant: tenantWithQuota(1, 0.5, 1)}).Code,
+				"credential-less traffic must not spend a tenant's budget")
+		})
+	}
+}
+
+// TestTenantRateLimitUnconfiguredIsPassthrough guards the off-by-default
+// posture for tenants without an override: when neither the tenant nor the
+// instance configures a budget, the limiter must add no limits of its own.
+func TestTenantRateLimitUnconfiguredIsPassthrough(t *testing.T) {
+	lim := newTenantRateLimiter()
+	require.True(t, lim.Enabled(), "the resolver keeps the limiter wired in")
+
+	for i := 0; i < 5; i++ {
+		assert.Equal(t, http.StatusOK,
+			sendAsTenant(lim, Principal{Tenant: store.Tenant{ID: 7}}).Code,
+			"request %d must pass: no budget is configured for this tenant", i+1)
+	}
+	assert.Zero(t, lim.Size(), "an unbudgeted tenant must not accumulate a bucket")
 }

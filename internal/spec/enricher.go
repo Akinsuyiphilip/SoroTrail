@@ -210,6 +210,22 @@ func (e *Enricher) getSpec(ctx context.Context, contractID string) *ContractSpec
 // collide with a real wasm hash (hex/base64 alphabet has no ':').
 const overrideKeyPrefix = "override:"
 
+// InvalidateContract evicts everything the cache holds for a contract: the
+// spec fetched from the RPC and the user-supplied override. It is called
+// after an override write, delete, or revert, so the next enrichment
+// reflects the change rather than the copy that was cached before it.
+//
+// Without this a stale override would keep decoding events the old way for
+// as long as the process lives: the override cache entry never expires on
+// its own, because an override is authoritative until it is replaced.
+func (e *Enricher) InvalidateContract(contractID string) {
+	if e == nil || e.cache == nil {
+		return
+	}
+	e.cache.InvalidateContract(contractID)
+	e.cache.InvalidateOverride(contractID)
+}
+
 // getOverride loads the user-supplied spec override for a contract.
 // Returns nil when no override exists (or the stored JSON is invalid —
 // invalid specs are rejected at upload time, so this only guards against

@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -117,11 +121,72 @@ func TestRunCompletionTo(t *testing.T) {
 func TestCompletionMatchesDispatch(t *testing.T) {
 	t.Parallel()
 	dispatched := []string{
-		"replay", "apikey", "backfill", "index-addresses",
+		"replay", "apikey", "contracts", "backfill", "index-addresses",
 		"migrate", "healthcheck", "schema-inspect", "migrate-status",
 		"completion", "version", "config", "help",
 	}
 	completion := completionNames()
 	assert.ElementsMatch(t, dispatched, completion,
 		"completionCommands must mirror the subcommands dispatch() routes")
+}
+
+// TestCompletionScriptSyntax validates that the generated completion scripts
+// parse without syntax errors in their target shells. If a shell is not
+// installed on the host running the test, the test case skips visibly.
+func TestCompletionScriptSyntax(t *testing.T) {
+	shells := []struct {
+		shell string
+		bin   string
+		flag  string
+	}{
+		{shell: "bash", bin: "bash", flag: "-n"},
+		{shell: "zsh", bin: "zsh", flag: "-n"},
+		{shell: "fish", bin: "fish", flag: "-n"},
+	}
+
+	for _, tt := range shells {
+		t.Run(tt.shell, func(t *testing.T) {
+			path, err := exec.LookPath(tt.bin)
+			if err != nil {
+				t.Skipf("shell %s not installed; skipping syntax validation", tt.bin)
+			}
+
+			script, err := completionScript(tt.shell)
+			require.NoError(t, err)
+			require.NotEmpty(t, script)
+
+			cmd := exec.Command(path, tt.flag)
+			cmd.Stdin = strings.NewReader(script)
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, "syntax check failed for %s completion script: %s", tt.shell, string(out))
+		})
+	}
+}
+
+// TestRunCompletionDirect asserts that runCompletion functions as the
+// entrypoint writing directly to stdout and correctly reporting errors.
+func TestRunCompletionDirect(t *testing.T) {
+	// 1. Valid invocation capturing stdout
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	oldStdout := os.Stdout
+	os.Stdout = w
+
+	runErr := runCompletion([]string{"bash"})
+	w.Close()
+	os.Stdout = oldStdout
+
+	require.NoError(t, runErr)
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	assert.Contains(t, buf.String(), "complete -F _sorotrail sorotrail")
+
+	// 2. Unsupported shell error through runCompletion
+	err = runCompletion([]string{"unsupported-shell"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bash, zsh, or fish")
+
+	// 3. Help invocation returns nil
+	err = runCompletion([]string{"--help"})
+	require.NoError(t, err)
 }

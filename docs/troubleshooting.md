@@ -225,6 +225,39 @@ before anything connects. Every message names the offending variable.
 - **Fix** — upload the contract spec, or drop the parameter. To see the
   stored values with nothing derived layered on top, use `?decoded=false`.
 
+### A contract is watched but no events are ingested
+
+- **Symptom** — `GET /watched-contracts` or `GET /tenant/watch` lists the
+  contract, and the contract is emitting events on-chain, but `GET /events`
+  returns no rows for it.
+- **Cause** — the watch-list entry was recorded under a `network` value that
+  no running ingester is polling. `buildFilterBatches` filters
+  `ListWatchedContracts` to entries matching the ingester's configured
+  `NETWORK` (`default` when `NETWORK` is unset). Common causes include
+  posting to `POST /watched-contracts` with the wrong `"network"`, switching
+  `NETWORK` after seeding, or adding a contract via `POST /tenant/watch`
+  (which currently defaults `tenant_watched_contracts.network` to `'default'`
+  even when `NETWORK=testnet` or `NETWORK=mainnet`; see
+  [Multi-tenancy — Watch lists and ingestion](multi-tenancy.md#watch-lists-and-ingestion)).
+- **Fix** — run this query against Postgres to list every watched contract
+  whose `network` has no active ingester state row:
+
+  ```sql
+  SELECT w.network, w.contract_id
+    FROM (
+          SELECT network, contract_id FROM watched_contracts
+          UNION
+          SELECT network, contract_id FROM tenant_watched_contracts
+         ) w
+    LEFT JOIN ingestion_state s ON s.network = w.network
+   WHERE s.network IS NULL;
+  ```
+
+  Re-add the contract on the target network via `POST /watched-contracts`
+  with `"network": "<active_network>"` (and `"confirm": true` if it is the
+  first watched contract on that network), then remove the stale entry with
+  `DELETE /watched-contracts/{id}?network=<stale_network>&confirm=true`.
+
 ---
 
 ## Replay errors

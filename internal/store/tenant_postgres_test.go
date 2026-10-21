@@ -255,22 +255,22 @@ func TestWatchedContracts_UnionAndRefcounting(t *testing.T) {
 	two := mustTenant(t, p, "two")
 
 	// The operator's global list still counts.
-	require.NoError(t, p.AddWatchedContract(ctx, contractC))
+	require.NoError(t, p.AddWatchedContract(ctx, WatchedContract{ContractID: contractC}))
 
-	require.NoError(t, p.AddTenantWatchedContract(ctx, one, contractA, 0))
-	require.NoError(t, p.AddTenantWatchedContract(ctx, two, contractA, 0))
-	require.NoError(t, p.AddTenantWatchedContract(ctx, two, contractB, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractB, 0))
 
 	assert.Equal(t, []string{contractA, contractB, contractC}, watchedContractIDs(t, p),
 		"a contract two tenants both want appears once")
 
 	// One tenant drops the shared contract; the other still needs it.
-	require.NoError(t, p.RemoveTenantWatchedContract(ctx, one.ID, contractA))
+	require.NoError(t, p.RemoveTenantWatchedContract(ctx, one.ID, "", contractA))
 	assert.Contains(t, watchedContractIDs(t, p), contractA,
 		"a contract another tenant still watches must keep being ingested")
 
 	// The last tenant drops it: now it leaves the union.
-	require.NoError(t, p.RemoveTenantWatchedContract(ctx, two.ID, contractA))
+	require.NoError(t, p.RemoveTenantWatchedContract(ctx, two.ID, "", contractA))
 	watched := watchedContractIDs(t, p)
 	assert.NotContains(t, watched, contractA)
 	assert.Contains(t, watched, contractB)
@@ -285,9 +285,9 @@ func TestDeleteTenant_ReleasesWatchClaims(t *testing.T) {
 
 	one := mustTenant(t, p, "one")
 	two := mustTenant(t, p, "two")
-	require.NoError(t, p.AddTenantWatchedContract(ctx, one, contractA, 0))
-	require.NoError(t, p.AddTenantWatchedContract(ctx, one, contractB, 0))
-	require.NoError(t, p.AddTenantWatchedContract(ctx, two, contractB, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractB, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractB, 0))
 
 	require.NoError(t, p.DeleteTenant(ctx, one.ID))
 
@@ -310,12 +310,12 @@ func TestWatchedContracts_Quotas(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, contractA, 0))
-		err = p.AddTenantWatchedContract(ctx, tenant, contractB, 0)
+		require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
+		err = p.AddTenantWatchedContract(ctx, tenant, "", contractB, 0)
 		assert.ErrorIs(t, err, ErrQuotaExceeded)
 
 		// Re-adding something already held stays idempotent at the cap.
-		assert.NoError(t, p.AddTenantWatchedContract(ctx, tenant, contractA, 0))
+		assert.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
 	})
 
 	t.Run("the instance cap bounds the union", func(t *testing.T) {
@@ -323,24 +323,24 @@ func TestWatchedContracts_Quotas(t *testing.T) {
 		one := mustTenant(t, p, "one")
 		two := mustTenant(t, p, "two")
 
-		require.NoError(t, p.AddTenantWatchedContract(ctx, one, contractA, 2))
-		require.NoError(t, p.AddTenantWatchedContract(ctx, one, contractB, 2))
+		require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractA, 2))
+		require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractB, 2))
 
-		err := p.AddTenantWatchedContract(ctx, two, contractC, 2)
+		err := p.AddTenantWatchedContract(ctx, two, "", contractC, 2)
 		assert.ErrorIs(t, err, ErrQuotaExceeded, "a third distinct contract exceeds the cap")
 
 		// A contract already in the union costs nothing to join, because
 		// the cap bounds ingestion cost and that contract is already polled.
-		assert.NoError(t, p.AddTenantWatchedContract(ctx, two, contractA, 2))
+		assert.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractA, 2))
 	})
 
 	t.Run("no cap means unlimited", func(t *testing.T) {
 		p := testTenantStore(t)
 		tenant := mustTenant(t, p, "uncapped")
 		for _, c := range []string{contractA, contractB, contractC} {
-			require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, c, 0))
+			require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", c, 0))
 		}
-		watched, err := p.ListTenantWatchedContracts(ctx, tenant.ID)
+		watched, err := p.ListTenantWatchedContracts(ctx, tenant.ID, "")
 		require.NoError(t, err)
 		assert.Len(t, watched, 3)
 	})
@@ -354,7 +354,7 @@ func TestWatchingDoesNotGrantAccess(t *testing.T) {
 	ctx := context.Background()
 
 	tenant := mustTenant(t, p, "watcher")
-	require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
 
 	sc, err := p.ScopeForTenant(ctx, tenant)
 	require.NoError(t, err)
@@ -366,6 +366,29 @@ func TestWatchingDoesNotGrantAccess(t *testing.T) {
 	got, _, err := p.QueryEvents(ctx, EventFilter{Scope: sc})
 	require.NoError(t, err)
 	assert.Empty(t, got)
+}
+
+func TestWatchedContracts_MultiNetwork(t *testing.T) {
+	p := testTenantStore(t)
+	ctx := context.Background()
+
+	tenant := mustTenant(t, p, "multi-net")
+	require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "mainnet", contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "testnet", contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "testnet", contractB, 0))
+
+	mainnetWatched, err := p.ListTenantWatchedContracts(ctx, tenant.ID, "mainnet")
+	require.NoError(t, err)
+	assert.Equal(t, []string{contractA}, mainnetWatched)
+
+	testnetWatched, err := p.ListTenantWatchedContracts(ctx, tenant.ID, "testnet")
+	require.NoError(t, err)
+	assert.Equal(t, []string{contractA, contractB}, testnetWatched)
+
+	require.NoError(t, p.RemoveTenantWatchedContract(ctx, tenant.ID, "testnet", contractA))
+	mainnetWatched, err = p.ListTenantWatchedContracts(ctx, tenant.ID, "mainnet")
+	require.NoError(t, err)
+	assert.Equal(t, []string{contractA}, mainnetWatched, "mainnet watch is preserved when testnet watch is removed")
 }
 
 func TestTenantAPIKeys(t *testing.T) {

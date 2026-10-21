@@ -216,3 +216,127 @@ func TestListEvents_FilterCombinationsAgainstSeededData(t *testing.T) {
 		})
 	}
 }
+
+// TestContractStats pins GET /contracts/{id}/stats against a real
+// Postgres: event_count must come from CountContractEvents, metadata
+// must come from the contract_meta cache written by UpsertContractMeta,
+// and the 404-on-zero-events rule must hold even when a contract_meta
+// row exists (a row without events is still not a contract we expose).
+func TestContractStats(t *testing.T) {
+	pool := testdb.Setup(t, store.Migrate)
+	st := store.NewPostgres(pool)
+
+	ctx := context.Background()
+	seed := apiSeed()
+	if _, err := st.UpsertEvents(ctx, seed); err != nil {
+		t.Fatalf("seeding api events: %v", err)
+	}
+
+	// Contract A emits 5 events (odd seeds): 4 "contract" + 1 "diagnostic".
+	name, symbol := "Token A", "TKA"
+	decimals := 7
+	fullMeta := store.ContractMeta{
+		ContractID: apiContractA,
+		Name:       &name,
+		Symbol:     &symbol,
+		Decimals:   &decimals,
+		IsToken:    true,
+		FetchedAt:  time.Now().UTC(),
+	}
+	// Contract B emits 5 events but is a probed non-token: null metadata.
+	negativeMeta := store.ContractMeta{ContractID: apiContractB, IsToken: false}
+	// Cached metadata for a contract that has no events at all.
+	orphanID := "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+	orphanMeta := store.ContractMeta{ContractID: orphanID, IsToken: true, FetchedAt: time.Now().UTC()}
+	for _, m := range []store.ContractMeta{fullMeta, negativeMeta, orphanMeta} {
+		if err := st.UpsertContractMeta(ctx, m); err != nil {
+			t.Fatalf("seeding contract_meta for %s: %v", m.ContractID, err)
+		}
+	}
+
+	log := captureLogger(t)
+	srv := httptest.NewServer(api.New(st, healthOnlyRPC{}, log, "test-key").Router())
+	t.Cleanup(srv.Close)
+
+	t.Run("with cached token metadata", func(t *testing.T) {
+		resp, err := http.Get(srv.URL + "/contracts/" + apiContractA + "/stats")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		var got contractStatsResponse
+		require.NoError(t, json.Unmarshal(body, &got), string(body))
+
+		assert.Equal(t, apiContractA, got.ContractID)
+		assert.Equal(t, int64(5), got.EventCount)
+		require.NotNil(t, got.Name, "name must be returned for a cached token")
+		assert.Equal(t, name, *got.Name)
+		require.NotNil(t, got.Symbol, "symbol must be returned for a cached token")
+		assert.Equal(t, symbol, *got.Symbol)
+		require.NotNil(t, got.Decimals, "decimals must be returned for a cached token")
+		assert.Equal(t, decimals, *got.Decimals)
+	})
+
+	t.Run("without metadata omits fields instead of nulls", func(t *testing.T) {
+		resp, err := http.Get(srv.URL + "/contracts/" + apiContractB + "/stats")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		// Decode generically so we can tell "field omitted" from "field: null":
+		// the API contract is omitempty, and a null would leak into clients
+		// that distinguish missing from explicit null.
+		var raw map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(body, &raw), string(body))
+		for _, field := range []string{"name", "symbol", "decimals"} {
+			v, ok := raw[field]
+			assert.False(t, ok, "%s must be omitted entirely, got %q", field, string(v))
+		}
+
+		var got contractStatsResponse
+		require.NoError(t, json.Unmarshal(body, &got), string(body))
+		assert.Equal(t, apiContractB, got.ContractID)
+		assert.Equal(t, int64(5), got.EventCount)
+		assert.Nil(t, got.Name)
+		assert.Nil(t, got.Symbol)
+		assert.Nil(t, got.Decimals)
+	})
+
+	t.Run("no events returns 404 even with cached meta", func(t *testing.T) {
+		resp, err := http.Get(srv.URL + "/contracts/" + orphanID + "/stats")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	})
+
+	t.Run("unknown contract returns 404", func(t *testing.T) {
+		resp, err := http.Get(srv.URL + "/contracts/" + apiContractA[:55] + "X/stats")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	})
+
+	t.Run("invalid contract id returns 400", func(t *testing.T) {
+		for _, id := range []string{"not-a-contract", "X" + apiContractA[1:], apiContractA[:55]} {
+			resp, err := http.Get(srv.URL + "/contracts/" + id + "/stats")
+			require.NoError(t, err)
+			resp.Body.Close()
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "id %q must be rejected", id)
+		}
+	})
+}
+
+// contractStatsResponse mirrors the unexported api.contractStatsResponse
+// so the test can assert the exact JSON wire shape.
+type contractStatsResponse struct {
+	ContractID    string                         `json:"contract_id"`
+	Name          *string                        `json:"name,omitempty"`
+	Symbol        *string                        `json:"symbol,omitempty"`
+	Decimals      *int                           `json:"decimals,omitempty"`
+	EventCount    int64                          `json:"event_count"`
+	TypeBreakdown []store.ContractEventTypeCount `json:"type_breakdown,omitempty"`
+}

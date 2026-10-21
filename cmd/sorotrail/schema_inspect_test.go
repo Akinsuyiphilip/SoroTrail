@@ -3,11 +3,74 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/store"
 )
+
+func TestQuerySchemaMatch(t *testing.T) {
+	embedded, err := store.CountEmbeddedMigrations()
+	require.NoError(t, err)
+	require.Greater(t, embedded, 1)
+
+	allPending := make([]uint, embedded)
+	for i := range allPending {
+		allPending[i] = uint(i + 1)
+	}
+
+	tests := []struct {
+		name           string
+		appliedVersion int
+		wantMatched    bool
+		wantPending    []uint
+		wantDetail     string
+	}{
+		{
+			name:           "fully applied",
+			appliedVersion: embedded,
+			wantMatched:    true,
+			wantPending:    nil,
+			wantDetail:     fmt.Sprintf("applied %d, embedded %d, pending 0", embedded, embedded),
+		},
+		{
+			name:           "migration drift with pending versions",
+			appliedVersion: embedded - 1,
+			wantMatched:    false,
+			wantPending:    []uint{uint(embedded)},
+			wantDetail:     fmt.Sprintf("applied %d, embedded %d, 1 pending: [%d]", embedded-1, embedded, embedded),
+		},
+		{
+			name:           "applied version newer than embedded set",
+			appliedVersion: embedded + 1,
+			wantMatched:    false,
+			wantPending:    nil,
+			wantDetail:     fmt.Sprintf("applied %d exceeds embedded %d", embedded+1, embedded),
+		},
+		{
+			name:           "no migrations applied",
+			appliedVersion: 0,
+			wantMatched:    false,
+			wantPending:    allPending,
+			wantDetail:     "no migrations applied",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := querySchemaMatch(tt.appliedVersion)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantMatched, got.Matched)
+			assert.Equal(t, embedded, got.EmbeddedVersion)
+			assert.Equal(t, tt.appliedVersion, got.AppliedVersion)
+			assert.Equal(t, tt.wantPending, got.PendingMigrations)
+			assert.Equal(t, tt.wantDetail, got.Detail)
+		})
+	}
+}
 
 func TestHumanSize(t *testing.T) {
 	tests := []struct {

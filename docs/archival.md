@@ -1,15 +1,17 @@
-# Cold-tier archival (planned)
+# Cold-tier archival (design proposal)
 
-> **Status: planned — not implemented.** This document sketches the
-> proposed design for the cold-tier archival feature tracked in
-> [#41](https://github.com/sorotrail/SoroTrail/issues/41). Nothing in the
-> codebase implements it yet; no Go code, no migrations, no S3 / Parquet
-> dependencies. The goal of this PR is to put the design in writing so a
-> future implementation PR has a reference and reviewers can sign off on
-> the shape before code lands.
+> **Status: proposal; the production implementation is a limited first
+> version.** The design below sketches the broader cold-tier archival
+> feature tracked in [#41](https://github.com/sorotrail/SoroTrail/issues/41).
+> The current `internal/archive` package writes gzip-compressed NDJSON and
+> a JSON manifest to S3-compatible storage, but does not implement the
+> proposed Parquet format, database-tracked lifecycle, read-back checksum
+> verification, or retention interlock described here. Do not treat this
+> proposal as a description of current runtime guarantees.
 >
 > Treat every paragraph below as **proposed** and revisit during
-> implementation. Open decisions are called out at the bottom.
+> expansion of the implementation. Open decisions are called out at the
+> bottom.
 
 ## Why
 

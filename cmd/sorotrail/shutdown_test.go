@@ -11,10 +11,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -30,6 +32,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/webhook"
 )
 
 var (
@@ -442,6 +446,49 @@ func TestComponentFailureExitsOne(t *testing.T) {
 	assert.Contains(t, c.stdout.String(), "shutdown complete",
 		"the process must drain the remaining components before exiting\nstdout:\n%s",
 		c.stdout.String())
+}
+
+// TestWebhookGoroutineReportsOnShutdown guards the accounting rule
+// behind issue #1002: every goroutine counted in `remaining` must send
+// exactly one result to errCh. The webhook was counted but never
+// reported, so the drain loop blocked after "shutdown signal received"
+// until SIGKILL, and "shutdown complete" was never logged.
+//
+// The end-to-end sequence test covers this too, but it needs a live
+// Postgres (TEST_DATABASE_URL) and therefore skips on most `go test`
+// runs. Notifier.Run never touches the store — it starts workers and
+// blocks until ctx is done — so this test exercises the real helper
+// with a nil store and no database, and guards the invariant everywhere
+// the suite runs.
+func TestWebhookGoroutineReportsOnShutdown(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	wh := webhook.NewNotifier(nil, log)
+
+	errCh := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go runWebhook(ctx, wh, errCh)
+
+	// A real shutdown begins with the signal, not with the webhook
+	// stopping, so the drain must still be waiting at this point: a
+	// report before any cancellation would burn an accounting slot
+	// the loop is not reading yet.
+	select {
+	case err := <-errCh:
+		t.Fatalf("runWebhook reported %v before ctx was cancelled; "+
+			"the drain would read a premature report (issue #1002)", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err, "a clean webhook stop must report nil, "+
+			"not an error that would abort the drain (issue #1002)")
+	case <-time.After(5 * time.Second):
+		t.Fatal("runWebhook never reported after ctx was cancelled; " +
+			"the drain would hang forever after " +
+			"\"shutdown signal received\" (issue #1002)")
+	}
 }
 
 // sendSignal delivers SIGINT to the child.

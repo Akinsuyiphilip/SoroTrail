@@ -22,13 +22,16 @@ func main() {
 	out := flag.String("out", "pkg/client/client.gen.go", "path to the generated client")
 	flag.Parse()
 
-	code, err := clientgen.GenerateFromFile(*in)
+	if err := run(*in, *out); err != nil {
+		fmt.Fprintln(os.Stderr, "clientgen:", err)
+		os.Exit(1)
+	}
+}
+
+func run(in, out string) error {
+	code, err := clientgen.GenerateFromFile(in)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "clientgen:", err)
-		os.Exit(1)
+		return err
 	}
-	if err := os.WriteFile(*out, code, 0o644); err != nil {
-		fmt.Fprintln(os.Stderr, "clientgen:", err)
-		os.Exit(1)
-	}
+	return os.WriteFile(out, code, 0o644)
 }
