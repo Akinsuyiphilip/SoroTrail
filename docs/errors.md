@@ -240,6 +240,7 @@ they matter rather than on every path.
 | the store backend does not implement API keys (ErrUnsupported) | DELETE /apikeys/{id} | `operation not supported by this store backend` |
 | the live stream is requested on an instance with no broadcaster | GET /events/ws | `streaming not configured` |
 | the store backend does not support listing contracts (ErrUnsupported) | GET /contracts | `operation not supported by this store backend` |
+| the store backend cannot count a contract's events (ErrUnsupported, e.g. ClickHouse) | GET /contracts/{id}/stats | `operation not supported by this store backend` |
 | the store backend does not support contract summaries (ErrUnsupported) | GET /contracts/{id} | `operation not supported by this store backend` |
 | the store backend does not implement contract spec overrides (ErrUnsupported) | DELETE /contracts/{id}/spec | `operation not supported by this store backend` |
 | the store backend does not implement contract spec overrides (ErrUnsupported) | PUT /contracts/{id}/spec | `operation not supported by this store backend` |

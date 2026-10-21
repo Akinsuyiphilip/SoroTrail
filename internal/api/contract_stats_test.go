@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -53,6 +54,26 @@ func TestContractStats_CountErrorIsInternal(t *testing.T) {
 	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
 }
 
+// TestContractStats_CountUnsupportedIsNotImplemented covers the backend that
+// cannot count a contract's events at all — ClickHouse, whose contract
+// metadata surface refuses rather than answering with a zero count.
+//
+// The endpoint has to recognise the refusal and stand down: a 500 would
+// read as a fault in this server, and a zero count would read as a contract
+// that has no events at all. The refusal is reported as 501, the status the
+// API already uses for a store that cannot serve the request.
+func TestContractStats_CountUnsupportedIsNotImplemented(t *testing.T) {
+	st := &stubStore{
+		contractEventCountErr: fmt.Errorf("counting contract events: %w", store.ErrUnsupported),
+	}
+
+	resp, body := doGet(t, newTestServer(st, nil), "/contracts/"+testContract+"/stats")
+
+	assert.Equal(t, http.StatusNotImplemented, resp.StatusCode)
+	assert.Contains(t, string(body), "not supported by this store backend")
+	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+}
+
 func TestContractStats_BasicResponseAndCacheControl(t *testing.T) {
 	st := &stubStore{contractEventCount: 12}
 
@@ -87,6 +108,13 @@ func TestContractStats_Metadata(t *testing.T) {
 		{name: "present", meta: full, wantName: &name, wantSym: &symbol, wantDec: &decimals},
 		{name: "absent", meta: nil},
 		{name: "error is swallowed", metaErr: errors.New("meta lookup failed")},
+		// A backend that stores no contract metadata refuses the read.
+		// That is not a failure of the request: the stats are still
+		// served, just without the token name, symbol and decimals.
+		{
+			name:    "unsupported backend serves the stats without metadata",
+			metaErr: fmt.Errorf("reading contract meta: %w", store.ErrUnsupported),
+		},
 		// HasMetadata requires IsToken and all three fields; a partial row
 		// must not produce a response with some metadata attached.
 		{name: "present but incomplete", meta: &store.ContractMeta{Name: &name, IsToken: true}},

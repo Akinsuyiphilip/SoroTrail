@@ -2150,6 +2150,11 @@ SEP-41 token interface via RPC simulation.
 - **TTL-based refresh** — token metadata is re-fetched after
   `CONTRACT_META_TTL` (default 24h) so name/symbol changes (e.g. a token
   upgrade) are eventually picked up.
+- **Postgres-only** — the contract metadata table is Postgres-only. On a
+  ClickHouse backend the whole contract-metadata surface refuses with
+  `ErrUnsupported`, so the worker stands down instead of reporting success
+  while storing nothing, and the API answers 501 on the endpoints that need
+  it. See [ClickHouse backend support](docs/clickhouse.md).
 
 Disable enrichment entirely with `CONTRACT_META_ENABLED=false`.
 

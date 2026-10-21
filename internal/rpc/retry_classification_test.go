@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -18,11 +22,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestIsTransientHTTP_Table pins the fragment list behind transport-level
-// retry classification, including the case that decides whether a flaky
-// provider degrades gracefully or stops ingestion: an HTTP 5xx response is
-// NOT matched, because call() renders it as "method returned HTTP 500: …"
-// and no fragment in the list appears in that sentence.
+// TestIsTransientHTTP_Table pins the transport-level retry classification.
+//
+// The inputs are the errors the Go runtime actually produces — a syscall
+// errno, a *net.OpError, a *net.DNSError, a closed listener — rather than
+// errors.New strings copied from the implementation's own fragment list. A
+// test built from the same words the code matches on proves nothing about
+// the failures that actually happen, and it would keep passing on a
+// platform whose error wording differs.
+//
+// The case that decides whether a flaky provider degrades gracefully or
+// stops ingestion is the HTTP 5xx response: it is NOT matched, because
+// call() renders it as "method returned HTTP 500: …" and neither the
+// structural checks nor the fallback fragments match that sentence.
 func TestIsTransientHTTP_Table(t *testing.T) {
 	tests := []struct {
 		name string
@@ -30,18 +42,72 @@ func TestIsTransientHTTP_Table(t *testing.T) {
 		want bool
 	}{
 		{name: "nil is never transient", err: nil, want: false},
-		{name: "connection refused", err: errors.New("dial tcp 127.0.0.1:1: connect: connection refused"), want: true},
-		{name: "connection reset mid-response", err: errors.New("read tcp: connection reset by peer"), want: true},
-		{name: "EOF on a keep-alive connection", err: errors.New("unexpected EOF"), want: true},
-		{name: "i/o timeout", err: errors.New("dial tcp: i/o timeout"), want: true},
-		{name: "DNS failure", err: errors.New("lookup rpc.example: no such host"), want: true},
-		{name: "temporary resolver failure", err: errors.New("temporary failure in name resolution"), want: true},
 		{
-			// The wrapped transport error from call() keeps the fragment in
-			// the message, so classification survives the wrapping.
-			name: "wrapped transport error",
-			err:  fmt.Errorf("calling getEvents: %w", errors.New("dial tcp: i/o timeout")),
+			name: "connection refused",
+			err:  &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
 			want: true,
+		},
+		{
+			// The real shape a transport error arrives in: net/http wraps
+			// the socket error in a *url.Error, and the caller's own
+			// wrapping adds another layer. The classification has to see
+			// through all of them.
+			name: "refused connection behind two wrappers",
+			err: fmt.Errorf("calling getEvents: %w", &url.Error{
+				Op:  "Get",
+				URL: "https://rpc.example",
+				Err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
+			}),
+			want: true,
+		},
+		{
+			name: "connection reset mid-response",
+			err:  &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET},
+			want: true,
+		},
+		{
+			name: "dns lookup failure",
+			err:  &net.DNSError{Err: "no such host", Name: "rpc.example", IsNotFound: true},
+			want: true,
+		},
+		{
+			name: "dns resolver timeout",
+			err:  &net.DNSError{Err: "i/o timeout", Name: "rpc.example", IsTimeout: true},
+			want: true,
+		},
+		{
+			name: "unexpected EOF",
+			err:  io.ErrUnexpectedEOF,
+			want: true,
+		},
+		{
+			name: "plain EOF",
+			err:  io.EOF,
+			want: true,
+		},
+		{
+			name: "context deadline exceeded",
+			err:  context.DeadlineExceeded,
+			want: true,
+		},
+		{
+			// The client's own timeout arrives as a net.Error that reports
+			// itself as a timeout without any errno behind it.
+			name: "client timeout",
+			err:  &url.Error{Op: "Get", URL: "https://rpc.example", Err: timeoutError{}},
+			want: true,
+		},
+		{
+			name: "context cancelled is not transient",
+			err:  context.Canceled,
+			want: false,
+		},
+		{
+			// A cancelled request arrives wrapped in the transport's own
+			// error type, so the cancellation check has to come first.
+			name: "cancelled context behind an op error",
+			err:  &net.OpError{Op: "read", Net: "tcp", Err: context.Canceled},
+			want: false,
 		},
 		{
 			// Pinned gap: a 502 from the provider reads as a gateway failure
@@ -66,13 +132,59 @@ func TestIsTransientHTTP_Table(t *testing.T) {
 			err:  errors.New("context timed out while waiting for response"),
 			want: false,
 		},
+		{
+			// The fallback exists for errors that carry no typed cause at
+			// all. It is a last resort, not the primary mechanism.
+			name: "untyped message falls back to the fragment list",
+			err:  errors.New("dial tcp 127.0.0.1:1: connect: connection refused"),
+			want: true,
+		},
+		{
+			name: "untyped message without a known fragment is not transient",
+			err:  errors.New("the response body did not parse"),
+			want: false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, isTransientHTTP(tt.err))
+			assert.Equal(t, tt.want, IsTransientHTTP(tt.err))
 		})
 	}
+}
+
+// timeoutError is a net.Error that reports a timeout without carrying an
+// errno, the shape the HTTP client produces when its own deadline fires.
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "context deadline exceeded (Client.Timeout exceeded)" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+// TestIsTransientHTTP_RealRefusedConnection drives the classifier against
+// the error a real dial produces, so the classification is proven for the
+// value the transport actually creates rather than for a hand-built one.
+//
+// The point is platform independence: POSIX renders the failure as
+// "connection refused" and Windows as "No connection could be made because
+// the target machine actively refused it", so a classifier that matched on
+// message text would answer differently on each. The typed cause does not
+// change, so neither does the answer.
+func TestIsTransientHTTP_RealRefusedConnection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+
+	_, err = net.DialTimeout("tcp", addr, 2*time.Second)
+	require.Error(t, err, "nothing is listening on the closed port")
+
+	assert.True(t, IsTransientHTTP(err),
+		"a refused connection must be transient on every platform, got %v", err)
+
+	// The same error wrapped the way the transport wraps it.
+	assert.True(t, IsTransientHTTP(fmt.Errorf("calling getHealth: %w", err)),
+		"the refusal must still be recognised through the transport's wrapping")
 }
 
 // TestRetryClient_EveryMethodRetries walks the Client surface: each method
@@ -242,11 +354,11 @@ func TestRetryClient_TransportErrorsEndToEnd(t *testing.T) {
 
 		// Pinned deliberately: 5xx is the textbook transient failure, yet
 		// the retry layer gives up after one attempt because the rendered
-		// message matches no fragment in isTransientHTTP and is not an
-		// *Error. The failover layer does demote the provider, so a request
-		// is moved rather than retried — but a single-provider deployment
-		// sees a hard failure. Filed as a follow-up; the fix belongs in
-		// production code, not here.
+		// message matches no fragment in IsTransientHTTP's fallback list
+		// and is not an *Error. The failover layer does demote the
+		// provider, so a request is moved rather than retried — but a
+		// single-provider deployment sees a hard failure. Filed as a
+		// follow-up; the fix belongs in production code, not here.
 		assert.Equal(t, 1, attempts, "current behaviour: a 5xx is never retried")
 		assert.Contains(t, err.Error(), "HTTP 500")
 		assert.False(t, isRetryable(err), "the gap this test pins: 5xx is classified as non-retryable")
