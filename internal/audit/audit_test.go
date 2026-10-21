@@ -503,3 +503,86 @@ func TestPassOnce_SpanHierarchy(t *testing.T) {
 	assert.Equal(t, passSpan.SpanContext.SpanID(), reconcileSpan.Parent.SpanID(),
 		"reconcile_range must be a child of audit.pass")
 }
+
+// TestLedgerMatches pins the ledger comparison the auditor certifies
+// ranges with: a false match here would certify a real gap as clean, so
+// both directions (match and mismatch) and the zero-vs-zero empty case
+// are worth pinning. The comparison is count-based — the RPC gives event
+// IDs but the census gives counts — so it must never be swayed by the
+// order the IDs happen to arrive in, and only the entry for the ledger
+// under test may influence the result.
+func TestLedgerMatches(t *testing.T) {
+	const l = uint32(42)
+
+	tests := []struct {
+		name   string
+		rpc    map[uint32][]string
+		stored map[uint32]int
+		want   bool
+	}{
+		{
+			name:   "identical counts match",
+			rpc:    map[uint32][]string{l: {"ev1", "ev2", "ev3"}},
+			stored: map[uint32]int{l: 3},
+			want:   true,
+		},
+		{
+			name:   "store holds more events than the RPC reports",
+			rpc:    map[uint32][]string{l: {"ev1"}},
+			stored: map[uint32]int{l: 2},
+			want:   false,
+		},
+		{
+			name:   "store holds fewer events than the RPC reports",
+			rpc:    map[uint32][]string{l: {"ev1", "ev2"}},
+			stored: map[uint32]int{l: 1},
+			want:   false,
+		},
+		{
+			name:   "empty on both sides matches",
+			rpc:    map[uint32][]string{},
+			stored: map[uint32]int{},
+			want:   true,
+		},
+		{
+			name:   "ledger absent from both maps matches",
+			rpc:    map[uint32][]string{99: {"ev1"}},
+			stored: map[uint32]int{99: 1},
+			want:   true,
+		},
+		{
+			name:   "RPC reports events the store has not counted yet",
+			rpc:    map[uint32][]string{l: {"ev1", "ev2"}},
+			stored: map[uint32]int{},
+			want:   false,
+		},
+		{
+			name:   "store counts events the RPC no longer reports",
+			rpc:    map[uint32][]string{},
+			stored: map[uint32]int{l: 1},
+			want:   false,
+		},
+		{
+			name:   "arrival order of the RPC IDs cannot fool the comparison",
+			rpc:    map[uint32][]string{l: {"ev3", "ev1", "ev2"}},
+			stored: map[uint32]int{l: 3},
+			want:   true,
+		},
+		{
+			name:   "only the ledger under test is consulted",
+			rpc:    map[uint32][]string{l: {"ev1"}, 43: {"ev2", "ev3"}},
+			stored: map[uint32]int{l: 1, 43: 99},
+			want:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// ledgerMatches reads only its arguments, so a zero Auditor
+			// is a complete receiver for this test.
+			got, err := (&Auditor{}).ledgerMatches(l, tt.rpc, tt.stored)
+			require.NoError(t, err, "the comparison is arithmetic and cannot fail")
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
