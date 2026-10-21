@@ -1172,6 +1172,61 @@ Fetch a single event by its ID (the TOID-based identifier from the RPC).
 Shell
 
 curl -s localhost:8080/events/0001099511627776-0000000001
+
+### `GET /events/aggregate`
+
+Returns event counts grouped into buckets instead of individual events. It
+accepts the same event filters as `GET /events` — `contract_id`, `type`,
+`in_successful_call`, `topic`/`topic0`..`topic3`, `topic_contains`, `tx_hash`,
+`from_ledger`, `to_ledger`, `from_time`, and `to_time` — applied before
+bucketing.
+
+| Param | Example | Meaning |
+| --- | --- | --- |
+| `bucket` | `ledger` | Required. `ledger` counts events per ledger. Any other value is parsed as a Go duration (`1h`, `24h`) and counts events per wall-clock interval. |
+| `cursor`, `limit`, `order`, `order_by` | | Accepted but ignored: aggregation always returns every bucket in one response. |
+
+Each bucket is `{"bucket": "...", "count": N}`. Ledger buckets are decimal
+ledger numbers; time buckets are `YYYY-MM-DDTHH:MM:SS` timestamps aligned to
+the requested interval. Buckets with no events are omitted, and the array is
+ordered by bucket ascending.
+
+**Limits.** The `bucket` parameter is required; a missing or unparseable value
+is a `400`. Durations must be positive and are resolved to whole seconds, so
+sub-second intervals are not supported, and `d` is not a Go duration unit —
+use `24h` for a day. There is no server-side cap on the ledger or time range
+and no pagination: every event matching the filters is aggregated into the
+response. Narrow wide queries with the filters above; aggregation is treated
+as an expensive, rate-limited read.
+
+```sh
+# One bucket per ledger, restricted to a contract and a ledger range
+curl -s 'localhost:8080/events/aggregate?bucket=ledger&contract_id=CDLZ...CYSC&from_ledger=256000&to_ledger=256001'
+```
+
+```json
+{
+  "buckets": [
+    {"bucket": "256000", "count": 5},
+    {"bucket": "256001", "count": 3}
+  ]
+}
+```
+
+```sh
+# One bucket per day, restricted to a time range
+curl -s 'localhost:8080/events/aggregate?bucket=24h&from_time=2026-07-21T00:00:00Z&to_time=2026-07-23T00:00:00Z'
+```
+
+```json
+{
+  "buckets": [
+    {"bucket": "2026-07-21T00:00:00", "count": 42},
+    {"bucket": "2026-07-22T00:00:00", "count": 17}
+  ]
+}
+```
+
 ### `GET /contracts`
 
 Lists every indexed contract with per-contract activity: total event
