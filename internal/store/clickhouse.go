@@ -52,13 +52,18 @@ func (cfg clickHouseConfig) databaseOrDefault() string {
 	return cfg.database
 }
 
-// Contract metadata (token enrichment) is Postgres-only; the ClickHouse
-// backend reports "not found"/empty so the enrichment worker stays a no-op.
-func (c *ClickHouse) ListContractIDs(ctx context.Context) ([]string, error) {
+// Contract metadata (token enrichment) is Postgres-only. Every method of
+// that surface refuses here rather than answering with an empty result: a
+// silent no-op made the enrichment pipeline report success forever while
+// writing nothing, and it left a caller unable to tell a contract that has
+// no metadata from a backend that cannot answer the question at all. The
+// refusal wraps ErrUnsupported, so a caller recognises it with errors.Is and
+// stands down instead of retrying a capability that will never arrive.
+func (c *ClickHouse) ListContractIDs(context.Context) ([]string, error) {
 	return nil, errUnsupported("clickhouse", "ListContractIDs")
 }
 func (c *ClickHouse) GetContractMeta(context.Context, string) (ContractMeta, error) {
-	return ContractMeta{}, ErrNotFound
+	return ContractMeta{}, errUnsupported("clickhouse", "GetContractMeta")
 }
 func (c *ClickHouse) UpsertContractMeta(context.Context, ContractMeta) error {
 	return errUnsupported("clickhouse", "UpsertContractMeta")

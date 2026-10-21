@@ -70,6 +70,14 @@ func (s *Server) handleContractStats(w http.ResponseWriter, r *http.Request) {
 
 	// Verify the contract exists (has at least one event).
 	count, err := s.store.CountContractEvents(r.Context(), contractID)
+	if errors.Is(err, store.ErrUnsupported) {
+		// The backend cannot count a contract's events at all. Saying so
+		// is the point: a 500 here would read as a fault in this server,
+		// and an empty stats object would read as a contract that has no
+		// events.
+		writeError(w, http.StatusNotImplemented, err)
+		return
+	}
 	if err != nil {
 		loggerFromContext(r.Context()).Error("counting events for contract", "contract_id", contractID, "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading contract stats failed"))
@@ -85,7 +93,10 @@ func (s *Server) handleContractStats(w http.ResponseWriter, r *http.Request) {
 		EventCount: count,
 	}
 
-	// Attach metadata if available.
+	// Attach metadata if available. A backend that does not store contract
+	// metadata (ClickHouse) refuses the read; that is not a failure of
+	// this request, it only means the token name, symbol and decimals are
+	// not known here, so the response carries the stats without them.
 	if meta, err := s.store.GetContractMeta(r.Context(), contractID); err == nil && meta.HasMetadata() {
 		resp.Name = meta.Name
 		resp.Symbol = meta.Symbol

@@ -1124,7 +1124,8 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 	assert.ErrorIs(t, err, ErrUnsupported, "ListContractIDs must report its absence explicitly")
 
 	_, err = st.GetContractMeta(ctx, "test")
-	assert.ErrorIs(t, err, ErrNotFound, "GetContractMeta must return ErrNotFound")
+	assert.ErrorIs(t, err, ErrUnsupported,
+		"GetContractMeta must report its absence explicitly: a backend that stores no metadata must not look like a contract that has none")
 
 	// ListContracts is an unsupported operation on ClickHouse: the
 	// backend has no contract registry to read and refuses rather than
@@ -1186,6 +1187,58 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 
 	err = st.RemoveWatchedContract(ctx, WatchedContract{ContractID: contractA})
 	assert.Error(t, err, "RemoveWatchedContract must report the failed lookup rather than ErrNotFound")
+}
+
+// TestClickHouse_ContractMetadataRefuses asserts that the contract-metadata
+// surface — the one the token-enrichment worker drives — refuses on
+// ClickHouse instead of answering with a value that reads as success.
+//
+// The methods are the ones an enrichment loop calls: it lists the contracts
+// it has seen, asks which need a refresh, writes what it learned, counts a
+// contract's events and reads a contract's cached metadata back. A silent
+// no-op on any of them made the whole pipeline report success forever while
+// storing nothing, and no log line or metric said so.
+//
+// The refusal has to wrap ErrUnsupported so a caller can recognise it and
+// stand down; a plain error would be indistinguishable from a transient
+// failure worth retrying.
+func TestClickHouse_ContractMetadataRefuses(t *testing.T) {
+	st := &ClickHouse{}
+	ctx := context.Background()
+
+	tests := []struct {
+		name  string
+		probe func() error
+	}{
+		{"ListContractIDs", func() error {
+			_, err := st.ListContractIDs(ctx)
+			return err
+		}},
+		{"GetContractMeta", func() error {
+			_, err := st.GetContractMeta(ctx, contractA)
+			return err
+		}},
+		{"UpsertContractMeta", func() error {
+			return st.UpsertContractMeta(ctx, ContractMeta{ContractID: contractA})
+		}},
+		{"CountContractEvents", func() error {
+			_, err := st.CountContractEvents(ctx, contractA)
+			return err
+		}},
+		{"ListContractsNeedingRefresh", func() error {
+			_, err := st.ListContractsNeedingRefresh(ctx, time.Now())
+			return err
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.probe()
+			require.Error(t, err, "an unimplemented operation must not succeed silently")
+			assert.ErrorIs(t, err, ErrUnsupported,
+				"the refusal must wrap ErrUnsupported so the caller can stand down")
+		})
+	}
 }
 
 // TestClickHouse_SuiteSkipsCleanly verifies that when no ClickHouse

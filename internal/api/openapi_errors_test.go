@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -120,6 +121,7 @@ type errorCase struct {
 
 func errorCases() []errorCase {
 	const badContract = "CNOTACONTRACT"
+	const goodContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
 	// Single-tenant server with a management key configured — the default
 	// deployment shape, and the one most of these statuses come from.
@@ -252,6 +254,19 @@ func errorCases() []errorCase {
 			target: "/events/ws", method: http.MethodGet,
 			status: http.StatusNotImplemented, envelope: true,
 			build: plain(&stubStore{}, http.MethodGet, "/events/ws"),
+		},
+		{
+			// A backend that cannot count a contract's events (ClickHouse)
+			// refuses the read. The endpoint has to say so rather than
+			// answer 500, which would read as a fault in this server, or
+			// an empty stats object, which would read as a contract with
+			// no events.
+			name: "501 when the backend cannot count a contract's events", route: "/contracts/{id}/stats",
+			target: "/contracts/" + goodContract + "/stats", method: http.MethodGet,
+			status: http.StatusNotImplemented, envelope: true,
+			build: plain(&stubStore{
+				contractEventCountErr: fmt.Errorf("counting contract events: %w", store.ErrUnsupported),
+			}, http.MethodGet, "/contracts/"+goodContract+"/stats"),
 		},
 		{
 			name:  "503 when the readiness probe's database is unreachable",
