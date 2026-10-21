@@ -52,6 +52,8 @@ var SpecRoutes = []SpecRoute{
 	{Method: "DELETE", Path: "/contracts/{id}/spec"},
 	{Method: "GET", Path: "/contracts/{id}/spec"},
 	{Method: "PUT", Path: "/contracts/{id}/spec"},
+	{Method: "GET", Path: "/contracts/{id}/spec/history"},
+	{Method: "POST", Path: "/contracts/{id}/spec/revert"},
 	{Method: "GET", Path: "/contracts/{id}/stats"},
 	{Method: "GET", Path: "/dead-letters"},
 	{Method: "DELETE", Path: "/dead-letters/{id}"},
@@ -139,6 +141,26 @@ type ContractListResponse = ContractsPage
 type ContractSpecOverrideRequest struct {
 	// Spec SEP-0041 contract specification JSON.
 	Spec map[string]any `json:"spec"`
+}
+
+// ContractSpecOverrideRevertRequest Names the override-history entry to restore. The id is the one listed by GET /contracts/{id}/spec/history.
+type ContractSpecOverrideRevertRequest struct {
+	// Version The id of the history entry to restore.
+	Version int64 `json:"version"`
+}
+
+// ContractSpecOverrideVersion One recorded change to a contract's spec override. The spec is absent for a tombstone entry, which means the override was deleted at that point rather than replaced.
+type ContractSpecOverrideVersion struct {
+	// ApiKeyPrefix The public prefix of the API key that made the change. The secret half of the key is never stored.
+	ApiKeyPrefix string `json:"api_key_prefix"`
+	// ContractID The contract whose override changed.
+	ContractID string `json:"contract_id"`
+	// CreatedAt When the change was recorded.
+	CreatedAt string `json:"created_at"`
+	// ID The version number. It is also the pagination cursor.
+	ID int64 `json:"id"`
+	// Spec The override document that was in force. Absent for a tombstone entry.
+	Spec map[string]any `json:"spec,omitempty"`
 }
 
 // ContractSummary API schema used by the SoroTrail client.
@@ -599,6 +621,13 @@ type GetContractSpecOverrideResponse struct {
 	Spec       map[string]any `json:"spec"`
 }
 
+// ListContractSpecOverrideHistoryResponse API schema used by the SoroTrail client.
+type ListContractSpecOverrideHistoryResponse struct {
+	Count    int64                         `json:"count"`
+	Cursor   string                        `json:"cursor,omitempty"`
+	Versions []ContractSpecOverrideVersion `json:"versions"`
+}
+
 // ListDeadLettersResponse API schema used by the SoroTrail client.
 type ListDeadLettersResponse = DeadLettersPage
 
@@ -615,6 +644,12 @@ type PutContractSpecOverrideResponse struct {
 type RawEventResponse struct {
 	TopicsXdr []string `json:"topics_xdr,omitempty"`
 	ValueXdr  string   `json:"value_xdr,omitempty"`
+}
+
+// RevertContractSpecOverrideResponse API schema used by the SoroTrail client.
+type RevertContractSpecOverrideResponse struct {
+	ContractID string         `json:"contract_id"`
+	Spec       map[string]any `json:"spec"`
 }
 
 // VersionResponse API schema used by the SoroTrail client.
@@ -1066,6 +1101,42 @@ func (c *Client) GetContractSpecOverride(ctx context.Context, id string) (*GetCo
 func (c *Client) PutContractSpecOverride(ctx context.Context, id string, body ContractSpecOverrideRequest) (*PutContractSpecOverrideResponse, error) {
 	path := urlEscapePath("/contracts/{id}/spec", id)
 	return do[PutContractSpecOverrideResponse](c, ctx, "PUT", path, nil, body)
+}
+
+// ListContractSpecOverrideHistory List a contract's spec override history.
+//
+// GET /contracts/{id}/spec/history
+func (c *Client) ListContractSpecOverrideHistory(ctx context.Context, id string, params ListContractSpecOverrideHistoryParams) (*ListContractSpecOverrideHistoryResponse, error) {
+	path := urlEscapePath("/contracts/{id}/spec/history", id)
+	query := params.values()
+	return do[ListContractSpecOverrideHistoryResponse](c, ctx, "GET", path, query, nil)
+}
+
+// ListContractSpecOverrideHistoryParams are the query parameters for ListContractSpecOverrideHistory.
+type ListContractSpecOverrideHistoryParams struct {
+	Limit  int64
+	Cursor string
+}
+
+// values renders the non-zero fields as query parameters, so an
+// unset field is omitted from the URL rather than sent as empty.
+func (p ListContractSpecOverrideHistoryParams) values() url.Values {
+	v := url.Values{}
+	if p.Limit != 0 {
+		v.Set("limit", strconv.FormatInt(p.Limit, 10))
+	}
+	if p.Cursor != "" {
+		v.Set("cursor", p.Cursor)
+	}
+	return v
+}
+
+// RevertContractSpecOverride Restore a previous contract spec override.
+//
+// POST /contracts/{id}/spec/revert
+func (c *Client) RevertContractSpecOverride(ctx context.Context, id string, body ContractSpecOverrideRevertRequest) (*RevertContractSpecOverrideResponse, error) {
+	path := urlEscapePath("/contracts/{id}/spec/revert", id)
+	return do[RevertContractSpecOverrideResponse](c, ctx, "POST", path, nil, body)
 }
 
 // ContractStats Get per-contract statistics.

@@ -22,6 +22,11 @@ HTTP API long after the RPC has forgotten them.
  Stellar RPC ──getEvents──▶ ingester ──▶ Postgres/SQLite ◀── HTTP API ◀── you
 ```
 
+## Community
+
+We welcome contributors and expect all participants to follow our
+[Code of Conduct](CODE_OF_CONDUCT.md). To report a security issue, use the
+private channel described in [SECURITY.md](SECURITY.md).
 
 ## Quickstart
 text
@@ -668,6 +673,34 @@ operator overlay and cannot be removed by this command; unset the environment
 variable to stop those entries. The CLI never edits the environment or
 configuration file.
 
+### Managing watched contracts via the HTTP API
+
+When `API_KEY` is set, operators can inspect and mutate the watch list at
+runtime without restarting the process. Every watched contract is keyed by
+`(network, contract_id)`:
+
+| Method | Path | Network parameter | Description |
+| --- | --- | --- | --- |
+| `GET` | `/watched-contracts` | — | Lists all persisted `(network, contract_id)` entries (`source: "api"`) plus any `WATCHED_CONTRACTS` environment overlay (`source: "config"`, `from_config`). |
+| `POST` | `/watched-contracts` | Body `"network"` (optional; defaults to the server's `NETWORK`, or `"default"` if unset) | Adds a contract to the watch list for that network. Requires `"confirm": true` (or `?confirm=true`) when adding the first watched contract on that network, since ingestion transitions from indexing all contracts to only the watched set. |
+| `DELETE` | `/watched-contracts/{id}` | Query `?network=` (optional; defaults to the server's `NETWORK`, or `"default"` if unset) | Removes a persisted contract from that network's watch list. Requires `?confirm=true` when removing the last watched contract on that network. Returns `409 Conflict` if the contract is pinned via `WATCHED_CONTRACTS`. |
+
+```sh
+# Add a contract on the server's default NETWORK (or pass "network": "testnet" explicitly)
+curl -s -X POST localhost:8080/watched-contracts \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"contract_id":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC","network":"testnet","confirm":true}'
+
+# Remove a contract from a specific network's watch list
+curl -s -X DELETE 'localhost:8080/watched-contracts/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC?network=testnet&confirm=true' \
+  -H "X-API-Key: $API_KEY"
+```
+
+See [The watch list and its network dimension](docs/architecture.md#the-watch-list-and-its-network-dimension)
+for how `buildFilterBatches` selects entries per network and how multi-network
+deployments share a single database.
+
 ### How to check who is behind
 
 `GET /stats` now includes a `contract_cursors` field — the number of
@@ -749,6 +782,8 @@ It is batched, resumable (Ctrl-C and re-run picks up where it stopped),
 idempotent, and safe to run against a live database while ingestion
 continues; a Postgres advisory lock prevents two replays at once.
 
+For the full documentation index, see [docs/README.md](docs/README.md).
+See [docs/replay.md](docs/replay.md) for flags, the summary output, the
 See [docs/replay.md](docs/replay.md) for the end-to-end workflow — sizing
 the job, dry-running it, spot-checking a single event, running it in chunks,
 and verifying the result — plus the flag reference, the summary output, the
@@ -763,11 +798,17 @@ Responses are gzip- or deflate-encoded when the client advertises support via
 `Accept-Encoding`, which matters most for event listings — a 200-event page is
 largely repetitive JSON keys and compresses well.
 
-Compression is applied per response, not per route, and only once the body
-reaches `COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet
-MTU). Below that, encoding costs CPU on both ends and can make the body
-*larger* once the gzip header and trailer are counted, so small responses
-(error envelopes, `/health`, a single event) are sent as-is.
+Compression is registered on the read routes whose responses grow with the
+data: event and contract lists, aggregate buckets, transaction siblings, raw
+and single events, contract stats, subscriptions, deliveries, watched contracts
+and address activity. Bounded reads (`/events/count`, `/contracts/{id}`,
+`/stats`, `/subscriptions/{id}`) and streaming exports are registered outside
+that group, so they are sent identity. Within the compressed routes the
+decision is still per response: encoding is applied only once the body reaches
+`COMPRESS_MIN_SIZE` (1400 bytes by default — roughly one Ethernet MTU). Below
+that, encoding costs CPU on both ends and can make the body *larger* once the
+gzip header and trailer are counted, so small responses (error envelopes,
+`/health`, a small single event) are sent as-is.
 
 Clients that don't advertise an encoding get the original bytes, byte for
 byte. `gzip` is preferred over `deflate` when both are offered, and
@@ -1003,7 +1044,10 @@ the spec-declared fields cannot be decoded (or the topics are malformed),
 the enriched response keeps the raw event alongside `"decoded": false` and a
 `decode_error` string explaining what failed, e.g.
 `"decode_error": "decoding topic field ...: cannot decode"`. Every such
-failure is also counted in `GET /stats` (see below).
+failure is also counted in `GET /stats` (see below). For contracts that do
+not embed a `contractspecv0` section on-chain (or whose Wasm is unreachable),
+operators can upload a manual spec override via `PUT /contracts/{id}/spec` —
+see [Contract Spec Overrides](docs/spec-overrides.md).
 | `include_xdr` | `true` | When `true`, includes raw base64 `topics_xdr` and `value_xdr` on each event. Omitted by default to keep responses small. |
 
 Topic filters may use `topic` for any-position matching, or `topic0`..`topic3` for position-specific matching. `topic` and positional topic filters cannot be combined.
@@ -1332,7 +1376,10 @@ triggers a reload; the one-shot subcommands (`replay`, `backfill`,
 Read-only GraphQL endpoint at `POST /graphql`, schema-first with
 Shared query-builder helpers in `internal/api/queries` so REST and
 GraphQL validate filters identically. Same `EventFilter` shape,
-same `Cursor` semantics, no drift between transports.
+same `Cursor` semantics, no drift between transports. See the
+[GraphQL API Guide](docs/graphql.md) for the full reference, including
+example queries for every top-level field, complexity calculation, and
+multi-tenant scope behavior.
 
 #### Endpoints
 
@@ -2103,6 +2150,11 @@ SEP-41 token interface via RPC simulation.
 - **TTL-based refresh** — token metadata is re-fetched after
   `CONTRACT_META_TTL` (default 24h) so name/symbol changes (e.g. a token
   upgrade) are eventually picked up.
+- **Postgres-only** — the contract metadata table is Postgres-only. On a
+  ClickHouse backend the whole contract-metadata surface refuses with
+  `ErrUnsupported`, so the worker stands down instead of reporting success
+  while storing nothing, and the API answers 501 on the endpoints that need
+  it. See [ClickHouse backend support](docs/clickhouse.md).
 
 Disable enrichment entirely with `CONTRACT_META_ENABLED=false`.
 

@@ -10,6 +10,7 @@ locally. Architecture context lives in [`architecture-overview.md`](architecture
 | Go | 1.25+ | Building and testing. The toolchain auto-downloads the version pinned in `go.mod`, so any Go ≥ 1.21 works too. |
 | Docker | any recent | Local Postgres / full-stack `docker compose`, and the ephemeral Postgres used by integration tests. |
 | golangci-lint | latest | `make lint` (CI runs it; install locally from [golangci-lint.run](https://golangci-lint.run/)). |
+| Helm | 3.10+ | The chart's golden tests (`deploy/helm/sorotrail`). Without it they skip and the suite says so — see [Tests that skip](#tests-that-skip). |
 | migrate (golang-migrate) | latest | Manual `make migrate-up`/`migrate-down` only — migrations run automatically on startup, so this is optional. |
 
 ## 1. Clone
@@ -110,6 +111,31 @@ and stays fast because the integration tests are gated behind the
 - **No Postgres?** Leave `TEST_DATABASE_URL` unset and the suite provisions its
   own container (needs Docker). Missing infra causes the test to `Skip`, not
   fail. See [`CONTRIBUTING.md`](../CONTRIBUTING.md#how-the-integration-test-layer-works-issue-9).
+
+### Tests that skip
+
+Some tests need an external dependency — `helm` for the chart's golden tests,
+a Postgres for the store's conformance suite — and skip when it is missing
+rather than failing, so a contributor without the dependency is not blocked.
+A skip that prints nothing is worse than no test, so every make target runs
+`make test-prereqs` first and prints a banner naming what was skipped, why,
+what it cost, and how to get the dependency.
+
+| Missing | What did not run | Install |
+| --- | --- | --- |
+| `helm` | The chart's golden tests (`deploy/helm/sorotrail`). | [helm.sh](https://helm.sh) |
+| `TEST_DATABASE_URL` | The database-backed store tests. | `make docker-up`, or point `TEST_DATABASE_URL` at your own Postgres. |
+
+A plain `go test ./...` shows the banner only under `-v`, because Go discards
+the output of a package that passes. Use the make targets to see it. Set
+`SOROTRAIL_REQUIRE_HELM=1` (or `SOROTRAIL_REQUIRE_POSTGRES=1`) to turn the
+skip into a failure instead — that is how CI asserts the tests really ran.
+
+**A green run without `helm` does not cover the Helm chart.** Adding a
+configuration variable means updating the chart in the same pull request; the
+guard is `TestRender_ConfigValuesReachThePod` in
+`deploy/helm/sorotrail/render_test.go`. See
+[`CONTRIBUTING.md`](../CONTRIBUTING.md#tests-that-skip-and-how-to-notice).
 
 ### Fuzz targets
 

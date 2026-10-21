@@ -353,7 +353,7 @@ func TestHTTPClient_ErrorEnvelopes(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "calling getHealth",
 			"a transport failure must name the method that failed")
-		assert.True(t, isNetworkError(err) || isTransientHTTP(err),
+		assert.True(t, isNetworkError(err) || IsTransientHTTP(err),
 			"a refused connection must be recognised as transient, got %v", err)
 	})
 }

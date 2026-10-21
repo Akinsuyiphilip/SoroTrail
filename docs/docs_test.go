@@ -42,6 +42,57 @@ func markdownDocs(t *testing.T) []string {
 	return matches
 }
 
+// TestDocsIndexIncludesAllDocs ensures every .md file in docs/ (except
+// README.md) is linked from docs/README.md so a new doc cannot be added
+// without updating the index.
+func TestDocsIndexIncludesAllDocs(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read docs directory: %v", err)
+	}
+
+	documents := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if filepath.Ext(entry.Name()) != ".md" || entry.Name() == "README.md" {
+			continue
+		}
+		documents[entry.Name()] = struct{}{}
+	}
+
+	if len(documents) == 0 {
+		t.Fatal("expected at least one Markdown document under docs/")
+	}
+
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("README.md should exist in docs/: %v", err)
+	}
+	content := string(readme)
+
+	for name := range documents {
+		if !strings.Contains(content, "["+name+"]("+name+")") {
+			t.Fatalf("docs/README.md is missing an entry for %s", name)
+		}
+	}
+}
+
+// TestRootReadmeLinksDocsIndex ensures the root README.md links to the
+// documentation index so visitors can discover the full docs.
+func TestRootReadmeLinksDocsIndex(t *testing.T) {
+	readme, err := os.ReadFile(filepath.Join("..", "README.md"))
+	if err != nil {
+		t.Fatalf("read root README.md: %v", err)
+	}
+
+	content := string(readme)
+	if !strings.Contains(content, "docs/README.md") && !strings.Contains(content, "documentation index") {
+		t.Fatal("root README.md should link to the documentation index")
+	}
+}
+
 // TestCodeFencesAreBalanced catches the classic markdown bug: an unclosed
 // ``` fence, which renders the whole remainder of the page as code.
 func TestCodeFencesAreBalanced(t *testing.T) {
@@ -174,6 +225,7 @@ func TestRequiredSections(t *testing.T) {
 				"## RPC errors",
 				"## Database errors",
 				"## API errors",
+				"### A contract is watched but no events are ingested",
 				"## Replay errors",
 				"## First things to check",
 			},
@@ -187,6 +239,33 @@ func TestRequiredSections(t *testing.T) {
 				"### Request and ingest lifecycle",
 				"### Replay lifecycle",
 				"## Components",
+				"#### The watch list and its network dimension",
+			},
+		},
+		{
+			doc: "graphql.md",
+			headings: []string{
+				"## Enabling the endpoint and the playground",
+				"## Authentication",
+				"## Top-level query fields",
+				"## Pagination",
+				"## Limits: depth and complexity",
+				"## Filter parity with `GET /events`",
+				"## Multi-tenant behaviour by query field",
+				"## When to use GraphQL instead of REST",
+			},
+		},
+		{
+			doc: "spec-overrides.md",
+			headings: []string{
+				"## When an override is needed",
+				"## Authentication",
+				"## Endpoints",
+				"## Accepted JSON format",
+				"## Validation rules and error messages",
+				"## Wrapper vs. bare request body",
+				"## Precedence and contract upgrades",
+				"## Caching and propagation timing",
 			},
 		},
 	}
@@ -367,4 +446,39 @@ func TestClickHouseSupportMatrixMatchesStoreInterface(t *testing.T) {
 		assert.Truef(t, named[name],
 			"store.Store.%s is not named in the ClickHouse support matrix; document whether it is implemented, refuses, or silently does nothing", name)
 	}
+}
+
+// TestCommunityFiles guards the community-standard documents GitHub surfaces in
+// the contribution sidebar and the community-standards checklist. They live at
+// the repository root rather than in docs/, so the per-document checks above
+// cannot see them: a vanished code of conduct, a dropped link, or a reporting
+// contact that disappears would otherwise ship silently.
+func TestCommunityFiles(t *testing.T) {
+	rootFile := func(name string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join("..", name))
+		require.NoErrorf(t, err, "%s should exist at the repository root", name)
+		return string(b)
+	}
+
+	coc := rootFile("CODE_OF_CONDUCT.md")
+	assert.Contains(t, coc, "[Contributor Covenant]",
+		"CODE_OF_CONDUCT.md should keep the recognised Contributor Covenant text")
+	assert.Contains(t, coc, "reported to the SoroTrail maintainers",
+		"CODE_OF_CONDUCT.md must say who handles a report")
+	assert.Contains(t, coc, "@sorotrail.io",
+		"CODE_OF_CONDUCT.md must publish a real reporting contact")
+	assert.Regexpf(t, `within [0-9]+ (business )?(hour|day|week)`, coc,
+		"CODE_OF_CONDUCT.md must say how quickly a report is acknowledged")
+	// Vulnerability reports have their own channel in SECURITY.md; neither
+	// document should read as covering the other's reports.
+	assert.NotContains(t, strings.ToLower(coc), "vulnerabilit",
+		"CODE_OF_CONDUCT.md must not claim to cover vulnerability reports")
+
+	for _, name := range []string{"CONTRIBUTING.md", "README.md"} {
+		assert.Containsf(t, rootFile(name), "(CODE_OF_CONDUCT.md)",
+			"%s should link to CODE_OF_CONDUCT.md", name)
+	}
+	assert.Contains(t, rootFile("SECURITY.md"), "(CODE_OF_CONDUCT.md)",
+		"SECURITY.md should point conduct reports at the Code of Conduct")
 }

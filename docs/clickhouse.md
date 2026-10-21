@@ -55,9 +55,10 @@ ones that still do not.
 | Contract inventory count | `CountContracts` | **implemented** | Counts distinct contract IDs in events, matching Postgres. |
 | Contract summary | `GetContractSummary` | **implemented** | Exact `count()`, `min(ledger)`, `max(ledger)` and `max(created_at)`; unknown contract returns `ErrNotFound`. |
 | Per-type breakdown | `ContractEventTypeCounts` | **implemented** | Aggregated in ClickHouse with `GROUP BY type`, ordered by count descending. |
-| Contract metadata | `ListContractIDs`, `GetContractMeta`, `UpsertContractMeta`, `CountContractEvents`, `ListContractsNeedingRefresh` | **silent no-op** | Reads return empty or `ErrNotFound`; the write returns nil. Token enrichment is effectively disabled, and a non-token contract is indistinguishable from one whose metadata was never fetched. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+metadata). |
+| Contract metadata | `ListContractIDs`, `GetContractMeta`, `UpsertContractMeta`, `CountContractEvents`, `ListContractsNeedingRefresh` | **refuses** | All five return `ErrUnsupported`. The backend stores no contract metadata, so token enrichment cannot run here; a caller that recognises the sentinel stands down instead of retrying a capability that will never arrive. `GET /contracts/{id}/stats` answers 501 rather than an empty stats object. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+metadata). |
 | Contract specs | `GetContractSpec`, `GetContractSpecOverride` | **silent no-op** | Both return `ErrNotFound`, so a cached spec looks absent. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+spec). |
 | Contract spec writes | `SetContractSpec`, `SetContractSpecOverride`, `DeleteContractSpecOverride` | **silent no-op** | All return nil without persisting anything. [Tracking search](https://github.com/sorotrail/SoroTrail/issues?q=is%3Aissue+clickhouse+spec). |
+| Contract spec override history | `SetContractSpecOverrideWithHistory`, `DeleteContractSpecOverrideWithHistory`, `ListContractSpecOverrideHistory` | **refuses** | All three return `ErrUnsupported`, so the API answers 501 rather than reporting an empty history. The history is written in the same transaction as the override it records, and the backend has neither. |
 
 ### Ingestion, audit and watch state
 
@@ -65,7 +66,7 @@ ones that still do not.
 | --- | --- | --- | --- |
 | Ingestion state | `GetIngestionState`, `SaveIngestionState` | **implemented** | ReplacingMergeTree rows read with `FINAL`; saves append a newer version. |
 | Audit state | `GetAuditState`, `SaveAuditState`, `SaveAuditStateIfGreater` | **implemented** | The "if greater" compare-and-set is a read-then-write, not atomic across instances. |
-| Watched contracts | `ListWatchedContracts`, `AddWatchedContract`, `RemoveWatchedContract` | **implemented** | Removal is a soft delete; `FINAL` collapses versions. |
+| Watched contracts | `ListWatchedContracts`, `ListWatchedContractsScoped`, `AddWatchedContract`, `RemoveWatchedContract` | **implemented** | Removal is a soft delete; `FINAL` collapses versions. `ListWatchedContractsScoped` filters to the caller's `Scope`. |
 | Per-contract cursors | `GetContractCursor`, `SaveContractCursor`, `DeleteContractCursor`, `ListContractCursors` | **implemented** | Delete is a synchronous ClickHouse mutation. |
 | Audit findings | `RecordAuditFinding`, `UpdateAuditFinding`, `ListOpenFindingsByRange` | **implemented** | IDs are minted in-process because the HTTP interface has no sequence or `RETURNING`. |
 
@@ -102,8 +103,14 @@ ones that still do not.
   `internal/store/conformance_test.go` therefore declares every behavioural
   test unsupported until a live `TEST_CLICKHOUSE_URL` server can be used to
   verify and narrow that declaration.
-- **Contract metadata and address lookups silently do nothing.** If you need
-  token names/symbols or address history, keep those reads on Postgres.
+- **Contract metadata is unavailable, and says so.** Token names, symbols and
+  decimals live in a Postgres-only table. On ClickHouse the whole contract
+  metadata surface refuses with `ErrUnsupported`, the API answers 501 on the
+  endpoints that need it, and any enrichment worker recognises the sentinel
+  and stands down instead of reporting success while writing nothing. If you
+  need token names/symbols, keep those reads on Postgres.
+- **Address lookups silently do nothing.** If you need address history, keep
+  those reads on Postgres.
 
 ## Tracking the gaps
 

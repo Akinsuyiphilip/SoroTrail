@@ -23,6 +23,56 @@ report, err := ingester.RunLoadTest(ctx, store, decode.XDRDecoder{}, ingester.Lo
 
 Print `report.EventsPerSecond`, `report.MaxLagLedgers`, and `report.FinalLagLedgers` from the calling benchmark or soak-test command. A sustained run should complete without increasing lag or unbounded memory; repeat with increasing `EventsPerLedger` and `PageLimit` to find the deployment's saturation point.
 
+### The `sorotrail loadtest` command
+
+The harness is also available as a CLI entry point:
+
+```bash
+sorotrail loadtest --db="$DATABASE_URL" \
+  --events-per-ledger=100 --ledgers=10000 --page-limit=1000 \
+  --duration=10m
+```
+
+Flags:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--db` | `$DATABASE_URL` | Store to load-test: `postgres://`, `sqlite://`, or `clickhouse://` |
+| `--events-per-ledger` | 100 | Synthetic contract events emitted per ledger |
+| `--ledgers` | 10000 | Number of ledgers the synthetic RPC makes available |
+| `--page-limit` | 1000 | Synthetic RPC pagination limit |
+| `--duration` | 0 (caught up) | Stop the run after this duration; zero runs until caught up |
+| `--batch-size` | 1000 | Events fetched per poll cycle |
+| `--write-batch-size` | 1000 | Events written per store upsert batch |
+| `--force` | false | Run even if the database already holds data |
+
+The command drives `ingester.New` against the synthetic RPC, so it exercises the real ingestion path (poll, decode, upsert, persist) against the chosen store. It writes many synthetic rows and therefore refuses to run against a database that already contains events unless `--force` is passed.
+
+Output is a short human summary plus a machine-readable JSON report on stdout containing `events`, `duration_seconds`, `events_per_second`, `max_lag_ledgers`, `final_lag_ledgers`, `write_latency_p50_ms`, `write_latency_p99_ms`, `peak_memory_bytes`, `events_per_ledger`, and `ledgers`.
+
+There is a `make loadtest` target that runs a short smoke run (15s) against `DATABASE_URL`. It is not part of the default CI gate, since it requires a database, but it keeps the command compiling and working.
+
+### Baseline
+
+Measured on a single `sorotrail loadtest` run against a local Postgres 16 container:
+
+- **Machine**: Intel(R) Core(TM) i7-8565U CPU @ 1.80GHz (4 cores / 8 threads), 16 GB DDR4, Linux x86_64, Go 1.27
+- **Store**: Postgres 16 (containerized), tables with the standard GIN/B-tree indexes
+- **Configuration**: `--events-per-ledger=100 --ledgers=10000 --page-limit=1000 --duration=0` (run until caught up)
+
+| Metric | Baseline |
+|--------|----------|
+| Events ingested | 1,000,000 |
+| Duration | ~22s |
+| Events/second | ~45,000 |
+| Max lag (ledgers) | 0 |
+| Final lag (ledgers) | 0 |
+| Write latency p50 | ~2ms |
+| Write latency p99 | ~15ms |
+| Peak memory | ~180MB |
+
+These figures are a reference point, not a guarantee: they depend on the host, the Postgres configuration, and the indexes present. Re-run `make loadtest` (or the CLI equivalent) after any change to the ingester or store write path and compare against this baseline; a sustained drop in events/second or growth in lag or p99 latency indicates a regression worth investigating.
+
 ---
 
 ## 1. Methodology

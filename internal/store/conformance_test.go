@@ -9,12 +9,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorotrail/internal/testskip"
 )
 
 const (
@@ -153,11 +156,25 @@ func conformanceBackendNamed(t *testing.T, name string) conformanceBackend {
 // runStoreTests runs the conformance suite against one backend. A backend
 // with a required server is skipped as a whole when its URL is unset, and any
 // operation it declares unsupported is skipped per test with that declaration.
+//
+// The skip goes through the shared convention (internal/testskip), so it
+// prints a notice naming what did not run instead of disappearing into the
+// default `go test` output, and so a CI job that needs the backend can set
+// the require variable and make the skip a failure.
 func runStoreTests(t *testing.T, backend conformanceBackend) {
 	t.Helper()
 
-	if backend.skipEnv != "" && os.Getenv(backend.skipEnv) == "" {
-		t.Skipf("%s: %s is not set; skipping this backend", backend.name, backend.skipEnv)
+	if backend.skipEnv != "" {
+		testskip.Skip(t, testskip.Tool{
+			Name:   backend.name,
+			EnvVar: backend.skipEnv,
+			Title:  "the " + backend.name + " store conformance suite",
+			Reason: backend.skipEnv + " is not set",
+			Cost: "the " + backend.name + " store implementation is only " +
+				"exercised against a live server, so its behaviour is unverified here",
+			Install:    "start one and set " + backend.skipEnv + ", then re-run the suite",
+			RequireEnv: "SOROTRAIL_REQUIRE_" + strings.ToUpper(backend.name),
+		})
 	}
 
 	tests := []struct {
@@ -817,7 +834,7 @@ func testContractInventory(t *testing.T, st Store) {
 	require.NoError(t, err)
 
 	t.Run("default listing groups counts and ledger ranges", func(t *testing.T) {
-		got, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 10})
+		got, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		assert.Empty(t, cursor, "no next page when everything fits")
 
@@ -840,13 +857,13 @@ func testContractInventory(t *testing.T, st Store) {
 	})
 
 	t.Run("cursor paging walks every contract exactly once", func(t *testing.T) {
-		page1, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 2})
+		page1, cursor, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, page1, 2)
 		require.NotEmpty(t, cursor, "a full page means more rows follow")
 		assert.Equal(t, []string{contractA, contractB}, []string{page1[0].ContractID, page1[1].ContractID})
 
-		page2, cursor2, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Cursor: cursor})
+		page2, cursor2, err := st.ListContracts(ctx, ContractsFilter{Limit: 2, Cursor: cursor, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, page2, 1)
 		assert.Empty(t, cursor2, "cursor omitted on the last page")
@@ -854,20 +871,20 @@ func testContractInventory(t *testing.T, st Store) {
 	})
 
 	t.Run("invalid cursor is reported as ErrInvalidContractsCursor", func(t *testing.T) {
-		_, _, err := st.ListContracts(ctx, ContractsFilter{Cursor: "!!!not-base64!!!"})
+		_, _, err := st.ListContracts(ctx, ContractsFilter{Cursor: "!!!not-base64!!!", Scope: WildcardScope()})
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrInvalidContractsCursor)
 	})
 
 	t.Run("prefix filter narrows to matching contracts", func(t *testing.T) {
-		got, _, err := st.ListContracts(ctx, ContractsFilter{ContractIDPrefix: "CB", Limit: 10})
+		got, _, err := st.ListContracts(ctx, ContractsFilter{ContractIDPrefix: "CB", Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
 		assert.Equal(t, contractB, got[0].ContractID)
 	})
 
 	t.Run("activity sort ranks busiest first", func(t *testing.T) {
-		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10})
+		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 3)
 		assert.Equal(t, []string{contractA, contractInventoryC, contractB},
@@ -884,7 +901,7 @@ func testContractInventory(t *testing.T, st Store) {
 			{SortByLastSeen, []string{contractInventoryC, contractB, contractA}},
 		}
 		for _, tc := range cases {
-			got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: tc.sortKey, Limit: 10})
+			got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: tc.sortKey, Limit: 10, Scope: WildcardScope()})
 			require.NoError(t, err)
 			require.Len(t, got, len(tc.want), "sort %s", tc.sortKey)
 			assert.Equal(t, tc.want,
@@ -949,13 +966,13 @@ func testContractInventory(t *testing.T, st Store) {
 		_, err := st.UpsertEvents(ctx, []Event{d1, d2, e1, e2})
 		require.NoError(t, err)
 
-		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10})
+		got, _, err := st.ListContracts(ctx, ContractsFilter{SortKey: SortByActivity, Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 5)
 		assert.Equal(t, []string{contractA, tieE, tieD, contractInventoryC, contractB},
 			[]string{got[0].ContractID, got[1].ContractID, got[2].ContractID, got[3].ContractID, got[4].ContractID})
 
-		got, _, err = st.ListContracts(ctx, ContractsFilter{SortKey: SortByLastSeen, Limit: 10})
+		got, _, err = st.ListContracts(ctx, ContractsFilter{SortKey: SortByLastSeen, Limit: 10, Scope: WildcardScope()})
 		require.NoError(t, err)
 		require.Len(t, got, 5)
 		assert.Equal(t, []string{tieE, tieD, contractInventoryC, contractB, contractA},
@@ -1119,25 +1136,25 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 	st := &ClickHouse{}
 	ctx := context.Background()
 
-	// Verify that unsupported methods return explicit errors.
+	// Verify that unsupported methods fail loudly with ErrUnsupported.
 	_, err := st.ListContractIDs(ctx)
-	assert.NoError(t, err, "ListContractIDs should return nil, nil for ClickHouse")
+	assert.ErrorIs(t, err, ErrUnsupported, "ListContractIDs must report its absence explicitly")
 
 	_, err = st.GetContractMeta(ctx, "test")
-	assert.ErrorIs(t, err, ErrNotFound, "GetContractMeta should return ErrNotFound")
+	assert.ErrorIs(t, err, ErrUnsupported,
+		"GetContractMeta must report its absence explicitly: a backend that stores no metadata must not look like a contract that has none")
 
-	// ListContracts is a zero-value stub rather than an error path: the
-	// backend has no contract registry to read, and it reports "nothing"
-	// instead of refusing. Pinned as-is; changing it to ErrUnsupported
-	// would be a behaviour change, not a test fix.
+	// ListContracts is an unsupported operation on ClickHouse: the
+	// backend has no contract registry to read and refuses rather than
+	// returning a zero value that would read as success.
 	_, _, err = st.ListContracts(ctx, ContractsFilter{})
-	assert.NoError(t, err, "ListContracts is a zero-value stub on the clickhouse backend")
+	assert.ErrorIs(t, err, ErrUnsupported, "ListContracts must report its absence explicitly")
 
 	_, err = st.GetContractSummary(ctx, "test")
 	assert.Error(t, err,
 		"GetContractSummary must surface the failed ClickHouse request rather than a zero-value summary")
 
-	// ContractEventTypeCounts should return an explicit error.
+	// ContractEventTypeCounts is unsupported on the ClickHouse backend.
 	_, err = st.ContractEventTypeCounts(ctx, "test")
 	assert.Error(t, err,
 		"ContractEventTypeCounts must surface the failed ClickHouse request")
@@ -1158,9 +1175,10 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 	err = st.RevokeAPIKey(ctx, 1)
 	assert.ErrorContains(t, err, "not supported by the clickhouse backend")
 
-	// GetContractCursor is implemented on this backend, not stubbed: it
-	// issues a request. On a zero-value ClickHouse there is no server to
-	// reach, so what it must not do is succeed or panic.
+	// GetContractCursor, SaveContractCursor, DeleteContractCursor and
+	// ListContractCursors are unsupported on the ClickHouse backend, so a
+	// call fails loudly instead of returning a zero cursor that would make
+	// the watched-contract ingester silently resume from ledger 0.
 	_, err = st.GetContractCursor(ctx, "test")
 	assert.Error(t, err, "GetContractCursor must report the failed lookup rather than a zero cursor")
 
@@ -1186,6 +1204,58 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 
 	err = st.RemoveWatchedContract(ctx, WatchedContract{ContractID: contractA})
 	assert.Error(t, err, "RemoveWatchedContract must report the failed lookup rather than ErrNotFound")
+}
+
+// TestClickHouse_ContractMetadataRefuses asserts that the contract-metadata
+// surface — the one the token-enrichment worker drives — refuses on
+// ClickHouse instead of answering with a value that reads as success.
+//
+// The methods are the ones an enrichment loop calls: it lists the contracts
+// it has seen, asks which need a refresh, writes what it learned, counts a
+// contract's events and reads a contract's cached metadata back. A silent
+// no-op on any of them made the whole pipeline report success forever while
+// storing nothing, and no log line or metric said so.
+//
+// The refusal has to wrap ErrUnsupported so a caller can recognise it and
+// stand down; a plain error would be indistinguishable from a transient
+// failure worth retrying.
+func TestClickHouse_ContractMetadataRefuses(t *testing.T) {
+	st := &ClickHouse{}
+	ctx := context.Background()
+
+	tests := []struct {
+		name  string
+		probe func() error
+	}{
+		{"ListContractIDs", func() error {
+			_, err := st.ListContractIDs(ctx)
+			return err
+		}},
+		{"GetContractMeta", func() error {
+			_, err := st.GetContractMeta(ctx, contractA)
+			return err
+		}},
+		{"UpsertContractMeta", func() error {
+			return st.UpsertContractMeta(ctx, ContractMeta{ContractID: contractA})
+		}},
+		{"CountContractEvents", func() error {
+			_, err := st.CountContractEvents(ctx, contractA)
+			return err
+		}},
+		{"ListContractsNeedingRefresh", func() error {
+			_, err := st.ListContractsNeedingRefresh(ctx, time.Now())
+			return err
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.probe()
+			require.Error(t, err, "an unimplemented operation must not succeed silently")
+			assert.ErrorIs(t, err, ErrUnsupported,
+				"the refusal must wrap ErrUnsupported so the caller can stand down")
+		})
+	}
 }
 
 // TestClickHouse_SuiteSkipsCleanly verifies that when no ClickHouse

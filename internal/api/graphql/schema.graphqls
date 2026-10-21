@@ -220,9 +220,9 @@ type Query {
   "List events with spec-driven field decoding applied."
   tokenEvents(filter: EventFilterInput, page: PageInput): TokenEventConnection!
 
-  "List watched contracts (the runtime subset of indexed contracts)."
+  "List watched contracts (the runtime subset of indexed contracts) visible in the caller's scope."
   contracts(page: PageInput): ContractConnection!
 
-  "Fetch a single watched contract by ID. Returns null when the contract is not in the watch list."
+  "Fetch a single watched contract by ID within the caller's scope. Returns null when the contract is not in the caller's watched set."
   contract(id: ID!): Contract
 }

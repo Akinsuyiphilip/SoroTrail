@@ -501,8 +501,23 @@ jobs:
 
   helm:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        id: go
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
       - uses: azure/setup-helm@v5
         with:
           version: v3.15.0
@@ -526,6 +541,37 @@ jobs:
           fi
       - name: Helm template render (defaults)
         run: helm template sorotrail deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db > /dev/null
+      # The chart's golden tests render the chart and compare the output
+      # byte for byte against the committed manifests. They skip when helm
+      # is missing, and a job that is supposed to run them must not pass by
+      # skipping them: SOROTRAIL_REQUIRE_HELM turns the skip into a
+      # failure, so this step fails if the runner ever loses helm.
+      - name: Helm chart golden tests
+        env:
+          SOROTRAIL_REQUIRE_HELM: "1"
+        run: go test ./deploy/helm/sorotrail/... -count=1
+
+  monitoring:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # promtool ships with Prometheus; pin a release here the same way
+      # the lint job pins golangci-lint rather than tracking latest.
+      - name: Install promtool
+        env:
+          PROM_VERSION: 3.15.0
+        run: |
+          curl -sSfL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" -o /tmp/prometheus.tar.gz
+          tar -xzf /tmp/prometheus.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          promtool --version
+      # No secrets and no running Prometheus: promtool parses and unit-tests
+      # the rule file in-process, and the script cross-checks every metric
+      # the rules and the dashboard reference against the list of metrics
+      # this project exports, so a renamed or deleted metric fails here
+      # instead of shipping as a silently dead alert or blank panel.
+      - name: Validate Prometheus rules and Grafana dashboard
+        run: make check-monitoring
       - name: Helm template render (existing secret)
         run: |
           helm template sorotrail deploy/helm/sorotrail \

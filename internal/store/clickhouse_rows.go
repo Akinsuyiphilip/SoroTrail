@@ -296,15 +296,6 @@ func auditFindingFromRow(r clickHouseRow) AuditFinding {
 	}
 }
 
-func contractCursorFromRow(r clickHouseRow) ContractCursor {
-	return ContractCursor{
-		ContractID:         r.str("contract_id"),
-		LastIngestedLedger: r.int64("last_ingested_ledger"),
-		LastCursor:         r.str("last_cursor"),
-		UpdatedAt:          r.time("updated_at"),
-	}
-}
-
 func watchedContractFromRow(r clickHouseRow) WatchedContract {
 	return WatchedContract{
 		Network:    r.str("network"),

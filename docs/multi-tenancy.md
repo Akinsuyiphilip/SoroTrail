@@ -186,20 +186,37 @@ with.
 ## Watch lists and ingestion
 
 Ingestion follows the **union** of the operator's `WATCHED_CONTRACTS` list
-and every tenant's watch list:
+and every tenant's watch list, keyed by `(network, contract_id)`:
 
 ```sql
-SELECT contract_id FROM watched_contracts
+SELECT network, contract_id FROM watched_contracts
 UNION
-SELECT contract_id FROM tenant_watched_contracts
+SELECT network, contract_id FROM tenant_watched_contracts
 ```
 
-Two tenants watching the same contract share one set of ingested rows, and
-both read them. Removal needs no refcount: the union is recomputed on read,
-so a contract stays watched exactly as long as at least one row anywhere
-names it, and one tenant dropping its claim cannot stop ingestion for
-another that still holds one. Deleting a tenant cascades its claims away
-with the same effect.
+An ingester configured with `NETWORK=<name>` (or `'default'` when `NETWORK`
+is unset) filters `ListWatchedContracts` to rows matching its own network
+before building RPC filter batches.
+
+> **Network assignment on `/tenant/watch` (known issue [#1159](https://github.com/sorotrail/SoroTrail/issues/1159)):**
+> `POST /tenant/watch` does not accept a `network` field in the request body.
+> Currently, `AddTenantWatchedContract` inserts `(tenant_id, contract_id)`
+> into `tenant_watched_contracts` without specifying the `network` column, so
+> tenant self-service entries always receive the schema default `'default'`
+> rather than the API server's configured `NETWORK`. On any deployment where
+> `NETWORK` is set (for example `NETWORK=testnet` or `NETWORK=mainnet`),
+> `buildFilterBatches` filters for `w.Network == ing.network` and **silently
+> ignores** `'default'` rows from `/tenant/watch`. Until #1159 is resolved,
+> operators on named-network deployments must register watched contracts via
+> `WATCHED_CONTRACTS` or `POST /watched-contracts` (with `"network"` set or
+> inherited from the server's `NETWORK`).
+
+Two tenants watching the same contract on the same network share one set of
+ingested rows, and both read them. Removal needs no refcount: the union is
+recomputed on read, so a contract stays watched on a network exactly as long
+as at least one row anywhere names it, and one tenant dropping its claim
+cannot stop ingestion for another that still holds one. Deleting a tenant
+cascades its claims away with the same effect.
 
 `MULTI_TENANT_MAX_WATCHED` caps the size of the union, not any single list,
 because what costs the operator RPC budget is the number of distinct

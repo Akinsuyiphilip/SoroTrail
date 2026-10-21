@@ -47,9 +47,14 @@ func NewHTTPClient(baseURL string, minInterval time.Duration) *HTTPClient {
 	}
 }
 
-// WithHTTPClient swaps the underlying transport (testing seam).
+// WithHTTPClient swaps the underlying transport (testing seam). A nil
+// client is ignored: swapping one in would leave every later request
+// panicking on a nil receiver, and there is no sensible meaning for
+// "no transport at all".
 func (c *HTTPClient) WithHTTPClient(hc *http.Client) *HTTPClient {
-	c.http = hc
+	if hc != nil {
+		c.http = hc
+	}
 	return c
 }
 

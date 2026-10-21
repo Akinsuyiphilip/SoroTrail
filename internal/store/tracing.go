@@ -18,6 +18,12 @@ type TracingStore struct {
 	tracer trace.Tracer
 }
 
+// TracingStore is passed to callers as Store, so it must keep satisfying the
+// interface as it evolves. This assertion catches a wrapped method whose
+// signature drifts from the interface; methods that are still promoted from
+// the embedded Store are listed in the tracing coverage note on #1154.
+var _ Store = (*TracingStore)(nil)
+
 // NewTracingStore returns a Store wrapper that records spans for the common
 // persistence and lookup operations used by the API and ingester.
 func NewTracingStore(base Store, tracer trace.Tracer) Store {
@@ -98,6 +104,35 @@ func (s *TracingStore) GetIngestionState(ctx context.Context) (IngestionState, e
 		span.SetStatus(codes.Error, err.Error())
 	}
 	return state, err
+}
+
+func (s *TracingStore) GetIngestionStateForNetwork(ctx context.Context, network string) (IngestionState, error) {
+	ctx, span := s.tracer.Start(ctx, "store.GetIngestionStateForNetwork")
+	defer span.End()
+	span.SetAttributes(attribute.String("store.network", network))
+	if r, ok := s.Store.(interface {
+		GetIngestionStateForNetwork(context.Context, string) (IngestionState, error)
+	}); ok {
+		state, err := r.GetIngestionStateForNetwork(ctx, network)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		return state, err
+	}
+	if defaultNetwork(network) == "default" {
+		state, err := s.Store.GetIngestionState(ctx)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		return state, err
+	}
+	// A store without the optional method only knows the default network, so
+	// this is a real lookup failure and belongs on the span like any other.
+	span.RecordError(ErrNotFound)
+	span.SetStatus(codes.Error, ErrNotFound.Error())
+	return IngestionState{}, ErrNotFound
 }
 
 func (s *TracingStore) SaveIngestionState(ctx context.Context, state IngestionState) error {
