@@ -18,10 +18,12 @@ The generated surface (`client.gen.go`) holds:
 
 `pkg/client/drift_test.go` regenerates the client from the committed spec
 and compares byte-for-byte against the committed file, so a spec change
-that is not followed by `make client` fails CI instead of drifting. The
-same test exercises the typed surface against the real server
-(`client_integration_test.go`), so a drift between the spec and the
-server's behaviour also fails loudly here.
+that is not followed by `make client` fails CI instead of drifting.
+`client_test.go` exercises the public client against `httptest` in the
+default test suite, including request construction, pagination, API
+errors, authentication, and context cancellation. The database-backed
+real-server test in `client_integration_test.go` remains available with
+the `integration` build tag.
 
 ## Usage
 

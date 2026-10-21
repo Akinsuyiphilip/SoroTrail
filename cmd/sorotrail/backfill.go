@@ -15,6 +15,7 @@ import (
 	"github.com/sorotrail/sorotrail/internal/config"
 	"github.com/sorotrail/sorotrail/internal/decode"
 	"github.com/sorotrail/sorotrail/internal/horizon"
+	"github.com/sorotrail/sorotrail/internal/rpc"
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
@@ -207,11 +208,21 @@ func runBackfill(args []string) error {
 	return nil
 }
 
+// backfillRunner abstracts *backfill.Backfiller for testing.
+type backfillRunner interface {
+	Run(ctx context.Context) (backfill.Summary, error)
+}
+
+var (
+	backfillInitialBackoff = time.Second
+	backfillSleep          = sleepCtx
+)
+
 // runBackfillWithRetry runs the backfiller and retries on transient
 // Horizon errors (rate limits) with jittered exponential backoff up to
 // MaxBackoff. Other errors surface immediately.
-func runBackfillWithRetry(ctx context.Context, b *backfill.Backfiller, log loggerLike) (backfill.Summary, error) {
-	backoff := time.Second
+func runBackfillWithRetry(ctx context.Context, b backfillRunner, log loggerLike) (backfill.Summary, error) {
+	backoff := backfillInitialBackoff
 	for {
 		sum, err := b.Run(ctx)
 		if ctx.Err() != nil {
@@ -229,7 +240,7 @@ func runBackfillWithRetry(ctx context.Context, b *backfill.Backfiller, log logge
 		}
 		log.Warn("backfill transient error; retrying",
 			"error", err, "retry_in", sleep)
-		if !sleepCtx(ctx, sleep) {
+		if !backfillSleep(ctx, sleep) {
 			// Interrupt during retry backs off: return the partial
 			// summary so the operator sees what was committed.
 			return backfill.Summary{}, nil
@@ -282,44 +293,18 @@ func randInt(n int64) int64 {
 // isRetryableBackfillErr returns true for the small handful of Horizon
 // errors worth backing off and retrying. Anything else is fatal so a
 // real bug surfaces immediately.
+//
+// The transport classification is the one the RPC client uses
+// (rpc.IsTransientHTTP), so the two paths cannot drift apart: a DNS
+// blip that the ingester backs off from is also retried here.
 func isRetryableBackfillErr(err error) bool {
-	return errors.Is(err, horizon.ErrRateLimited) || !errors.Is(err, horizon.ErrNotFound) &&
-		isTransientHTTP(err)
-}
-
-// isTransientHTTP looks for HTTP/transport messages the standard Go
-// client returns when a connection drops or times out. We keep this
-// permissive: a misclassified non-retryable error just gets re-tried
-// once and surfaces on the second failure.
-func isTransientHTTP(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	for _, frag := range []string{
-		"connection reset",
-		"connection refused",
-		"EOF",
-		"timeout",
-		"temporary failure",
-	} {
-		if contains(s, frag) {
-			return true
-		}
-	}
-	return false
-}
-
-func contains(haystack, needle string) bool {
-	if len(needle) == 0 {
+	if errors.Is(err, horizon.ErrRateLimited) {
 		return true
 	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
+	if errors.Is(err, horizon.ErrNotFound) {
+		return false
 	}
-	return false
+	return rpc.IsTransientHTTP(err)
 }
 
 // printBackfillSummary mirrors replay's printReplaySummary shape so

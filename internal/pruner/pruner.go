@@ -174,7 +174,9 @@ func (p *Pruner) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
-} // pruneOnce performs one full sweep: deletes batches until fewer than
+}
+
+// pruneOnce performs one full sweep: deletes batches until fewer than
 // BatchSize rows are returned, then logs a summary. Returns the total
 // number of rows deleted in the sweep.
 //

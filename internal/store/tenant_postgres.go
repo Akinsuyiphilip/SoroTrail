@@ -183,7 +183,8 @@ func (p *Postgres) ScopeForTenant(ctx context.Context, t Tenant) (Scope, error) 
 //
 // Both checks and the insert run in one transaction, so two concurrent
 // requests cannot each observe headroom for the last slot and both take it.
-func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, contractID string, instanceCap int) error {
+func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, network, contractID string, instanceCap int) error {
+	network = defaultNetwork(network)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("starting watch-list transaction: %w", err)
@@ -195,7 +196,7 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, contr
 	var exists int
 	err = tx.QueryRow(ctx, `
 		SELECT 1 FROM tenant_watched_contracts
-		WHERE tenant_id = $1 AND contract_id = $2`, t.ID, contractID).Scan(&exists)
+		WHERE tenant_id = $1 AND network = $2 AND contract_id = $3`, t.ID, network, contractID).Scan(&exists)
 	if err == nil {
 		return nil
 	}
@@ -219,8 +220,9 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, contr
 	if instanceCap > 0 {
 		// The instance cap bounds the union, not any single list: what
 		// costs the operator RPC budget is the number of distinct
-		// contracts ingestion must poll. A contract another tenant already
-		// watches is therefore free to add.
+		// (network, contract_id) pairs ingestion must poll. A contract
+		// another tenant already watches on this network is therefore free
+		// to add.
 		var unionSize int
 		if err := tx.QueryRow(ctx,
 			`SELECT count(*) FROM (`+watchedContractsUnion+`) u`).Scan(&unionSize); err != nil {
@@ -228,8 +230,8 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, contr
 		}
 		var alreadyWatched int
 		err := tx.QueryRow(ctx,
-			`SELECT 1 FROM (`+watchedContractsUnion+`) u WHERE contract_id = $1`,
-			contractID).Scan(&alreadyWatched)
+			`SELECT 1 FROM (`+watchedContractsUnion+`) u WHERE network = $1 AND contract_id = $2`,
+			network, contractID).Scan(&alreadyWatched)
 		switch {
 		case err == nil:
 			// Already in the union; adding this tenant's claim does not
@@ -245,8 +247,9 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, contr
 	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO tenant_watched_contracts (tenant_id, contract_id)
-		VALUES ($1, $2) ON CONFLICT DO NOTHING`, t.ID, contractID); err != nil {
+		INSERT INTO tenant_watched_contracts (tenant_id, network, contract_id)
+		VALUES ($1, $2, $3) ON CONFLICT (tenant_id, network, contract_id) DO NOTHING`,
+		t.ID, network, contractID); err != nil {
 		return fmt.Errorf("adding tenant watched contract: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -255,20 +258,22 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, contr
 	return nil
 }
 
-func (p *Postgres) RemoveTenantWatchedContract(ctx context.Context, tenantID int64, contractID string) error {
+func (p *Postgres) RemoveTenantWatchedContract(ctx context.Context, tenantID int64, network, contractID string) error {
+	network = defaultNetwork(network)
 	_, err := p.pool.Exec(ctx,
-		`DELETE FROM tenant_watched_contracts WHERE tenant_id = $1 AND contract_id = $2`,
-		tenantID, contractID)
+		`DELETE FROM tenant_watched_contracts WHERE tenant_id = $1 AND network = $2 AND contract_id = $3`,
+		tenantID, network, contractID)
 	if err != nil {
 		return fmt.Errorf("removing tenant watched contract: %w", err)
 	}
 	return nil
 }
 
-func (p *Postgres) ListTenantWatchedContracts(ctx context.Context, tenantID int64) ([]string, error) {
+func (p *Postgres) ListTenantWatchedContracts(ctx context.Context, tenantID int64, network string) ([]string, error) {
+	network = defaultNetwork(network)
 	return p.queryContractIDs(ctx,
-		`SELECT contract_id FROM tenant_watched_contracts WHERE tenant_id = $1 ORDER BY contract_id`,
-		tenantID)
+		`SELECT contract_id FROM tenant_watched_contracts WHERE tenant_id = $1 AND network = $2 ORDER BY contract_id`,
+		tenantID, network)
 }
 
 // queryContractIDs runs query — whose first column is a contract id — and

@@ -36,7 +36,7 @@ func runFilterQueryTable(t *testing.T, tests []filterQueryCase) {
 			r := httptest.NewRequest(http.MethodGet, "/events?"+tt.query, nil)
 			r = r.WithContext(WithPrincipal(r.Context(), Principal{Scope: store.WildcardScope(), Untenanted: true}))
 
-			f, err := filterFromQuery(r)
+			f, err := FilterFromQuery(r)
 
 			if tt.wantErr != "" {
 				require.Error(t, err)

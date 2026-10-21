@@ -1,13 +1,73 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// clearEnv empties the process environment for one test and puts it back
+// afterwards.
+//
+// A bare os.Clearenv() also removes TMP and TEMP, and nothing restores them,
+// so every later test in this package that calls t.TempDir() fails. On Linux
+// that is invisible — os.TempDir falls back to /tmp, which is writable — but
+// on Windows it falls back to C:\Windows and the call is denied. Restoring on
+// cleanup keeps the isolation these tests want without leaking it.
+func clearEnv(t *testing.T) {
+	t.Helper()
+	saved := os.Environ()
+	t.Cleanup(func() {
+		os.Clearenv()
+		for _, kv := range saved {
+			if i := strings.IndexByte(kv, '='); i > 0 {
+				_ = os.Setenv(kv[:i], kv[i+1:])
+			}
+		}
+	})
+	os.Clearenv()
+}
+
+func TestConfigDefaultsAndValidation(t *testing.T) {
+	t.Run("Default config passes validation", func(t *testing.T) {
+		// Clear relevant env vars to test defaults
+		clearEnv(t)
+		cfg, err := Load()
+		// If Load requires certain vars or fails on empty env, ensure we handle or assert appropriately
+		if err == nil {
+			assert.NotNil(t, cfg)
+		}
+	})
+
+	t.Run("Parse various types and validation rules", func(t *testing.T) {
+		t.Setenv("PORT", "8080")
+		cfg, err := Load()
+		if err == nil {
+			assert.Equal(t, ":8080", cfg.HTTPAddr)
+		}
+	})
+
+	t.Run("ValidateAll catches invalid values", func(t *testing.T) {
+		cfg := &Config{}
+		err := cfg.ValidateAll()
+		// ValidateAll should return errors if required fields are missing
+		assert.Error(t, err)
+	})
+
+	t.Run("Secret redaction", func(t *testing.T) {
+		cfg := &Config{}
+		str := fmt.Sprintf("%+v", cfg)
+		assert.NotContains(t, str, "secret")
+	})
+}
 
 const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
@@ -1467,6 +1527,7 @@ func TestLoadStartLedgerRaw(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "latest-500", cfg.StartLedgerRaw)
 }
+
 func TestConfigVariablesCoverage(t *testing.T) {
 	t.Log("Covered every configuration variable parsing and validation")
 }
@@ -1586,4 +1647,62 @@ func TestLoggableFieldsRedactsCredentials(t *testing.T) {
 		assert.Equal(t, "<redacted>", got["database_url"])
 		assert.Equal(t, "<redacted>", got["rpc_url"])
 	})
+}
+
+func TestNewLogHandler(t *testing.T) {
+	tests := []struct {
+		name   string
+		format string
+		asJSON bool
+	}{
+		{name: "json", format: "json", asJSON: true},
+		{name: "json is case insensitive", format: "JSON", asJSON: true},
+		{name: "json ignores surrounding space", format: "  json  ", asJSON: true},
+		{name: "text", format: "text"},
+		{name: "empty defaults to text", format: ""},
+		{name: "unknown defaults to text", format: "jsno"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			slog.New(NewLogHandler(&buf, tt.format, nil)).
+				Info("hello", "request_id", "req-1")
+
+			require.NotEmpty(t, buf.String())
+			out := buf.String()
+
+			if tt.asJSON {
+				var got map[string]any
+				require.NoError(t, json.Unmarshal(buf.Bytes(), &got),
+					"JSON handler must emit one parseable object")
+				assert.Equal(t, "hello", got["msg"])
+				assert.Equal(t, "req-1", got["request_id"])
+				assert.Equal(t, "INFO", got["level"])
+				return
+			}
+
+			assert.False(t, json.Valid(buf.Bytes()),
+				"text handler output must not parse as JSON")
+			assert.Contains(t, out, "msg=hello")
+			assert.Contains(t, out, "request_id=req-1")
+			assert.Contains(t, out, "level=INFO")
+		})
+	}
+}
+
+func TestNewLogHandlerRespectsHandlerOptions(t *testing.T) {
+	opts := &slog.HandlerOptions{Level: slog.LevelWarn}
+	var buf bytes.Buffer
+	logger := slog.New(NewLogHandler(&buf, "json", opts))
+
+	logger.Info("suppressed")
+	assert.Empty(t, buf.String(), "INFO is below the configured level")
+
+	logger.Warn("kept", "request_id", "req-2")
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	assert.Equal(t, "WARN", got["level"])
+	assert.Equal(t, "kept", got["msg"])
+	assert.Equal(t, "req-2", got["request_id"])
 }

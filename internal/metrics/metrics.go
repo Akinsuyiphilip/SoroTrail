@@ -173,6 +173,16 @@ var (
 		Help: "Total seconds spent throttling event writes under backpressure.",
 	})
 	// ---- End batch instrumentation ----
+
+	// SpecInvalidationsReceived counts the spec-cache invalidations this
+	// process applied because another replica said the contract's decoded
+	// shape changed. A non-zero value proves the cross-replica fan-out is
+	// working; a replica that never invalidates anything while its peers
+	// are changing specs is serving stale decodes.
+	SpecInvalidationsReceived = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sorotrail_spec_invalidations_received_total",
+		Help: "Total number of spec cache invalidations received from other replicas.",
+	})
 )
 
 func init() {
@@ -193,6 +203,7 @@ func init() {
 		RPCFailoversTotal,
 		RPCCircuitBreakerState,
 		RPCProviderState,
+		SpecInvalidationsReceived,
 	)
 }
 

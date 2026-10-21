@@ -124,7 +124,7 @@ func (h *Harness) Run(ctx context.Context) error {
 
 	// Seed watched contracts.
 	for _, cid := range h.Scenario.WatchedContracts {
-		if err := h.Store.AddWatchedContract(ctx, cid); err != nil {
+		if err := h.Store.AddWatchedContract(ctx, store.WatchedContract{ContractID: cid}); err != nil {
 			return fmt.Errorf("adding watched contract %s: %w", cid, err)
 		}
 	}

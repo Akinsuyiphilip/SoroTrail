@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
+	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,8 +25,18 @@ type LoadTestConfig struct {
 	Ledgers uint32
 	// PageLimit controls synthetic RPC pagination.
 	PageLimit uint
-	// Duration optionally stops the run after this duration. Zero runs until caught up.
+	// Duration optionally stops the run after this duration. Zero runs until
+	// caught up.
 	Duration time.Duration
+	// Seed seeds the synthetic RPC so the same configuration produces the
+	// same events on every run. Zero uses an arbitrary fixed default.
+	Seed uint64
+	// BatchSize is the maximum number of events the ingester fetches per
+	// poll cycle.
+	BatchSize uint
+	// WriteBatchSize is the maximum number of events written per store
+	// upsert batch.
+	WriteBatchSize uint
 }
 
 // LoadTestReport summarizes a synthetic ingestion run.
@@ -33,10 +46,18 @@ type LoadTestReport struct {
 	EventsPerSecond float64
 	MaxLagLedgers   uint32
 	FinalLagLedgers uint32
+	// WriteLatencyP50 and WriteLatencyP99 are the per-cycle write latencies
+	// observed across the run, measured from the start of each RunOnce call
+	// to its return.
+	WriteLatencyP50 time.Duration
+	WriteLatencyP99 time.Duration
+	// PeakMemoryBytes is the largest runtime.Alloc observed during the run.
+	PeakMemoryBytes int64
 }
 
 // RunLoadTest drives the ingester against a configurable in-memory RPC.
-// It is intended for local soak tests and never contacts a network or database.
+// It is intended for local soak tests and never contacts a network or
+// database.
 func RunLoadTest(ctx context.Context, st StoreForLoadTest, dec DecoderForLoadTest, cfg LoadTestConfig) (LoadTestReport, error) {
 	if cfg.EventsPerLedger < 1 || cfg.Ledgers < 1 {
 		return LoadTestReport{}, fmt.Errorf("events per ledger and ledgers must be positive")
@@ -52,15 +73,36 @@ func RunLoadTest(ctx context.Context, st StoreForLoadTest, dec DecoderForLoadTes
 		logCtx, cancel = context.WithTimeout(ctx, cfg.Duration)
 		defer cancel()
 	}
-	ing := New(client, st, dec, loadTestLogger(), Options{StartLedger: 2, PageLimit: cfg.PageLimit})
+	ing := New(client, st, dec, loadTestLogger(), Options{
+		StartLedger:    2,
+		PageLimit:      cfg.PageLimit,
+		BatchSize:      cfg.BatchSize,
+		WriteBatchSize: cfg.WriteBatchSize,
+	})
 	var total int64
 	var maxLag uint32
+	var latencies []time.Duration
+	var peakMem int64
+
+	sampleMemory := func() {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		if int64(m.Alloc) > peakMem {
+			peakMem = int64(m.Alloc)
+		}
+	}
+	sampleMemory()
+
 	for {
 		before, err := st.LoadTestEventCount(logCtx)
 		if err != nil {
 			return LoadTestReport{}, err
 		}
+		cycleStart := time.Now()
 		caughtUp, err := ing.RunOnceForTest(logCtx)
+		cycleDur := time.Since(cycleStart)
+		latencies = append(latencies, cycleDur)
+		sampleMemory()
 		if err != nil {
 			if logCtx.Err() != nil {
 				break
@@ -82,12 +124,30 @@ func RunLoadTest(ctx context.Context, st StoreForLoadTest, dec DecoderForLoadTes
 			}
 			if caughtUp {
 				d := time.Since(start)
-				return LoadTestReport{Events: total, Duration: d, EventsPerSecond: float64(total) / d.Seconds(), MaxLagLedgers: maxLag, FinalLagLedgers: lag}, nil
+				return LoadTestReport{
+					Events:          total,
+					Duration:        d,
+					EventsPerSecond: float64(total) / d.Seconds(),
+					MaxLagLedgers:   maxLag,
+					FinalLagLedgers: lag,
+					WriteLatencyP50: percentile(latencies, 50),
+					WriteLatencyP99: percentile(latencies, 99),
+					PeakMemoryBytes: peakMem,
+				}, nil
 			}
 		}
 	}
 	d := time.Since(start)
-	return LoadTestReport{Events: total, Duration: d, EventsPerSecond: float64(total) / maxFloat(d.Seconds(), 1), MaxLagLedgers: maxLag}, logCtx.Err()
+	sampleMemory()
+	return LoadTestReport{
+		Events:          total,
+		Duration:        d,
+		EventsPerSecond: float64(total) / maxFloat(d.Seconds(), 1),
+		MaxLagLedgers:   maxLag,
+		WriteLatencyP50: percentile(latencies, 50),
+		WriteLatencyP99: percentile(latencies, 99),
+		PeakMemoryBytes: peakMem,
+	}, logCtx.Err()
 }
 
 func maxInt64(v, floor int64) int64 {
@@ -101,6 +161,22 @@ func maxFloat(v, floor float64) float64 {
 		return v
 	}
 	return floor
+}
+
+// percentile returns the element at the given percentile of a sorted copy of
+// latencies. An empty slice yields zero.
+func percentile(latencies []time.Duration, pct int) time.Duration {
+	if len(latencies) == 0 {
+		return 0
+	}
+	ordered := make([]time.Duration, len(latencies))
+	copy(ordered, latencies)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	rank := pct * len(ordered) / 100
+	if rank >= len(ordered) {
+		rank = len(ordered) - 1
+	}
+	return ordered[rank]
 }
 
 // StoreForLoadTest is the small store surface needed by RunLoadTest.
@@ -119,19 +195,38 @@ type DecoderForLoadTest interface {
 type SyntheticRPC struct {
 	mu     sync.Mutex
 	cfg    LoadTestConfig
+	rng    *rand.Rand
 	latest uint32
 	events []rpc.Event
 }
 
 func NewSyntheticRPC(cfg LoadTestConfig) *SyntheticRPC {
-	r := &SyntheticRPC{cfg: cfg, latest: cfg.Ledgers + 1}
+	r := &SyntheticRPC{cfg: cfg, latest: cfg.Ledgers + 1, rng: rand.New(rand.NewPCG(cfg.Seed, 1))}
 	for ledger := uint32(2); ledger <= cfg.Ledgers+1; ledger++ {
 		for n := 0; n < cfg.EventsPerLedger; n++ {
-			r.events = append(r.events, rpc.Event{ID: fmt.Sprintf("%010d-%09d", ledger, n), Ledger: ledger, Type: "contract", ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ValueJSON: json.RawMessage(`{"u64":1}`)})
+			r.events = append(r.events, r.event(ledger, n))
 		}
 	}
 	return r
 }
+
+// event builds one deterministic synthetic event for the given ledger and
+// position. The event identifier is derived from the ledger and position so
+// pagination is stable, while the value is drawn from the seeded generator so
+// two runs with the same seed produce identical events and different seeds
+// produce different ones.
+func (r *SyntheticRPC) event(ledger uint32, n int) rpc.Event {
+	value := map[string]any{"u64": r.rng.Int64N(1 << 24)}
+	valueJSON, _ := json.Marshal(value)
+	return rpc.Event{
+		ID:         fmt.Sprintf("%010d-%09d", ledger, n),
+		Ledger:     ledger,
+		Type:       "contract",
+		ContractID: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		ValueJSON:  valueJSON,
+	}
+}
+
 func (r *SyntheticRPC) LatestLedger() uint32 { return r.latest }
 func (r *SyntheticRPC) GetHealth(context.Context) (rpc.Health, error) {
 	return rpc.Health{LatestLedger: r.latest, OldestLedger: 2}, nil
