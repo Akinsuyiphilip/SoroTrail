@@ -1,7 +1,10 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -1644,4 +1647,62 @@ func TestLoggableFieldsRedactsCredentials(t *testing.T) {
 		assert.Equal(t, "<redacted>", got["database_url"])
 		assert.Equal(t, "<redacted>", got["rpc_url"])
 	})
+}
+
+func TestNewLogHandler(t *testing.T) {
+	tests := []struct {
+		name   string
+		format string
+		asJSON bool
+	}{
+		{name: "json", format: "json", asJSON: true},
+		{name: "json is case insensitive", format: "JSON", asJSON: true},
+		{name: "json ignores surrounding space", format: "  json  ", asJSON: true},
+		{name: "text", format: "text"},
+		{name: "empty defaults to text", format: ""},
+		{name: "unknown defaults to text", format: "jsno"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			slog.New(NewLogHandler(&buf, tt.format, nil)).
+				Info("hello", "request_id", "req-1")
+
+			require.NotEmpty(t, buf.String())
+			out := buf.String()
+
+			if tt.asJSON {
+				var got map[string]any
+				require.NoError(t, json.Unmarshal(buf.Bytes(), &got),
+					"JSON handler must emit one parseable object")
+				assert.Equal(t, "hello", got["msg"])
+				assert.Equal(t, "req-1", got["request_id"])
+				assert.Equal(t, "INFO", got["level"])
+				return
+			}
+
+			assert.False(t, json.Valid(buf.Bytes()),
+				"text handler output must not parse as JSON")
+			assert.Contains(t, out, "msg=hello")
+			assert.Contains(t, out, "request_id=req-1")
+			assert.Contains(t, out, "level=INFO")
+		})
+	}
+}
+
+func TestNewLogHandlerRespectsHandlerOptions(t *testing.T) {
+	opts := &slog.HandlerOptions{Level: slog.LevelWarn}
+	var buf bytes.Buffer
+	logger := slog.New(NewLogHandler(&buf, "json", opts))
+
+	logger.Info("suppressed")
+	assert.Empty(t, buf.String(), "INFO is below the configured level")
+
+	logger.Warn("kept", "request_id", "req-2")
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &got))
+	assert.Equal(t, "WARN", got["level"])
+	assert.Equal(t, "kept", got["msg"])
+	assert.Equal(t, "req-2", got["request_id"])
 }
