@@ -30,13 +30,13 @@ func TestIsRetryableBackfillErr_Table(t *testing.T) {
 		want bool
 	}{
 		{
-			// Horizon's own signal: slow down and try again.
-			name: "horizon rate limit",
+			// Horizon's 429 signal: slow down and try again.
+			name: "HTTP 429 rate limit",
 			err:  horizon.ErrRateLimited,
 			want: true,
 		},
 		{
-			name: "wrapped horizon rate limit",
+			name: "wrapped HTTP 429 rate limit",
 			err:  fmt.Errorf("fetching page 3: %w", horizon.ErrRateLimited),
 			want: true,
 		},
@@ -50,6 +50,16 @@ func TestIsRetryableBackfillErr_Table(t *testing.T) {
 		{
 			name: "wrapped horizon not found",
 			err:  fmt.Errorf("fetching page 3: %w", horizon.ErrNotFound),
+			want: false,
+		},
+		{
+			name: "HTTP 5xx response is not a transport failure",
+			err:  errors.New("horizon returned HTTP 503: service unavailable"),
+			want: false,
+		},
+		{
+			name: "HTTP 4xx response other than 429 is permanent",
+			err:  errors.New("horizon returned HTTP 400: bad request"),
 			want: false,
 		},
 		{
@@ -71,10 +81,12 @@ func TestIsRetryableBackfillErr_Table(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "refused connection behind the transport's wrapper",
-			err: &url.Error{Op: "Get", URL: "https://horizon.example", Err: &net.OpError{
-				Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED,
-			}},
+			name: "wrapped refused connection behind the transport's wrapper",
+			err: fmt.Errorf("fetching page 3: %w", &url.Error{
+				Op: "Get", URL: "https://horizon.example", Err: &net.OpError{
+					Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED,
+				},
+			}),
 			want: true,
 		},
 		{

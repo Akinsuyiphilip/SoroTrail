@@ -77,6 +77,48 @@ func TestValidateAll_Coverage(t *testing.T) {
 	}
 }
 
+func TestRedactURLPassword_Table(t *testing.T) {
+	tests := []struct {
+		name   string
+		in     string
+		want   string
+		secret string
+	}{
+		{
+			name:   "password is masked and URL components survive",
+			in:     "https://alice:s3cr3t@rpc.example.com:8443/v1/events?network=test",
+			want:   "https://alice:%2A%2A%2A@rpc.example.com:8443/v1/events?network=test",
+			secret: "s3cr3t",
+		},
+		{
+			name: "username without password is unchanged",
+			in:   "https://alice@rpc.example.com/v1/events",
+			want: "https://alice@rpc.example.com/v1/events",
+		},
+		{
+			name: "URL without userinfo is unchanged",
+			in:   "https://rpc.example.com/v1/events?network=test",
+			want: "https://rpc.example.com/v1/events?network=test",
+		},
+		{
+			name: "malformed URL fails closed without panicking",
+			in:   "https://alice:secret%zz@rpc.example.com/v1/events",
+			want: "<redacted>",
+		},
+		{name: "empty string remains empty", in: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := redactURLPassword(tt.in)
+			assert.Equal(t, tt.want, got)
+			if tt.secret != "" {
+				assert.NotContains(t, got, tt.secret)
+			}
+		})
+	}
+}
+
 // TestValidateCORSOrigins pins down the startup guard on CORS_ALLOWED_ORIGINS,
 // which is the last point before a malformed entry becomes a permissive browser
 // policy for the life of the process. Each case covers one rule the operator

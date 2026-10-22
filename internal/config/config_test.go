@@ -69,6 +69,28 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	})
 }
 
+func TestCleanContractList(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{name: "nil input returns an empty list", want: []string{}},
+		{name: "empty input returns an empty list", in: []string{}, want: []string{}},
+		{
+			name: "trims entries drops blanks deduplicates and preserves order",
+			in:   []string{" first ", "", "second", "first", "  ", " second ", "third"},
+			want: []string{"first", "second", "third"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, cleanContractList(tt.in))
+		})
+	}
+}
+
 const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
 var envKeys = []string{
@@ -205,7 +227,7 @@ func TestLoad(t *testing.T) {
 				"WATCHED_CONTRACTS": validContract + ", " + validContract + " ,",
 			},
 			check: func(t *testing.T, c Config) {
-				assert.Equal(t, []string{validContract, validContract}, c.WatchedContracts)
+				assert.Equal(t, []string{validContract}, c.WatchedContracts)
 			},
 		},
 		{
@@ -223,7 +245,7 @@ func TestLoad(t *testing.T) {
 				"SKIP_CONTRACTS": validContract + ", " + validContract + " ,",
 			},
 			check: func(t *testing.T, c Config) {
-				assert.Equal(t, []string{validContract, validContract}, c.SkipContracts)
+				assert.Equal(t, []string{validContract}, c.SkipContracts)
 			},
 		},
 		{
