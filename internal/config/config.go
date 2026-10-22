@@ -817,10 +817,17 @@ func ValidOrigin(s string) bool {
 
 func cleanContractList(in []string) []string {
 	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
 	for _, s := range in {
-		if s = strings.TrimSpace(s); s != "" {
-			out = append(out, s)
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
 		}
+		if _, exists := seen[s]; exists {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
 	}
 	return out
 }
