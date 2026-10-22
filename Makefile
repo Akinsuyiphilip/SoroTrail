@@ -14,7 +14,7 @@ LDFLAGS := -ldflags="-X github.com/sorotrail/sorotrail/internal/buildinfo.Versio
 
 .PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint bench bench-ci ci cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean
 .PHONY: build build-all build-all-integration run test test-fast test-db test-integration vet vet-integration test-ci lint cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check docker-up docker-down simtest simtest-long clean bench bench-ci seed spec spec-check client ci
-.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean loadtest
+.PHONY: help build build-all build-all-integration run test test-fast test-db test-ci test-integration simtest simtest-long vet vet-integration lint lint-guard bench bench-ci ci client cover cover-html cover-ci cover-integration-ci migrate-up migrate-down migrations-check seed docker-up docker-down spec clean loadtest test-prereqs
 
 # ── Self-documenting help ────────────────────────────────────────────────────
 # Every target that starts with a double-hash comment (##) is listed by
@@ -43,23 +43,37 @@ run: build ## Build and run the binary
 
 # ── Test ─────────────────────────────────────────────────────────────────────
 
-test: ## Run the unit suite with race detector
+# Report the external dependencies the suite needs but cannot find.
+#
+# A skipped dependency is invisible inside `go test`: Go discards the output
+# of a package that passes, so a notice printed by the test binary itself
+# only shows up under -v. This target prints the notice before the suite
+# runs, so `make test` and every other full-gate target say out loud that
+# the Helm chart golden tests or the database-backed tests did not run.
+#
+# Set SOROTRAIL_REQUIRE_HELM (or SOROTRAIL_REQUIRE_POSTGRES) to turn a
+# missing dependency into a failure instead of a notice — that is how CI
+# asserts the tests really ran.
+test-prereqs: ## Report external test dependencies that are missing
+	@go run ./cmd/testprereqs
+
+test: test-prereqs ## Run the unit suite with race detector
 	go test -race ./...
 
-test-fast: ## Run unit tests without the race detector
+test-fast: test-prereqs ## Run unit tests without the race detector
 	go test ./...
 
-test-db: ## Run full test suite against Postgres (requires DATABASE_URL)
+test-db: test-prereqs ## Run full test suite against Postgres (requires DATABASE_URL)
 	TEST_DATABASE_URL=$(DATABASE_URL) go test -p 1 ./...
 
 # Shared with cover-ci so the plain and coverage-instrumented runs of the CI
 # suite cannot drift: same packages, same serialization, same race detector.
 TEST_CI_FLAGS := -p 1 ./... -count=1 -race -timeout=120s
 
-test-ci: ## Mirror the CI test job exactly (race-enabled, serial, 120s timeout)
+test-ci: test-prereqs ## Mirror the CI test job exactly (race-enabled, serial, 120s timeout)
 	go test $(TEST_CI_FLAGS)
 
-test-integration: ## Run the integration-tagged suite against a real Postgres
+test-integration: test-prereqs ## Run the integration-tagged suite against a real Postgres
 	go test -tags=integration -p 1 ./... -count=1
 
 loadtest: ## Run a short synthetic load test against a database (requires DATABASE_URL)
@@ -146,7 +160,7 @@ client: ## Regenerate the versioned API client in pkg/client
 
 # ── Coverage ─────────────────────────────────────────────────────────────────
 
-cover: ## Run tests with coverage profile
+cover: test-prereqs ## Run tests with coverage profile
 	go test -coverprofile=coverage.out ./... && go tool cover -func=coverage.out
 
 cover-html: cover ## Open coverage report in browser
@@ -157,7 +171,7 @@ cover-html: cover ## Open coverage report in browser
 # reproduce the exact CI coverage profile locally with one make target.
 # -covermode=atomic is what -race requires and must match the integration
 # legs' mode, or scripts/merge_coverage.sh rejects the mixed profiles.
-cover-ci: ## Mirror the CI test job, recording an atomic coverage profile
+cover-ci: test-prereqs ## Mirror the CI test job, recording an atomic coverage profile
 	go test $(TEST_CI_FLAGS) -coverprofile=coverage.out -covermode=atomic
 
 # Tagged counterpart of cover-ci: the same database-backed suite the
@@ -165,7 +179,7 @@ cover-ci: ## Mirror the CI test job, recording an atomic coverage profile
 # integration tag counts as covered once the coverage job merges the two
 # flavours. Without it, migrations and the store/ingester paths that need a
 # real Postgres look untested in the reported figure.
-cover-integration-ci: ## Mirror the CI integration job, recording an atomic coverage profile
+cover-integration-ci: test-prereqs ## Mirror the CI integration job, recording an atomic coverage profile
 	go test -tags=integration -p 1 -timeout 5m ./... -count=1 -coverprofile=coverage.out -covermode=atomic
 
 # ── Database / Migrations ────────────────────────────────────────────────────

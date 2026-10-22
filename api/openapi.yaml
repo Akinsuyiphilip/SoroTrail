@@ -1870,6 +1870,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /contracts/{id}/export:
     get:
       operationId: contractExport

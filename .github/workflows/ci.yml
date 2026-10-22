@@ -501,8 +501,23 @@ jobs:
 
   helm:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        id: go
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
       - uses: azure/setup-helm@v5
         with:
           version: v3.15.0
@@ -526,6 +541,15 @@ jobs:
           fi
       - name: Helm template render (defaults)
         run: helm template sorotrail deploy/helm/sorotrail --set database.url=postgres://user:pass@host:5432/db > /dev/null
+      # The chart's golden tests render the chart and compare the output
+      # byte for byte against the committed manifests. They skip when helm
+      # is missing, and a job that is supposed to run them must not pass by
+      # skipping them: SOROTRAIL_REQUIRE_HELM turns the skip into a
+      # failure, so this step fails if the runner ever loses helm.
+      - name: Helm chart golden tests
+        env:
+          SOROTRAIL_REQUIRE_HELM: "1"
+        run: go test ./deploy/helm/sorotrail/... -count=1
 
   monitoring:
     runs-on: ubuntu-latest
@@ -576,3 +600,90 @@ jobs:
             --set image.tag=v1.2.3 \
             --set config.watchedContracts=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC \
             > /dev/null
+
+  # Issue #1082: validate the release build on every pull request. The
+  # configuration was previously only ever exercised by a tag push — the one
+  # operation that cannot be taken back. This job runs `goreleaser check` plus a
+  # snapshot release on pull requests, publishing nothing and needing no secrets,
+  # so it is safe on fork PRs. The job is scoped by path: it runs unconditionally
+  # on pushes to main, and is kept off pull requests whose diffs cannot change
+  # the release pipeline (goreleaser config, go.mod/go.sum, Dockerfiles,
+  # Makefile, internal/buildinfo, the workflows and scripts/). Pushes to main
+  # always validate; the gate deliberately leaves darwin-/windows-only code as a
+  # compromise in exchange for not running a six-target build on every PR.
+  goreleaser:
+    name: goreleaser
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # goreleaser needs the full history for changelog
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Restore Go module and build caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-plain-
+
+      - name: Determine release scope
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "[RUN] push to main always validates"
+          else
+            git diff --name-only ${{ github.event.pull_request.base.sha }}...HEAD | ./scripts/check_release_scope.sh
+          fi
+
+      - name: Install goreleaser
+        if: steps.scope.outputs.run == 'true'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          install-only: true
+
+      - name: Validate goreleaser config
+        if: steps.scope.outputs.run == 'true'
+        run: goreleaser check
+
+      - name: Build snapshot release
+        if: steps.scope.outputs.run == 'true'
+        run: goreleaser release --snapshot --clean
+
+      - name: Verify build info stamps
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          binary=$(find dist -name 'sorotrail*' -type f | grep -E '(linux_amd64|linux_arm64)' | head -1)
+          if [ -z "$binary" ]; then
+            echo "No linux binary found in dist/"
+            exit 1
+          fi
+          chmod +x "$binary"
+          output=$("$binary" version)
+          echo "Binary output: $output"
+          # The snapshot build stamps "unknown" for version/commit/date; we assert
+          # those placeholders are present rather than empty, which would indicate
+          # the ldflags never reached the artefact.
+          for field in version commit build-date; do
+            if ! echo "$output" | grep -q "unknown"; then
+              echo "Build info $field not stamped (got: $output)"
+              exit 1
+            fi
+          done
+          echo "All build info fields correctly stamped with 'unknown' placeholders"
