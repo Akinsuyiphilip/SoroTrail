@@ -83,3 +83,36 @@ func TestJitter(t *testing.T) {
 		}
 	})
 }
+
+func TestRandInt(t *testing.T) {
+	tests := []struct {
+		name       string
+		n          int64
+		wantAlways int64 // when non-negative, every call must return this exact value
+		inRange    bool  // when true, every call must land in [0, n)
+	}{
+		{name: "zero bound returns zero", n: 0, wantAlways: 0},
+		{name: "negative bound returns zero without panicking", n: -100, wantAlways: 0},
+		{name: "bound of one always returns zero", n: 1, wantAlways: 0},
+		{name: "small bound", n: 4, inRange: true},
+		{name: "large bound", n: 1 << 40, inRange: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A single call can pass by luck, so check the invariant
+			// over many iterations: this is the random source behind
+			// jitter's backoff, and an off-by-one in the bound would
+			// make sleeps occasionally exceed the requested window.
+			for i := 0; i < 1000; i++ {
+				got := randInt(tt.n)
+				if tt.inRange {
+					assert.GreaterOrEqual(t, got, int64(0), "iteration %d", i)
+					assert.Less(t, got, tt.n, "iteration %d", i)
+				} else {
+					assert.Equal(t, tt.wantAlways, got, "iteration %d", i)
+				}
+			}
+		})
+	}
+}
