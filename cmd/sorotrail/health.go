@@ -131,10 +131,26 @@ func validateProbeURL(raw string) error {
 // Following a redirect could mask a real misconfiguration behind
 // a successful probe.
 func probeEndpoint(label, url string, timeout time.Duration) int {
-	client := &http.Client{Timeout: timeout}
+	// The probe gets its own transport rather than sharing
+	// http.DefaultTransport. A one-shot probe has no use for a
+	// process-wide connection pool, and sharing one makes the result
+	// depend on what else in the process touched that pool: anything
+	// calling CloseIdleConnections can kill a pooled connection while
+	// this request is being assigned to it, which surfaces as
+	// "transport connection broken" and reads as an unhealthy service.
+	// httptest.Server.Close does exactly that to DefaultTransport, so
+	// under test this turned into an intermittent false negative.
+	// Clone keeps the standard settings — proxy resolution included —
+	// and only separates the pool.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	client := &http.Client{Timeout: timeout, Transport: transport}
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
+	// The process exits straight after a probe, but closing idle
+	// connections keeps the intent explicit and avoids holding a socket
+	// open if probeEndpoint is ever called more than once.
+	defer transport.CloseIdleConnections()
 
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
