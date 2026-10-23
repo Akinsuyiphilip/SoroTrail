@@ -48,7 +48,6 @@ they matter rather than on every path.
 | the export's ledger range is wider than the operator's cap | GET /contracts/{id}/export | `ledger range [%d,%d] spans %d ledgers, exceeding EXPORT_MAX_RANGE=%d` |
 | the export's to_ledger bound is not a positive integer | GET /contracts/{id}/export | `to_ledger <detail>` |
 | the CSV export's format parameter names something other than csv or ndjson | GET /events.csv | `invalid format %q (want csv or ndjson)` |
-| POST /watched-contracts cannot decode its JSON body (the decodeJSONBody family) | POST /watched-contracts | `request body is empty; request body exceeds 4096 bytes; invalid JSON body: <json error>; invalid JSON body: unexpected data after the JSON value; reading request body: <io error>` |
 | the first watch would silently narrow ingestion from all contracts to a list, and the caller did not pass ?confirm=true | POST /watched-contracts | `adding the first watched contract would switch ingestion from 'all contract events' to a specific list — pass ?confirm=true to acknowledge` |
 | the body's contract_id is not a strkey | POST /watched-contracts | `invalid contract_id %q (want 56-char C... strkey)` |
 | the address-events filter fails shared validation | GET /addresses/{address}/events | `event-filter validation message (see "Event-filter validation messages" below)` |
@@ -74,6 +73,7 @@ they matter rather than on every path.
 | the {id} path segment is not a strkey | DELETE /watched-contracts/{id} | `invalid contract id %q (want 56-char C... strkey)` |
 | a cursor is replayed against a different ordering than the one that produced it (store.ErrInvalidCursor) | GET /events, GET /contracts/{id}/events | `invalid cursor for order_by=%s; use the cursor returned by the same ordering` |
 | a list-shaped endpoint rejects a malformed query (shared filter validation); the forbidden-contract case is split out to 403 by the same helper | GET /events, GET /events/count, GET /events.csv, GET /events/ws, GET /contracts/{id}/events, GET /contracts/{id}/export, POST /subscriptions, PUT /subscriptions/{id} | `event-filter validation message (see "Event-filter validation messages" below)` |
+| the shared request-body decoder rejects a malformed, empty, or trailing-data body | any authenticated or rate-limited operation (middleware-wide) | `request body is empty; invalid JSON body: <json error>; invalid JSON body: unexpected data after the JSON value; reading request body: <io error>` |
 | the {id} path segment is not a strkey | GET /contracts/{id}/stats | `invalid contract ID %q` |
 | the {id} path segment is not a strkey | GET /contracts/{id} | `invalid contract ID %q` |
 | the {id} path segment is not a strkey | DELETE /contracts/{id}/spec | `invalid contract id %q (want 56-char C... strkey)` |
@@ -82,16 +82,19 @@ they matter rather than on every path.
 | the PUT body is valid JSON but carries neither a "spec" wrapper nor a bare spec object | PUT /contracts/{id}/spec | `request body must contain a "spec" object` |
 | neither wrapped nor bare body could be decoded as JSON | PUT /contracts/{id}/spec | `invalid JSON body: <json error>` |
 | the {id} path segment is not a strkey | PUT /contracts/{id}/spec | `invalid contract id %q (want 56-char C... strkey)` |
+| the {id} path segment is not a strkey | GET /contracts/{id}/spec/history | `invalid contract id %q (want 56-char C... strkey)` |
+| the history page size is outside [1, limit] | GET /contracts/{id}/spec/history | `limit must be an integer in [1,%d]` |
+| the ?cursor= is not a cursor this endpoint produced | GET /contracts/{id}/spec/history | `spec override history cursor is not valid base64url; spec override history cursor is not a version id` |
+| the {id} path segment is not a strkey | POST /contracts/{id}/spec/revert | `invalid contract id %q (want 56-char C... strkey)` |
+| the body names no history version to restore | POST /contracts/{id}/spec/revert | `version must be a positive integer` |
 | the subscription is created without the HMAC signing secret | POST /subscriptions | `secret is required` |
 | the subscription is created without a webhook URL | POST /subscriptions | `url is required` |
-| POST /subscriptions cannot decode its JSON body | POST /subscriptions | `invalid JSON: <json error>` |
 | DELETE /subscriptions/{id} is given a path id that is not a positive integer | DELETE /subscriptions/{id} | `subscription id must be a positive integer, got %q` |
 | GET /subscriptions/{id} is given a path id that is not a positive integer | GET /subscriptions/{id} | `subscription id must be a positive integer, got %q` |
 | GET /subscriptions/{id}/deliveries is given a path id that is not a positive integer | GET /subscriptions/{id}/deliveries | `subscription id must be a positive integer, got %q` |
 | the delivery-history page size is outside [1, limit] | GET /subscriptions/{id}/deliveries | `limit must be an integer in [1,%d]` |
 | PUT /subscriptions/{id} is given a path id that is not a positive integer | PUT /subscriptions/{id} | `subscription id must be a positive integer, got %q` |
 | the update would empty the subscription's webhook URL | PUT /subscriptions/{id} | `url must not be empty` |
-| PUT /subscriptions/{id} cannot decode its JSON body | PUT /subscriptions/{id} | `invalid JSON: <json error>` |
 | the body's contract_id is not a strkey | POST /tenant/watch | `invalid contract_id %q` |
 | the tenant's quota fields are inconsistent or negative (validateTenantQuotas) | POST /admin/tenants | `rate_limit_rps must be non-negative; rate_limit_burst must be non-negative; max_watched_contracts must be non-negative; rate_limit_rps and rate_limit_burst must be set together` |
 | the tenant is created without a name | POST /admin/tenants | `name is required` |
@@ -99,7 +102,6 @@ they matter rather than on every path.
 | the {contract_id} path segment is not a strkey | DELETE /tenant/watch/{contract_id} | `invalid contract_id %q` |
 | the update would leave the tenant's quota fields inconsistent or negative (validateTenantQuotas) | PATCH /admin/tenants/{id} | `rate_limit_rps must be non-negative; rate_limit_burst must be non-negative; max_watched_contracts must be non-negative; rate_limit_rps and rate_limit_burst must be set together` |
 | the usage window is outside [1, days] | GET /tenant/usage, GET /admin/tenants/{id}/usage | `days must be an integer in [1,%d]` |
-| a tenant control-plane body cannot be decoded — including a body over the request-body cap, which surfaces as 'http: request body too large' | POST /admin/tenants, PATCH /admin/tenants/{id}, POST /admin/tenants/{id}/grants, POST /admin/tenants/{id}/keys, POST /tenant/watch | `invalid JSON body: <json error>` |
 | an admin path id ({id} or {key_id}) is not an integer | GET /admin/tenants/{id}, PATCH /admin/tenants/{id}, GET /admin/tenants/{id}/usage, GET /admin/tenants/{id}/grants, POST /admin/tenants/{id}/grants, DELETE /admin/tenants/{id}/grants/{contract_id}, GET /admin/tenants/{id}/keys, POST /admin/tenants/{id}/keys, DELETE /admin/tenants/{id}, DELETE /admin/keys/{key_id} | `invalid %s %q` |
 
 ### 401 Unauthorized
@@ -108,7 +110,7 @@ they matter rather than on every path.
 | --- | --- | --- |
 | requireAPIKey sees a missing, malformed, unknown, revoked or mismatched key — one sentence for all five so the response is not an existence oracle | POST /apikeys, GET /apikeys, DELETE /apikeys/{id}, GET /events/ws, POST /subscriptions, PUT /subscriptions/{id}, DELETE /subscriptions/{id}, GET /subscriptions, GET /subscriptions/{id}, GET /subscriptions/{id}/deliveries | `missing or invalid API key` |
 | multi-tenant authentication rejects the credential, with the reason that lets a legitimate caller fix it | any authenticated or rate-limited operation (middleware-wide) | `missing API key; malformed API key; unknown or revoked API key` |
-| a management endpoint is called without the configured X-API-Key, or with the wrong one | DELETE /events, GET /watched-contracts, POST /watched-contracts, DELETE /watched-contracts/{id}, PUT /contracts/{id}/spec, GET /contracts/{id}/spec, DELETE /contracts/{id}/spec, GET /dead-letters, DELETE /dead-letters/{id} | `invalid or missing X-API-Key header` |
+| a management endpoint is called without the configured X-API-Key, or with the wrong one | DELETE /events, GET /watched-contracts, POST /watched-contracts, DELETE /watched-contracts/{id}, PUT /contracts/{id}/spec, GET /contracts/{id}/spec, DELETE /contracts/{id}/spec, GET /contracts/{id}/spec/history, POST /contracts/{id}/spec/revert, GET /dead-letters, DELETE /dead-letters/{id} | `invalid or missing X-API-Key header` |
 
 ### 403 Forbidden
 
@@ -135,6 +137,7 @@ they matter rather than on every path.
 | the contract has no indexed events | GET /contracts/{id}/stats | `contract %q not found` |
 | the contract has no indexed events | GET /contracts/{id} | `contract %q not found` |
 | no override was ever stored for this contract | GET /contracts/{id}/spec | `no spec override for contract %q` |
+| the named version is not in the contract's override history | POST /contracts/{id}/spec/revert | `no spec override version %d for contract %q` |
 | the subscription does not exist or is not visible to the caller | DELETE /subscriptions/{id} | `subscription %d not found` |
 | the subscription does not exist or is not visible to the caller | GET /subscriptions/{id} | `subscription %d not found` |
 | the subscription does not exist or is not visible to the caller | GET /subscriptions/{id}/deliveries | `subscription %d not found` |
@@ -150,6 +153,12 @@ they matter rather than on every path.
 | a tenant with the same name exists (store.ErrDuplicate) | POST /admin/tenants | `already exists` |
 | a tenant is authenticated as tries to delete its own account | DELETE /admin/tenants/{id} | `a tenant cannot delete itself` |
 | the update would rename the tenant onto an existing name (store.ErrDuplicate) | PATCH /admin/tenants/{id} | `already exists` |
+
+### 413 Request Entity Too Large
+
+| Condition | Operations | Message |
+| --- | --- | --- |
+| the shared request-body decoder rejects an oversized body | any authenticated or rate-limited operation (middleware-wide) | `request body exceeds <limit> bytes` |
 
 ### 429 Too Many Requests
 
@@ -194,6 +203,9 @@ they matter rather than on every path.
 | the store fails while deleting the override | DELETE /contracts/{id}/spec | `deleting contract spec override failed` |
 | the store fails while loading the override | GET /contracts/{id}/spec | `loading contract spec override failed` |
 | the store fails while persisting the override | PUT /contracts/{id}/spec | `saving contract spec override failed` |
+| the store fails while listing the override history | GET /contracts/{id}/spec/history | `listing contract spec override history failed` |
+| the store fails while listing the override history to find the version to restore | POST /contracts/{id}/spec/revert | `listing contract spec override history failed` |
+| the store fails while writing the restored override | POST /contracts/{id}/spec/revert | `reverting contract spec override failed` |
 | the store fails while creating the subscription | POST /subscriptions | `creating subscription failed` |
 | the store fails while deleting the subscription | DELETE /subscriptions/{id} | `deleting subscription failed` |
 | the store fails while loading the subscription | GET /subscriptions/{id} | `getting subscription failed` |
@@ -228,13 +240,18 @@ they matter rather than on every path.
 | the store backend does not implement API keys (ErrUnsupported) | DELETE /apikeys/{id} | `operation not supported by this store backend` |
 | the live stream is requested on an instance with no broadcaster | GET /events/ws | `streaming not configured` |
 | the store backend does not support listing contracts (ErrUnsupported) | GET /contracts | `operation not supported by this store backend` |
+| the store backend cannot count a contract's events (ErrUnsupported, e.g. ClickHouse) | GET /contracts/{id}/stats | `operation not supported by this store backend` |
 | the store backend does not support contract summaries (ErrUnsupported) | GET /contracts/{id} | `operation not supported by this store backend` |
+| the store backend does not implement contract spec overrides (ErrUnsupported) | DELETE /contracts/{id}/spec | `operation not supported by this store backend` |
+| the store backend does not implement contract spec overrides (ErrUnsupported) | PUT /contracts/{id}/spec | `operation not supported by this store backend` |
+| the store backend does not implement the override history (ErrUnsupported) | GET /contracts/{id}/spec/history | `operation not supported by this store backend` |
+| the store backend does not implement the override history (ErrUnsupported) | POST /contracts/{id}/spec/revert | `operation not supported by this store backend` |
 
 ### 503 Service Unavailable
 
 | Condition | Operations | Message |
 | --- | --- | --- |
-| a management endpoint is called on an instance with no API_KEY — fail-closed, so writes are never open on a misconfigured deployment | DELETE /events, GET /watched-contracts, POST /watched-contracts, DELETE /watched-contracts/{id}, PUT /contracts/{id}/spec, GET /contracts/{id}/spec, DELETE /contracts/{id}/spec, GET /dead-letters, DELETE /dead-letters/{id} | `API_KEY env var must be set to access watched-contracts endpoints` |
+| a management endpoint is called on an instance with no API_KEY — fail-closed, so writes are never open on a misconfigured deployment | DELETE /events, GET /watched-contracts, POST /watched-contracts, DELETE /watched-contracts/{id}, PUT /contracts/{id}/spec, GET /contracts/{id}/spec, DELETE /contracts/{id}/spec, GET /contracts/{id}/spec/history, POST /contracts/{id}/spec/revert, GET /dead-letters, DELETE /dead-letters/{id} | `API_KEY env var must be set to access watched-contracts endpoints` |
 | /metrics is scraped on an instance with no metrics collector wired in | GET /metrics | `metrics not enabled` |
 
 ## Event-filter validation messages

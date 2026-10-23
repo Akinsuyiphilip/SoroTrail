@@ -391,8 +391,12 @@ once. A single process still ingests one network — the one named by
 | `RATE_LIMIT_RPS` | float | `0` (disabled) | Per-client HTTP request rate limit (`requests/second`). Must be set together with `RATE_LIMIT_BURST`; setting only one fails startup. | restart |
 | `RATE_LIMIT_BURST` | int | `0` (disabled) | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. | restart |
 | `RATE_LIMIT_TRUSTED_PROXY` | bool | `false` | Honor `X-Forwarded-For` for client IP detection. Only enable behind a trusted proxy that strips/rewrites the header. | restart |
-| `HOURLY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 1-hour window. `0` disables the quota. | restart |
-| `DAILY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 24-hour window. `0` disables the quota. | restart |
+| `HOURLY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a fixed 1-hour window that starts at the client's first request. `0` disables the quota. See [Rate limits and quotas](docs/rate-limits.md). | restart |
+| `DAILY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a fixed 24-hour window that starts at the client's first request. `0` disables the quota. See [Rate limits and quotas](docs/rate-limits.md). | restart |
+
+See [Rate limits and quotas](docs/rate-limits.md) for the evaluation order,
+client-key derivation, response headers, per-tenant overrides, and the
+multi-replica caveat.
 
 ### Audit
 
@@ -1172,6 +1176,61 @@ Fetch a single event by its ID (the TOID-based identifier from the RPC).
 Shell
 
 curl -s localhost:8080/events/0001099511627776-0000000001
+
+### `GET /events/aggregate`
+
+Returns event counts grouped into buckets instead of individual events. It
+accepts the same event filters as `GET /events` — `contract_id`, `type`,
+`in_successful_call`, `topic`/`topic0`..`topic3`, `topic_contains`, `tx_hash`,
+`from_ledger`, `to_ledger`, `from_time`, and `to_time` — applied before
+bucketing.
+
+| Param | Example | Meaning |
+| --- | --- | --- |
+| `bucket` | `ledger` | Required. `ledger` counts events per ledger. Any other value is parsed as a Go duration (`1h`, `24h`) and counts events per wall-clock interval. |
+| `cursor`, `limit`, `order`, `order_by` | | Accepted but ignored: aggregation always returns every bucket in one response. |
+
+Each bucket is `{"bucket": "...", "count": N}`. Ledger buckets are decimal
+ledger numbers; time buckets are `YYYY-MM-DDTHH:MM:SS` timestamps aligned to
+the requested interval. Buckets with no events are omitted, and the array is
+ordered by bucket ascending.
+
+**Limits.** The `bucket` parameter is required; a missing or unparseable value
+is a `400`. Durations must be positive and are resolved to whole seconds, so
+sub-second intervals are not supported, and `d` is not a Go duration unit —
+use `24h` for a day. There is no server-side cap on the ledger or time range
+and no pagination: every event matching the filters is aggregated into the
+response. Narrow wide queries with the filters above; aggregation is treated
+as an expensive, rate-limited read.
+
+```sh
+# One bucket per ledger, restricted to a contract and a ledger range
+curl -s 'localhost:8080/events/aggregate?bucket=ledger&contract_id=CDLZ...CYSC&from_ledger=256000&to_ledger=256001'
+```
+
+```json
+{
+  "buckets": [
+    {"bucket": "256000", "count": 5},
+    {"bucket": "256001", "count": 3}
+  ]
+}
+```
+
+```sh
+# One bucket per day, restricted to a time range
+curl -s 'localhost:8080/events/aggregate?bucket=24h&from_time=2026-07-21T00:00:00Z&to_time=2026-07-23T00:00:00Z'
+```
+
+```json
+{
+  "buckets": [
+    {"bucket": "2026-07-21T00:00:00", "count": 42},
+    {"bucket": "2026-07-22T00:00:00", "count": 17}
+  ]
+}
+```
+
 ### `GET /contracts`
 
 Lists every indexed contract with per-contract activity: total event
@@ -2114,6 +2173,26 @@ be defined with a foreign key to `events(id)` and `ON DELETE CASCADE`. The
 pruner therefore deletes only from `events` and lets Postgres cascade the
 dependent rows; today's single-table DELETE is correct because no such
 table exists yet, and the contract is “derived tables ride along”.
+
+### Bulk event deletion
+
+The pruner is the routine path. For a one-off correction there is also an
+admin-only `DELETE /events?before_ledger=<ledger>` endpoint. It deletes
+every stored event with `ledger < before_ledger` in one unbatched
+statement, across every network, with no archive step and no
+`last_ingested_ledger` guard. It is not reversible; unlike the pruner it
+does not respect retention configuration, and it can race the auditor
+(which may re-ingest the range while the RPC still has it).
+
+| Method | Path | Authentication | Description |
+| --- | --- | --- | --- |
+| `DELETE` | `/events` | `X-API-Key: $API_KEY` | Deletes all events with `ledger < before_ledger` across all networks. Returns `{"deleted": N}`. |
+
+Use the [bulk event deletion runbook](docs/runbook.md#bulk-event-deletion-delete-events)
+before calling it: it covers the required export, the RPC retention check,
+archive coverage, auditor and backfill interaction, and post-delete
+verification.
+
 ## Contract metadata enrichment
 
 SoroTrail runs a background worker that enriches contracts with
@@ -2150,6 +2229,11 @@ SEP-41 token interface via RPC simulation.
 - **TTL-based refresh** — token metadata is re-fetched after
   `CONTRACT_META_TTL` (default 24h) so name/symbol changes (e.g. a token
   upgrade) are eventually picked up.
+- **Postgres-only** — the contract metadata table is Postgres-only. On a
+  ClickHouse backend the whole contract-metadata surface refuses with
+  `ErrUnsupported`, so the worker stands down instead of reporting success
+  while storing nothing, and the API answers 501 on the endpoints that need
+  it. See [ClickHouse backend support](docs/clickhouse.md).
 
 Disable enrichment entirely with `CONTRACT_META_ENABLED=false`.
 

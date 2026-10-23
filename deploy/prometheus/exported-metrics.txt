@@ -27,3 +27,4 @@ sorotrail_event_batch_size
 sorotrail_event_backpressure_total
 sorotrail_event_backpressure_seconds_total
 http_request_duration_seconds
+sorotrail_spec_invalidations_received_total

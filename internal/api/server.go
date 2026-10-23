@@ -187,6 +187,11 @@ type Server struct {
 
 	httpRequestBodyLimit int64 // max accepted request body size, in bytes
 
+	// specInvalidationPublisher tells the other replicas that a contract's
+	// cached spec must be evicted after a write. Optional: a single-process
+	// deployment has nobody to tell.
+	specInvalidationPublisher SpecInvalidationPublisher
+
 	// GraphQL transport, injected by main after the server is built.
 	// internal/api/graphql imports this package for its ServerDeps, so
 	// the dependency has to run in this direction to avoid an import
@@ -236,6 +241,25 @@ func (s *Server) SetHTTPRequestBodyLimit(n int64) {
 	s.httpRequestBodyLimit = n
 }
 
+// SpecInvalidationPublisher tells the other replicas that a contract's
+// cached spec must be evicted.
+//
+// The spec package declares the same shape, so a cache and an API server
+// can share one implementation without either depending on the other.
+type SpecInvalidationPublisher interface {
+	PublishSpecInvalidation(ctx context.Context, contractID string) error
+}
+
+// SetSpecInvalidationPublisher wires the publisher used after a write that
+// changes what a contract decodes to.
+//
+// Without it the other replicas keep serving the old spec until their own
+// cache expires, so the same request decodes differently depending on which
+// replica served it. A single-process deployment leaves it unset.
+func (s *Server) SetSpecInvalidationPublisher(pub SpecInvalidationPublisher) {
+	s.specInvalidationPublisher = pub
+}
+
 // SetCompressMinSize overrides the body size at which responses are
 // compressed. Pass a negative value to disable compression.
 func (s *Server) SetCompressMinSize(n int) {
@@ -276,7 +300,7 @@ func (s *Server) SetStatsTTL(ttl time.Duration) {
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New()}
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New(), enableMetrics: true}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -466,7 +490,7 @@ func (s *Server) router() chi.Router {
 	// Always registered so the documented surface is stable; a nil
 	// collector (hand-built Server) answers 503 rather than 404.
 	r.Get("/metrics", func(w http.ResponseWriter, req *http.Request) {
-		if s.metrics == nil {
+		if !s.enableMetrics || s.metrics == nil {
 			writeError(w, http.StatusServiceUnavailable, errors.New("metrics not enabled"))
 			return
 		}
@@ -517,6 +541,11 @@ func (s *Server) router() chi.Router {
 	r.With(watchedMW).Put("/contracts/{id}/spec", s.handlePutContractSpecOverride)
 	r.With(watchedMW).Get("/contracts/{id}/spec", s.handleGetContractSpecOverride)
 	r.With(watchedMW).Delete("/contracts/{id}/spec", s.handleDeleteContractSpecOverride)
+	// The override history answers "did someone change the override?", and
+	// a revert puts a previous version back. Both are management surfaces,
+	// so they sit behind the same key gate as the override itself.
+	r.With(watchedMW).Get("/contracts/{id}/spec/history", s.handleListContractSpecOverrideHistory)
+	r.With(watchedMW).Post("/contracts/{id}/spec/revert", s.handleRevertContractSpecOverride)
 
 	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
 	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)

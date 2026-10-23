@@ -10,6 +10,7 @@ Normally the enricher fetches that specification automatically from the chain by
 - [Accepted JSON format](#accepted-json-format)
 - [Validation rules and error messages](#validation-rules-and-error-messages)
 - [Wrapper vs. bare request body](#wrapper-vs-bare-request-body)
+- [History and reverting](#history-and-reverting)
 - [Precedence and contract upgrades](#precedence-and-contract-upgrades)
 - [Caching and propagation timing](#caching-and-propagation-timing)
 
@@ -44,6 +45,8 @@ Every response from `/contracts/{id}/spec` carries `Cache-Control: no-store`.
 | `PUT` | `/contracts/{id}/spec` | `200 OK` | Validate and store (or replace) the JSON spec override for contract `{id}`. |
 | `GET` | `/contracts/{id}/spec` | `200 OK` | Return the stored spec override for contract `{id}`, or `404 Not Found` (`{"error": "no spec override for contract \"C...\""}`) when none is set. |
 | `DELETE` | `/contracts/{id}/spec` | `200 OK` | Remove the stored spec override for contract `{id}`. Idempotent: deleting an absent override still returns `200 OK` with `{"contract_id": "C...", "deleted": true}`. |
+| `GET` | `/contracts/{id}/spec/history` | `200 OK` | List every recorded change to the contract's override, newest first. |
+| `POST` | `/contracts/{id}/spec/revert` | `200 OK` | Restore a previous version of the override. |
 
 `{id}` must be a valid 56-character Stellar contract strkey (`C...`); otherwise the handler returns `400 Bad Request` (`invalid contract id "..." (want 56-char C... strkey)`).
 
@@ -193,6 +196,70 @@ Always send the **wrapped** form:
 
 ---
 
+## History and reverting
+
+A spec override silently changes how a contract's events decode, so every
+change to one is recorded. `PUT`, `DELETE`, and a revert each append a row to
+an append-only history table (`contract_spec_override_history`), carrying:
+
+- the contract ID,
+- the spec that was in force (absent for a tombstone, meaning the override
+  was deleted rather than replaced),
+- the public prefix of the API key that made the change (never the secret
+  half), and
+- when the change was recorded.
+
+The history row is written in the same transaction as the override itself, so
+the two can never disagree.
+
+Read the history newest first:
+
+```sh
+curl -s "http://localhost:8080/contracts/$CONTRACT/spec/history?limit=50" \
+  -H "X-API-Key: $API_KEY"
+```
+
+```json
+{
+  "versions": [
+    {
+      "id": 7,
+      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "spec": {"events": [{"name": "transfer"}]},
+      "api_key_prefix": "a1b2c3d4e5f60718",
+      "created_at": "2026-09-01T12:00:00Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+The response carries an opaque `cursor` when more entries follow; pass it
+back as `?cursor=` to page backwards through the history.
+
+Restore a previous version by naming its id:
+
+```sh
+curl -s -X POST http://localhost:8080/contracts/$CONTRACT/spec/revert \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"version": 7}'
+```
+
+The revert is itself a change, so it is recorded as a new history entry: the
+history stays append-only and keeps the whole sequence, including the way
+back. A version that is not in the history answers `404 Not Found`.
+
+**Retention.** History rows are retained in full; there is no automatic
+pruning. The history is never consulted when decoding an event, so the
+current-override read path costs exactly what it did before.
+
+**Backends.** Postgres and SQLite record the history. ClickHouse refuses
+these operations with `ErrUnsupported`, so the API answers
+`501 Not Implemented` rather than reporting an empty history.
+
+---
+
 ## Precedence and contract upgrades
 
 In `Enricher.getSpec` (`internal/spec/enricher.go`), lookup order is:
@@ -216,6 +283,8 @@ When `getOverride` loads an override from the database on a cache miss, it store
 Verify the current caching behaviour against the code (`internal/spec/enricher.go` and `internal/spec/cache.go`):
 
 - **First upload (no prior override cached in memory)**: takes effect **immediately** on the next `?decoded=true` request, because `getOverride` misses in memory (`e.cache.Get("override:" + contractID)` returns `nil`) and reads the newly stored row from Postgres/SQLite.
-- **Replacing or deleting an already-cached override on a single instance (known bug [#1142](https://github.com/sorotrail/SoroTrail/issues/1142))**: `PUT /contracts/{id}/spec` and `DELETE /contracts/{id}/spec` write to the store but do not currently evict `"override:" + contractID` from `spec.Cache`. Although a comment in `getOverride` states that in-memory overrides never expire, `e.cache.Get(key)` calls `Cache.get`, which enforces `DefaultSpecTTL` (`10m`). As a result, replacing or deleting an override that has already been served takes up to **`DefaultSpecTTL` (10 minutes)** (or a process restart) to take effect in the handling process until #1142 is resolved.
-- **Multi-replica deployments (known issue [#1167](https://github.com/sorotrail/SoroTrail/issues/1167))**: `spec.Cache` is per-process in memory with no cross-replica invalidation channel yet. Even once local eviction is wired, other API replicas that have already cached `"override:<contract_id>"` will continue serving their in-memory entry until their local `DefaultSpecTTL` (10 minutes) expires.
+- **Replacing or deleting an already-cached override**: takes effect **immediately** on the handling replica. `PUT /contracts/{id}/spec` and `DELETE /contracts/{id}/spec` now evict `"override:" + contractID` from the cache, so the next `?decoded=true` request re-reads the store. (Before this, an override that had already been served took up to `DefaultSpecTTL` — 10 minutes — to change.)
+- **Multi-replica deployments**: an override write is published on the Postgres channel `sorotrail_spec_invalidation`, and every replica's listener evicts the contract's cached spec and override when it arrives. The payload is the bare contract ID, so the same request decodes the same way whichever replica serves it. A replica whose listener reconnects clears its whole cache, because a reconnect may have missed notifications.
+- **Contract upgrades**: a detected wasm-hash change is published the same way, so the other replicas stop serving the pre-upgrade spec.
+- **Single-process and SQLite deployments**: there is nobody to tell, so no channel is used and the local eviction above is the whole story.
 - **ClickHouse backend caveat**: as documented in [ClickHouse backend support](clickhouse.md#contract-inventory-and-metadata), `GetContractSpecOverride`, `SetContractSpecOverride`, and `DeleteContractSpecOverride` are silent no-ops on ClickHouse (`GET` returns `404`, `PUT`/`DELETE` return `200` without persisting). Spec overrides require Postgres or SQLite.

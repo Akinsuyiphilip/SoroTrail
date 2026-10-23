@@ -32,6 +32,8 @@ full details.
 - [indexes.md](indexes.md) — explanations of composite indexes and query plans.
 - [logging.md](logging.md) — structured logging conventions and tracing configuration.
 - [metrics.md](metrics.md) — exported Prometheus metrics and alerting rules.
+- [rate-limits.md](rate-limits.md) — token bucket, fixed hourly/daily quotas,
+  per-tenant overrides, response headers, and multi-replica caveats.
 - [spec-overrides.md](spec-overrides.md) — uploading, inspecting, and deleting
   user-supplied contract event specs, JSON schema validation, precedence over
   on-chain Wasm specs, and cache invalidation behavior.
@@ -97,6 +99,9 @@ for operators and developers.
   when contract ABIs change or parser bugs are fixed.
 - [Local Setup](local-setup.md): Setting up local development dependencies,
   PostgreSQL, and Stellar RPC testnet environments.
+- [onboarding.md](onboarding.md): End-to-end guide for new contributors —
+  environment setup, test tiers, issue assignment, review conventions, and common
+  first-PR mistakes with their CI failures.
 
 ## Operations and Runbooks
 

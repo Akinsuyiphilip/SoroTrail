@@ -210,6 +210,22 @@ func (e *Enricher) getSpec(ctx context.Context, contractID string) *ContractSpec
 // collide with a real wasm hash (hex/base64 alphabet has no ':').
 const overrideKeyPrefix = "override:"
 
+// InvalidateContract evicts everything the cache holds for a contract: the
+// spec fetched from the RPC and the user-supplied override. It is called
+// after an override write, delete, or revert, so the next enrichment
+// reflects the change rather than the copy that was cached before it.
+//
+// Without this a stale override would keep decoding events the old way
+// until its TTL (DefaultSpecTTL) expires: the override is authoritative,
+// but the cache still applies its TTL to the entry.
+func (e *Enricher) InvalidateContract(contractID string) {
+	if e == nil || e.cache == nil {
+		return
+	}
+	e.cache.InvalidateContract(contractID)
+	e.cache.InvalidateOverride(contractID)
+}
+
 // getOverride loads the user-supplied spec override for a contract.
 // Returns nil when no override exists (or the stored JSON is invalid —
 // invalid specs are rejected at upload time, so this only guards against
@@ -217,8 +233,11 @@ const overrideKeyPrefix = "override:"
 func (e *Enricher) getOverride(ctx context.Context, contractID string) *ContractSpec {
 	key := overrideKeyPrefix + contractID
 
-	// Fast path: parsed override already in memory (never expires — an
-	// override is authoritative until explicitly replaced or deleted).
+	// Fast path: parsed override already in memory. Overrides are
+	// authoritative until replaced or deleted, but the cache still applies
+	// its TTL to this entry (see Cache.get), so a stale copy can only
+	// survive until DefaultSpecTTL unless InvalidateContract evicts it
+	// sooner. Writes must therefore invalidate the cache entry.
 	if s := e.cache.Get(key); s != nil {
 		return s
 	}

@@ -2,6 +2,7 @@ package decode
 
 import (
 	"encoding/json"
+	"math"
 	"math/big"
 	"strings"
 	"testing"
@@ -435,6 +436,37 @@ func TestUint128String(t *testing.T) {
 	}
 }
 
+// TestInt128String pins the decimal rendering of 128-bit signed Soroban
+// integers. The hi/lo words are two's complement, and JSON numbers cannot
+// carry the full range without loss, so token balances rely on this string
+// form being exact at every boundary — including values past the 2^53 that
+// a float64 JSON number would silently round, and the negative extremes
+// where the sign handling matters.
+func TestInt128String(t *testing.T) {
+	tests := []struct {
+		name string
+		hi   int64
+		lo   uint64
+		want string
+	}{
+		{"zero renders as 0", 0, 0, "0"},
+		{"small positive value", 0, 12345, "12345"},
+		{"small negative value is two's complement", -1, 0xFFFFFFFFFFFFFFFF, "-1"},
+		{"value above 2^53 stays exact", 0, 9007199254740993, "9007199254740993"},
+		// -2^64: the sign lives in the high word alone, the low word is zero.
+		{"value just below zero across words", -1, 0, "-18446744073709551616"},
+		{"maximum i128 renders without truncation", math.MaxInt64, math.MaxUint64, "170141183460469231731687303715884105727"},
+		{"minimum i128 renders with its sign", math.MinInt64, 0, "-170141183460469231731687303715884105728"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := int128String(xdr.Int128Parts{Hi: xdr.Int64(tt.hi), Lo: xdr.Uint64(tt.lo)})
+			assert.Equal(t, tt.want, got, "decimal rendering")
+		})
+	}
+}
+
 // Table test for the 256-bit unsigned renderer (issue #772).
 func TestUint256String(t *testing.T) {
 	const maxWord = ^uint64(0)
@@ -497,5 +529,87 @@ func TestUint256String(t *testing.T) {
 		require.True(t, ok, "uint256String = %q is not decimal", got)
 		assert.Equal(t, want, parsed)
 		assert.False(t, strings.HasPrefix(got, "-"))
+	})
+}
+
+// Table test for the 256-bit signed renderer (issue #627).
+func TestInt256String(t *testing.T) {
+	const maxWord = ^uint64(0)
+
+	cases := []struct {
+		name  string
+		parts xdr.Int256Parts
+		want  string
+	}{
+		{
+			name:  "zero renders as 0",
+			parts: xdr.Int256Parts{},
+			want:  "0",
+		},
+		{
+			name:  "value in the lowest word",
+			parts: xdr.Int256Parts{LoLo: 7},
+			want:  "7",
+		},
+		{
+			// 2^255-1: the largest value the two's-complement
+			// representation can hold, so any truncation or sign
+			// mishandling shows up here first.
+			name: "maximum positive 256-bit value renders without truncation",
+			parts: xdr.Int256Parts{
+				HiHi: xdr.Int64(maxWord >> 1),
+				HiLo: xdr.Uint64(maxWord),
+				LoHi: xdr.Uint64(maxWord),
+				LoLo: xdr.Uint64(maxWord),
+			},
+			want: "57896044618658097711785492504343953926634992332820282019728792003956564819967",
+		},
+		{
+			// -2^255: only the high bit is set, and the result must
+			// keep its minus sign so consumers don't see it as a huge
+			// unsigned balance.
+			name:  "minimum negative 256-bit value renders with its sign",
+			parts: xdr.Int256Parts{HiHi: -1 << 63},
+			want:  "-57896044618658097711785492504343953926634992332820282019728792003956564819968",
+		},
+		{
+			// All four words set is -1 in two's complement, which
+			// exercises sign extension together with every low word.
+			name: "every bit set renders as minus one",
+			parts: xdr.Int256Parts{
+				HiHi: -1,
+				HiLo: xdr.Uint64(maxWord),
+				LoHi: xdr.Uint64(maxWord),
+				LoLo: xdr.Uint64(maxWord),
+			},
+			want: "-1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := int256String(tc.parts)
+			assert.Equal(t, tc.want, got, "decimal rendering")
+		})
+	}
+
+	t.Run("mid-range value round-trips through big.Int", func(t *testing.T) {
+		parts := xdr.Int256Parts{
+			HiHi: 0x0102030405060708,
+			HiLo: 0x090a0b0c0d0e0f10,
+			LoHi: 0x1112131415161718,
+			LoLo: 0x191a1b1c1d1e1f20,
+		}
+		// Reading the four words as one big-endian hex string is an
+		// independent restatement of what the renderer must produce,
+		// rather than a copy of its shift-and-or loop.
+		want, ok := new(big.Int).SetString(
+			"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20", 16)
+		require.True(t, ok)
+
+		got := int256String(parts)
+		parsed, ok := new(big.Int).SetString(got, 10)
+		require.True(t, ok, "int256String = %q is not decimal", got)
+		assert.Equal(t, want, parsed)
+		assert.False(t, strings.HasPrefix(got, "-"), "positive mid-range value must not carry a sign")
 	})
 }

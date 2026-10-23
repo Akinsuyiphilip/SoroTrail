@@ -13,7 +13,10 @@
 //
 // The tests skip when the helm binary is unavailable, so `go test ./...`
 // stays green on machines without Helm; CI's runner ships Helm and runs
-// them for real.
+// them for real. The skip is never silent: it prints a notice naming what
+// did not run and how to get Helm (see internal/testskip), and the make
+// targets print the same notice before the suite starts, because Go
+// discards the output of a package that passes.
 package sorotrail_test
 
 import (
@@ -21,12 +24,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
+
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/testskip"
 )
 
 var update = flag.Bool("update", false, "regenerate golden files instead of comparing")
@@ -39,12 +48,14 @@ func chartDir() string {
 }
 
 // helmPath returns the helm binary, skipping the test when it is not
-// installed.
+// installed. The skip is reported through the shared convention, so the
+// notice a contributor reads here is the same one the make targets print.
 func helmPath(t *testing.T) string {
 	t.Helper()
+	testskip.Skip(t, testskip.Helm)
 	p, err := exec.LookPath("helm")
 	if err != nil {
-		t.Skip("helm not installed; install Helm (https://helm.sh) to run the chart golden tests")
+		t.Fatalf("helm was found by the presence check but not by LookPath: %v", err)
 	}
 	return p
 }
@@ -184,6 +195,100 @@ func TestRender_ManifestInvariants(t *testing.T) {
 		assert.Contains(t, sm, "interval: 15s", "ServiceMonitor must carry the configured interval")
 	})
 
+}
+
+// TestRender_ConfigValuesReachThePod is the config-variable guard, and the
+// test contributors trip over: a value under the chart's `config:` block
+// that never reaches the pod is a setting an operator can change without
+// any effect.
+//
+// Helm does not catch this on its own. An unused value is accepted by the
+// schema, rendered into nothing, and the chart's own golden files only
+// change if the template changed — so the value can sit there unwired
+// while every test stays green.
+//
+// The check runs in both directions:
+//
+//   - every `config.*` value in values.yaml is referenced by the ConfigMap
+//     template, so a value that is added but not wired fails here;
+//   - every environment variable the template renders is one the
+//     application actually reads, so a value wired to the wrong variable
+//     name fails here too.
+//
+// The template is read rather than the rendered manifest because several
+// values are rendered only when they are set: the default render omits
+// them, so a check against the default output would never see them.
+func TestRender_ConfigValuesReachThePod(t *testing.T) {
+	helmPath(t) // the guard needs the chart's own schema to be renderable
+
+	template := readChartFile(t, "templates", "configmap.yaml")
+	values := readChartFile(t, "values.yaml")
+
+	var valuesDoc struct {
+		Config map[string]any `yaml:"config"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(values), &valuesDoc),
+		"values.yaml must be readable so the config block can be checked")
+	require.NotEmpty(t, valuesDoc.Config, "values.yaml must declare a config block")
+
+	t.Run("every config value is wired into the ConfigMap", func(t *testing.T) {
+		for key := range valuesDoc.Config {
+			assert.Contains(t, template, ".Values.config."+key,
+				"the chart's config.%s value is never wired into the ConfigMap, so setting it does nothing", key)
+		}
+	})
+
+	t.Run("every rendered variable is one the application reads", func(t *testing.T) {
+		known := applicationEnvVars(t)
+		for _, name := range configMapEnvVars(template) {
+			assert.Contains(t, known, name,
+				"the ConfigMap renders %s, which the application does not read", name)
+		}
+	})
+}
+
+// applicationEnvVars returns the environment variables the application
+// reads, taken from the struct tags of internal/config — the single place
+// the application's configuration is declared.
+func applicationEnvVars(t *testing.T) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	typ := reflect.TypeOf(config.Config{})
+	for i := 0; i < typ.NumField(); i++ {
+		if name := typ.Field(i).Tag.Get("env"); name != "" {
+			out[name] = true
+		}
+	}
+	require.NotEmpty(t, out, "the application's configuration must declare environment variables")
+	return out
+}
+
+// configMapEnvVars returns the environment variable names the ConfigMap
+// template renders, in the order they appear.
+func configMapEnvVars(template string) []string {
+	var names []string
+	for _, line := range strings.Split(template, "\n") {
+		match := configMapEnvLine.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+		names = append(names, match[1])
+	}
+	return names
+}
+
+// configMapEnvLine matches the environment variable lines of the ConfigMap
+// template: an indented NAME: value pair whose name is the screaming-snake
+// form the application reads.
+var configMapEnvLine = regexp.MustCompile(`^\s+([A-Z][A-Z0-9_]+):`)
+
+// readChartFile reads a file from the chart directory.
+func readChartFile(t *testing.T, parts ...string) string {
+	t.Helper()
+	path := filepath.Join(append([]string{chartDir()}, parts...)...)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err, "reading %s", path)
+	return string(data)
 }
 
 // manifest extracts the first block for the given Kind from a rendered

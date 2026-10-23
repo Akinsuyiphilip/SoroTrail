@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -72,8 +71,7 @@ type createSubscriptionRequest struct {
 
 func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request) {
 	var req createSubscriptionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
+	if s.decodeJSONBody(w, r, &req) {
 		return
 	}
 	if req.URL == "" {
@@ -181,8 +179,7 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 	}
 
 	var req updateSubscriptionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
+	if s.decodeJSONBody(w, r, &req) {
 		return
 	}
 

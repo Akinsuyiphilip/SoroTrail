@@ -76,3 +76,49 @@ func TestEventsFilterExamples(t *testing.T) {
 		})
 	}
 }
+
+// aggregateSection returns the README text between the aggregate endpoint
+// heading and the next endpoint heading. The section is separate from
+// GET /events, so eventsSection above stays scoped to the filter table.
+func aggregateSection(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("../README.md")
+	require.NoErrorf(t, err, "README.md is missing")
+	doc := string(b)
+
+	start := strings.Index(doc, "### `GET /events/aggregate`")
+	require.GreaterOrEqualf(t, start, 0, "README.md must document GET /events/aggregate")
+	rest := doc[start:]
+	end := strings.Index(rest, "### `GET /contracts`")
+	require.GreaterOrEqualf(t, end, 0, "the aggregate section must be followed by GET /contracts")
+	return rest[:end]
+}
+
+// TestAggregateEndpointDocumented keeps the aggregate endpoint discoverable
+// from the README: both bucket modes need a copy-paste request, the response
+// envelope must be visible, and the limits the endpoint actually enforces
+// (required bucket, ignored pagination, no range cap) must stay stated.
+func TestAggregateEndpointDocumented(t *testing.T) {
+	section := aggregateSection(t)
+
+	assert.Regexp(t, regexp.MustCompile(`curl[^\n]*[?&]bucket=ledger`), section,
+		"README.md must show a ledger-bucket example")
+	assert.Regexp(t, regexp.MustCompile(`curl[^\n]*[?&]bucket=24h`), section,
+		"README.md must show a time-bucket example")
+	assert.Regexp(t, regexp.MustCompile(`"buckets"\s*:`), section,
+		"README.md must show the response envelope")
+
+	for _, want := range []string{
+		"`bucket`",
+		"Required.",
+		"ignored",
+		"no server-side cap",
+		"no pagination",
+		"whole seconds",
+		"from_ledger",
+		"from_time",
+		"24h",
+	} {
+		assert.Contains(t, section, want, "aggregate docs must state %q", want)
+	}
+}
