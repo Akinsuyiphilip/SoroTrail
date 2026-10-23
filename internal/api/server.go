@@ -300,7 +300,7 @@ func (s *Server) SetStatsTTL(ttl time.Duration) {
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New()}
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New(), enableMetrics: true}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -490,7 +490,7 @@ func (s *Server) router() chi.Router {
 	// Always registered so the documented surface is stable; a nil
 	// collector (hand-built Server) answers 503 rather than 404.
 	r.Get("/metrics", func(w http.ResponseWriter, req *http.Request) {
-		if s.metrics == nil {
+		if !s.enableMetrics || s.metrics == nil {
 			writeError(w, http.StatusServiceUnavailable, errors.New("metrics not enabled"))
 			return
 		}
