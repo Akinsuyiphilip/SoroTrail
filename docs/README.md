@@ -32,6 +32,8 @@ full details.
 - [indexes.md](indexes.md) — explanations of composite indexes and query plans.
 - [logging.md](logging.md) — structured logging conventions and tracing configuration.
 - [metrics.md](metrics.md) — exported Prometheus metrics and alerting rules.
+- [rate-limits.md](rate-limits.md) — token bucket, fixed hourly/daily quotas,
+  per-tenant overrides, response headers, and multi-replica caveats.
 - [spec-overrides.md](spec-overrides.md) — uploading, inspecting, and deleting
   user-supplied contract event specs, JSON schema validation, precedence over
   on-chain Wasm specs, and cache invalidation behavior.
