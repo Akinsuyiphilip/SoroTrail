@@ -266,8 +266,8 @@ func (c *Cache) Set(ctx context.Context, spec *ContractSpec) error {
 
 // Put stores a spec in the in-memory cache only (no db persistence, no
 // fetch counter). Used for user-supplied spec overrides, which live in
-// their own store table and are authoritative until replaced or deleted —
-// so they bypass the TTL expiry by being re-checked on the next miss.
+// their own store table. The entry is still subject to the cache TTL (see
+// get); invalidation is what makes a replacement visible immediately.
 func (c *Cache) Put(key string, spec *ContractSpec) {
 	c.mu.Lock()
 	c.mem[key] = &entry{spec: spec, cachedAt: c.now()}
@@ -304,9 +304,10 @@ func (c *Cache) InvalidateContract(contractID string) {
 // and an override are different things and a write to one says nothing about
 // the other.
 //
-// The override never expires on its own — it is authoritative until it is
-// replaced or deleted — so this is the only way a stale override leaves the
-// cache.
+// Overrides are authoritative until they are replaced or deleted, but the
+// cache still applies its TTL to this entry (see get), so this is not the
+// only way a stale override leaves the cache; it is, however, the way a
+// write makes the change visible immediately.
 func (c *Cache) InvalidateOverride(contractID string) {
 	c.mu.Lock()
 	_, ok := c.mem[overrideKeyPrefix+contractID]
