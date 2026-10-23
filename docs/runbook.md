@@ -21,6 +21,7 @@ database, API and replay errors by their text.
 - [Database connection exhaustion](#database-connection-exhaustion)
 - [RPC rate limiting / 429 errors](#rpc-rate-limiting--429-errors)
 - [Gap in ingested data (retention window missed)](#gap-in-ingested-data-retention-window-missed)
+- [Bulk event deletion (`DELETE /events`)](#bulk-event-deletion-delete-events)
 - [Backup and restore](#backup-and-restore)
 - [Useful queries](#useful-queries)
 - [Configuration reference](#configuration-reference)
@@ -446,6 +447,223 @@ to error.
   restore it, but the events in the gap are only available from the RPC
   while the RPC still retains them. Once the retention window passes, they
   are gone.
+
+---
+
+## Bulk event deletion (`DELETE /events`)
+
+`DELETE /events` is the manual, admin-only bulk delete. It is the only API
+surface that removes stored events outside the retention pruner, and it
+deliberately does not inherit the pruner's safeguards. Use it for a one-off
+correction, not as a retention policy: the pruner is batched, scheduled,
+bounded by `last_ingested_ledger`, optionally archived, and reports metrics.
+
+### What it deletes
+
+`DELETE /events?before_ledger=N` runs one SQL statement:
+
+```sql
+DELETE FROM events WHERE ledger < N;
+```
+
+Consequences:
+
+- The bound is **exclusive**: ledger `N-1` is deleted, ledger `N` is kept.
+- The delete is **instance-wide**. The statement has no `network` predicate,
+  so it removes the range on every network stored in the database, not only
+  the server's configured `NETWORK`.
+- It is **one unbatched statement**, with no `LIMIT`, no dry run, and no
+  `last_ingested_ledger` guard. A bound above the chain head deletes every
+  stored event. A large range can hold locks and grow WAL for a long time.
+- It removes only rows from `events`. On Postgres, `event_addresses` has no
+  foreign key to `events`, so those index rows survive; address endpoints
+  join `events`, so they will not return the deleted events, but the index
+  entries are not reclaimed here. `token_balances`, `contract_meta`,
+  `archive_chunks`, subscriptions, and delivery history are also untouched.
+- It does not reset `ingestion_state`, `contract_cursors`, `backfill_state`,
+  or `audit_state`.
+
+### Authentication, parameters and response
+
+The route is gated by the static `API_KEY`, not by the tenant API-key
+system. `X-API-Key` must match `API_KEY` byte-for-byte; an
+`Authorization: Bearer ...` key minted by `/apikeys` is not accepted here.
+When `API_KEY` is unset the endpoint is closed and every request gets `503`
+rather than running unauthenticated.
+
+| Input / outcome | Behaviour |
+| --- | --- |
+| `before_ledger` | Required. Positive integer. Exclusive: `ledger < before_ledger`. There is no maximum, so validate it before sending. |
+| success | `200 {"deleted": N}`. `N` is the number of rows the statement removed; an empty range returns `0`. `Cache-Control: no-store`. |
+| missing or invalid `before_ledger` | `400` with the parse error. |
+| missing or wrong key | `401 invalid or missing X-API-Key header`. |
+| no `API_KEY` configured | `503 API_KEY env var must be set ...`. |
+| store failure | `500 deleting events failed`. |
+
+On ClickHouse the delete is an asynchronous `ALTER TABLE ... DELETE`
+mutation; the response count is a snapshot taken before the mutation, so
+rows can remain visible briefly. Postgres and SQLite delete synchronously.
+
+```sh
+curl -sS -X DELETE \
+  -H "X-API-Key: $API_KEY" \
+  "$SOROTRAIL_URL/events?before_ledger=250000"
+```
+
+### What it cannot undo
+
+**There is no undo.** The endpoint returns only a count, not the deleted
+IDs, and it does not write a backup. Recovery is limited to what still
+exists in the RPC, the archive, or your own export.
+
+- **RPC retention.** Stellar RPC serves only the most recent
+  `ledgerRetentionWindow` ledgers (roughly 24h-7d). Check the live window
+  with:
+
+  ```sh
+  curl -sS -X POST "$RPC_URL" \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
+    | jq '{oldestLedger: .result.oldestLedger, latestLedger: .result.latestLedger, ledgerRetentionWindow: .result.ledgerRetentionWindow}'
+  ```
+
+  If `before_ledger - 1 < oldestLedger`, part or all of the range is
+  already outside the RPC's retention window. Those rows cannot be
+  re-ingested; export them before deleting.
+
+- **Archive.** The endpoint never archives. The pruner's archive path is
+  separate: with `ARCHIVE_BUCKET` and `ARCHIVE_BEFORE_PRUNE=true`, the
+  pruner writes the range to `<prefix>/events/schema=1/ledger_start=.../`
+  as `data.ndjson.gz` plus `manifest.json` before deleting it. The bulk
+  endpoint bypasses that path, so a range can be deleted without ever being
+  archived.
+
+  Check the bucket, not `archive_chunks`: the current archiver writes
+  objects but does not populate the `archive_chunks` table (see the status
+  note in [archival.md](archival.md)). A manifest whose `chunk.ledger_end`
+  is greater than `before_ledger` covers the range. Archived objects are
+  never removed by this endpoint.
+
+- **Audit.** The auditor is forward-only. It verifies from
+  `verified_through_ledger + 1` toward the ingest frontier and never
+  revisits a lower ledger. Therefore:
+
+  - A delete at or below `verified_through_ledger` is invisible to the
+    auditor and stays deleted.
+  - A delete above the high-water mark, while the RPC still retains the
+    range, looks like missing data: the auditor opens a finding and
+    re-ingests the range, restoring exactly the events just deleted.
+  - Once the range has aged out of the RPC, the auditor cannot restore it;
+    findings in that range can end up `unverifiable` or `unrecoverable`.
+
+  If you need a deletion above `verified_through_ledger` to stick, keep the
+  auditor disabled for the operation; re-enabling it with the old
+  high-water mark will trigger a repair. The simplest safe rule is to
+  delete only at or below the high-water mark. When `AUDIT_ENABLED=false`,
+  `verified_through_ledger` stays `0`, so there is no auditor to undo the
+  delete and this check does not apply.
+
+- **Backfill.** `backfill_state` and `contract_cursors` are untouched. A
+  backfill that is still running resumes from
+  `backfill_state.last_ledger + 1` and will re-insert any deleted ledgers
+  above that point as it advances. A completed backfill will not replay
+  them. Deleting rows does not reset either cursor.
+
+- **Live subscribers.** Neither the WebSocket stream nor webhook
+  subscriptions receive a delete or tombstone event. They only see newly
+  ingested events at delivery time, and neither has server-side replay;
+  clients implement the catch-up pattern by querying `/events`, which also
+  stops returning the deleted rows. A delivery already queued in memory may
+  still arrive after the delete, and historical `delivery_attempts` rows
+  remain.
+
+- **HTTP caches.** `GET /events/{id}` is served with
+  `Cache-Control: public, max-age=31536000, immutable`. A CDN or browser
+  that cached a deleted event can keep serving it for up to a year even
+  though the API now returns `404`. Purge the CDN/proxy cache after the
+  delete if the event must disappear immediately.
+
+### Safe procedure
+
+1. **Pick the bound and record the current state.**
+
+   ```sh
+   BOUND=250000
+
+   psql "$DATABASE_URL" <<SQL
+   SELECT count(*) AS events_below_bound FROM events WHERE ledger < $BOUND;
+   SELECT coalesce(max(last_ingested_ledger), 0) AS last_ingested
+     FROM ingestion_state;
+   SELECT network, verified_through_ledger FROM audit_state ORDER BY network;
+   SELECT contract_id, from_ledger, to_ledger, last_ledger, completed_at
+     FROM backfill_state;
+   SQL
+   ```
+
+   If `events_below_bound` is `0`, there is nothing to delete. If a
+   backfill is not complete and `last_ledger < BOUND - 1`, it can restore
+   part of the range; stop it first or account for that.
+
+2. **Confirm the RPC and archive cannot cover the range.** Run the
+   `getHealth` check above. If `BOUND - 1 < oldestLedger` and no archive
+   manifest covers the range, this delete is permanent. Export first.
+
+3. **Export the exact range and verify the export.**
+
+   ```sh
+   curl -sG "$SOROTRAIL_URL/events" \
+     --data-urlencode "stream=true" \
+     --data-urlencode "include_xdr=true" \
+     --data-urlencode "from_ledger=1" \
+     --data-urlencode "to_ledger=$((BOUND - 1))" \
+     -o "events-before-$BOUND.ndjson"
+
+   EXPECTED=$(curl -sG "$SOROTRAIL_URL/events/count" \
+     --data-urlencode "to_ledger=$((BOUND - 1))" | jq -r .count)
+   test "$(wc -l < "events-before-$BOUND.ndjson")" -eq "$EXPECTED"
+   sha256sum "events-before-$BOUND.ndjson"
+   ```
+
+   `include_xdr=true` keeps the raw topic/value XDR needed by
+   `sorotrail replay`; without it the export is only the decoded JSON.
+   Store the file somewhere durable before continuing. `/events` is
+   streamed, so it has no page limit, but the whole range must fit on disk
+   and the request lasts as long as the scan.
+
+4. **Make the delete auditable.** Only proceed when
+   `BOUND - 1 <= verified_through_ledger` for every network you are
+   deleting from. If that is not true, either wait for the auditor to
+   verify through the range or keep the auditor disabled for the whole
+   operation (see above).
+
+5. **Delete.**
+
+   ```sh
+   curl -sS -X DELETE \
+     -H "X-API-Key: $API_KEY" \
+     "$SOROTRAIL_URL/events?before_ledger=$BOUND" \
+     | tee "delete-$BOUND.json"
+   ```
+
+6. **Verify the range is gone and nothing was re-ingested.**
+
+   ```sh
+   curl -sG "$SOROTRAIL_URL/events/count" \
+     --data-urlencode "to_ledger=$((BOUND - 1))"
+   # {"count":0}
+
+   curl -s "$SOROTRAIL_URL/stats" \
+     | jq '{total_events, oldest_stored_ledger, verified_through_ledger, last_ingested_ledger}'
+   ```
+
+   The count must be `0`. `oldest_stored_ledger` should move forward (or
+   become `0` if the table is empty). Check `audit_findings` for a new
+   finding over the range; if one appears, the auditor is re-fetching it.
+   Then purge any CDN or browser cache for the deleted event URLs.
+
+7. **Keep the export.** The NDJSON file and its checksum are the only
+   recovery path once the RPC has aged out the range; keep them for at
+   least as long as the deleted data matters.
 
 ---
 
