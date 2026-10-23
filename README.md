@@ -2173,6 +2173,26 @@ be defined with a foreign key to `events(id)` and `ON DELETE CASCADE`. The
 pruner therefore deletes only from `events` and lets Postgres cascade the
 dependent rows; today's single-table DELETE is correct because no such
 table exists yet, and the contract is “derived tables ride along”.
+
+### Bulk event deletion
+
+The pruner is the routine path. For a one-off correction there is also an
+admin-only `DELETE /events?before_ledger=<ledger>` endpoint. It deletes
+every stored event with `ledger < before_ledger` in one unbatched
+statement, across every network, with no archive step and no
+`last_ingested_ledger` guard. It is not reversible; unlike the pruner it
+does not respect retention configuration, and it can race the auditor
+(which may re-ingest the range while the RPC still has it).
+
+| Method | Path | Authentication | Description |
+| --- | --- | --- | --- |
+| `DELETE` | `/events` | `X-API-Key: $API_KEY` | Deletes all events with `ledger < before_ledger` across all networks. Returns `{"deleted": N}`. |
+
+Use the [bulk event deletion runbook](docs/runbook.md#bulk-event-deletion-delete-events)
+before calling it: it covers the required export, the RPC retention check,
+archive coverage, auditor and backfill interaction, and post-delete
+verification.
+
 ## Contract metadata enrichment
 
 SoroTrail runs a background worker that enriches contracts with
