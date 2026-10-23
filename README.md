@@ -391,8 +391,12 @@ once. A single process still ingests one network — the one named by
 | `RATE_LIMIT_RPS` | float | `0` (disabled) | Per-client HTTP request rate limit (`requests/second`). Must be set together with `RATE_LIMIT_BURST`; setting only one fails startup. | restart |
 | `RATE_LIMIT_BURST` | int | `0` (disabled) | Maximum instantaneous burst size for the rate limiter. Pairs with `RATE_LIMIT_RPS`. | restart |
 | `RATE_LIMIT_TRUSTED_PROXY` | bool | `false` | Honor `X-Forwarded-For` for client IP detection. Only enable behind a trusted proxy that strips/rewrites the header. | restart |
-| `HOURLY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 1-hour window. `0` disables the quota. | restart |
-| `DAILY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a rolling 24-hour window. `0` disables the quota. | restart |
+| `HOURLY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a fixed 1-hour window that starts at the client's first request. `0` disables the quota. See [Rate limits and quotas](docs/rate-limits.md). | restart |
+| `DAILY_QUOTA` | int64 | `0` (disabled) | Maximum requests a single client may issue in a fixed 24-hour window that starts at the client's first request. `0` disables the quota. See [Rate limits and quotas](docs/rate-limits.md). | restart |
+
+See [Rate limits and quotas](docs/rate-limits.md) for the evaluation order,
+client-key derivation, response headers, per-tenant overrides, and the
+multi-replica caveat.
 
 ### Audit
 
@@ -2169,6 +2173,26 @@ be defined with a foreign key to `events(id)` and `ON DELETE CASCADE`. The
 pruner therefore deletes only from `events` and lets Postgres cascade the
 dependent rows; today's single-table DELETE is correct because no such
 table exists yet, and the contract is “derived tables ride along”.
+
+### Bulk event deletion
+
+The pruner is the routine path. For a one-off correction there is also an
+admin-only `DELETE /events?before_ledger=<ledger>` endpoint. It deletes
+every stored event with `ledger < before_ledger` in one unbatched
+statement, across every network, with no archive step and no
+`last_ingested_ledger` guard. It is not reversible; unlike the pruner it
+does not respect retention configuration, and it can race the auditor
+(which may re-ingest the range while the RPC still has it).
+
+| Method | Path | Authentication | Description |
+| --- | --- | --- | --- |
+| `DELETE` | `/events` | `X-API-Key: $API_KEY` | Deletes all events with `ledger < before_ledger` across all networks. Returns `{"deleted": N}`. |
+
+Use the [bulk event deletion runbook](docs/runbook.md#bulk-event-deletion-delete-events)
+before calling it: it covers the required export, the RPC retention check,
+archive coverage, auditor and backfill interaction, and post-delete
+verification.
+
 ## Contract metadata enrichment
 
 SoroTrail runs a background worker that enriches contracts with
