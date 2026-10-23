@@ -326,16 +326,27 @@ func (s *Server) specOverrideKeyPrefix() string {
 
 // invalidateSpecContract evicts the contract's cached spec and override after
 // a write. The enricher is optional — a server without one has no cache to
-// invalidate — so the invalidation is a no-op in that case.
+// invalidate — so that path is skipped in that case. The cache wired through
+// SetSpecCache is invalidated the same way, so a deployment that supplies the
+// cache without an enricher still drops the stale entry.
 func (s *Server) invalidateSpecContract(contractID string) {
-	if s.enricher == nil {
-		return
+	if s.enricher != nil {
+		if inv, ok := s.enricher.(SpecOverrideInvalidator); ok {
+			inv.InvalidateContract(contractID)
+		}
 	}
-	inv, ok := s.enricher.(SpecOverrideInvalidator)
-	if !ok {
-		return
+	// SetSpecCache wires the cache as a SpecCacheStatsSource; invalidate
+	// through it when it also implements the cache's invalidation methods.
+	if sc := getSpecCache(); sc != nil {
+		type cacheInvalidator interface {
+			InvalidateContract(string)
+			InvalidateOverride(string)
+		}
+		if inv, ok := sc.(cacheInvalidator); ok {
+			inv.InvalidateContract(contractID)
+			inv.InvalidateOverride(contractID)
+		}
 	}
-	inv.InvalidateContract(contractID)
 }
 
 // SpecOverrideInvalidator evicts a contract's cached spec and override.

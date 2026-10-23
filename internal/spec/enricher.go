@@ -215,9 +215,9 @@ const overrideKeyPrefix = "override:"
 // after an override write, delete, or revert, so the next enrichment
 // reflects the change rather than the copy that was cached before it.
 //
-// Without this a stale override would keep decoding events the old way for
-// as long as the process lives: the override cache entry never expires on
-// its own, because an override is authoritative until it is replaced.
+// Without this a stale override would keep decoding events the old way
+// until its TTL (DefaultSpecTTL) expires: the override is authoritative,
+// but the cache still applies its TTL to the entry.
 func (e *Enricher) InvalidateContract(contractID string) {
 	if e == nil || e.cache == nil {
 		return
@@ -233,8 +233,11 @@ func (e *Enricher) InvalidateContract(contractID string) {
 func (e *Enricher) getOverride(ctx context.Context, contractID string) *ContractSpec {
 	key := overrideKeyPrefix + contractID
 
-	// Fast path: parsed override already in memory (never expires — an
-	// override is authoritative until explicitly replaced or deleted).
+	// Fast path: parsed override already in memory. Overrides are
+	// authoritative until replaced or deleted, but the cache still applies
+	// its TTL to this entry (see Cache.get), so a stale copy can only
+	// survive until DefaultSpecTTL unless InvalidateContract evicts it
+	// sooner. Writes must therefore invalidate the cache entry.
 	if s := e.cache.Get(key); s != nil {
 		return s
 	}
