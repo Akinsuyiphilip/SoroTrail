@@ -347,6 +347,26 @@ type ContractCursor struct {
 	UpdatedAt time.Time
 }
 
+// ContractSpecOverrideVersion is one entry in a contract's spec-override
+// history. It records what the override was, which key changed it, and when.
+//
+// A tombstone entry (Spec == nil) means the override was deleted rather than
+// replaced: the history keeps the fact that a delete happened, which is what
+// makes "the override disappeared" answerable.
+type ContractSpecOverrideVersion struct {
+	// ID is the monotonic version number. It is the pagination cursor.
+	ID int64 `json:"id"`
+	// ContractID is the contract whose override changed.
+	ContractID string `json:"contract_id"`
+	// Spec is the override document that was in force. Nil for a tombstone.
+	Spec json.RawMessage `json:"spec,omitempty"`
+	// APIKeyPrefix identifies the key that made the change. It is the
+	// public routing prefix of the key, never the secret.
+	APIKeyPrefix string `json:"api_key_prefix"`
+	// CreatedAt is when the change was recorded.
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // AuditState tracks how far the background auditor has verified stored
 // ranges against the RPC for one network.
 type AuditState struct {
@@ -430,6 +450,9 @@ type ContractsFilter struct {
 	Order            string // "asc" | "desc"; "" defaults to "asc" for contract_id and "desc" otherwise
 	Cursor           string
 	Limit            int
+	// Scope restricts the listing and count to contracts the caller is
+	// granted. Like EventFilter.Scope, a zero Scope denies all.
+	Scope Scope
 }
 
 // SortKey constants for ContractsFilter.SortKey. The zero value
@@ -958,6 +981,10 @@ type Store interface {
 	// Removal is implicit per network — an entry disappears from the
 	// union when the last row naming it on that network is gone.
 	ListWatchedContracts(ctx context.Context) ([]WatchedContract, error)
+	// ListWatchedContractsScoped returns the watched contracts restricted to
+	// the caller's Scope (used by the GraphQL contracts query so a tenant
+	// cannot enumerate another tenant's watched contracts).
+	ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error)
 	AddWatchedContract(ctx context.Context, w WatchedContract) error
 	// RemoveWatchedContract stops future ingestion for the given
 	// contract on the given network by removing its row from
@@ -1045,6 +1072,22 @@ type Store interface {
 	SetContractSpecOverride(ctx context.Context, contractID string, specJSON []byte) error
 	// DeleteContractSpecOverride removes the override. Idempotent.
 	DeleteContractSpecOverride(ctx context.Context, contractID string) error
+
+	// Contract spec override history: an append-only log of every change to
+	// a contract's spec override, so "did someone change the override?" has
+	// an answer. The current-override read path never consults it.
+	//
+	// SetContractSpecOverrideWithHistory upserts the override and appends a
+	// history row in the same transaction, so the recorded history can never
+	// disagree with the stored override.
+	SetContractSpecOverrideWithHistory(ctx context.Context, contractID string, specJSON []byte, apiKeyPrefix string) error
+	// DeleteContractSpecOverrideWithHistory removes the override and appends
+	// a tombstone row (a history entry with no spec) in the same transaction.
+	DeleteContractSpecOverrideWithHistory(ctx context.Context, contractID string, apiKeyPrefix string) error
+	// ListContractSpecOverrideHistory returns a contract's override history
+	// newest first, with cursor pagination over the id column. The cursor is
+	// empty when the page is the last one.
+	ListContractSpecOverrideHistory(ctx context.Context, contractID string, limit int, cursor string) ([]ContractSpecOverrideVersion, string, error)
 
 	// DeleteEventsBeforeLedger deletes all events with a ledger strictly less than
 	// the given ledger number. It returns the number of rows deleted.

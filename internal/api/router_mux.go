@@ -1,0 +1,102 @@
+package api
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+)
+
+// routeMux is a chi.Router that rejects duplicate method/pattern
+// registrations. chi silently replaces the earlier handler, so a duplicated
+// block looks healthy while the first registration (and any middleware on it)
+// is dead. Panicking at construction turns that into an immediate failure
+// instead of a route that only appears to exist.
+//
+// With and Group return routeMux values that share the registration set, so
+// routes mounted inside middleware groups are covered as well. The key is the
+// method plus pattern, which keeps GET /events and DELETE /events distinct.
+type routeMux struct {
+	chi.Router
+	registered map[string]struct{}
+}
+
+func newRouteMux(r chi.Router) *routeMux {
+	return &routeMux{Router: r, registered: make(map[string]struct{})}
+}
+
+func (m *routeMux) add(method, pattern string) {
+	key := method + " " + pattern
+	if _, exists := m.registered[key]; exists {
+		panic(fmt.Sprintf("api: duplicate route registration: %s %s", method, pattern))
+	}
+	m.registered[key] = struct{}{}
+}
+
+func (m *routeMux) register(method, pattern string, handler http.Handler) {
+	m.add(method, pattern)
+	m.Router.Method(method, pattern, handler)
+}
+
+func (m *routeMux) Get(pattern string, handler http.HandlerFunc) {
+	m.register(http.MethodGet, pattern, handler)
+}
+
+func (m *routeMux) Post(pattern string, handler http.HandlerFunc) {
+	m.register(http.MethodPost, pattern, handler)
+}
+
+func (m *routeMux) Put(pattern string, handler http.HandlerFunc) {
+	m.register(http.MethodPut, pattern, handler)
+}
+
+func (m *routeMux) Patch(pattern string, handler http.HandlerFunc) {
+	m.register(http.MethodPatch, pattern, handler)
+}
+
+func (m *routeMux) Delete(pattern string, handler http.HandlerFunc) {
+	m.register(http.MethodDelete, pattern, handler)
+}
+
+func (m *routeMux) Head(pattern string, handler http.HandlerFunc) {
+	m.register(http.MethodHead, pattern, handler)
+}
+
+func (m *routeMux) Options(pattern string, handler http.HandlerFunc) {
+	m.register(http.MethodOptions, pattern, handler)
+}
+
+func (m *routeMux) Connect(pattern string, handler http.HandlerFunc) {
+	m.register(http.MethodConnect, pattern, handler)
+}
+
+func (m *routeMux) Trace(pattern string, handler http.HandlerFunc) {
+	m.register(http.MethodTrace, pattern, handler)
+}
+
+func (m *routeMux) Method(method, pattern string, handler http.Handler) {
+	m.register(method, pattern, handler)
+}
+
+// Handle mounts a handler for every HTTP method. It uses "*" as the
+// registration key because chi expands the registration internally; a second
+// Handle for the same pattern is still rejected.
+func (m *routeMux) Handle(pattern string, handler http.Handler) {
+	m.add("*", pattern)
+	m.Router.Handle(pattern, handler)
+}
+
+func (m *routeMux) With(middlewares ...func(http.Handler) http.Handler) chi.Router {
+	return &routeMux{
+		Router:     m.Router.With(middlewares...),
+		registered: m.registered,
+	}
+}
+
+func (m *routeMux) Group(fn func(r chi.Router)) chi.Router {
+	im := m.With()
+	if fn != nil {
+		fn(im)
+	}
+	return im
+}

@@ -187,6 +187,11 @@ type Server struct {
 
 	httpRequestBodyLimit int64 // max accepted request body size, in bytes
 
+	// specInvalidationPublisher tells the other replicas that a contract's
+	// cached spec must be evicted after a write. Optional: a single-process
+	// deployment has nobody to tell.
+	specInvalidationPublisher SpecInvalidationPublisher
+
 	// GraphQL transport, injected by main after the server is built.
 	// internal/api/graphql imports this package for its ServerDeps, so
 	// the dependency has to run in this direction to avoid an import
@@ -236,6 +241,25 @@ func (s *Server) SetHTTPRequestBodyLimit(n int64) {
 	s.httpRequestBodyLimit = n
 }
 
+// SpecInvalidationPublisher tells the other replicas that a contract's
+// cached spec must be evicted.
+//
+// The spec package declares the same shape, so a cache and an API server
+// can share one implementation without either depending on the other.
+type SpecInvalidationPublisher interface {
+	PublishSpecInvalidation(ctx context.Context, contractID string) error
+}
+
+// SetSpecInvalidationPublisher wires the publisher used after a write that
+// changes what a contract decodes to.
+//
+// Without it the other replicas keep serving the old spec until their own
+// cache expires, so the same request decodes differently depending on which
+// replica served it. A single-process deployment leaves it unset.
+func (s *Server) SetSpecInvalidationPublisher(pub SpecInvalidationPublisher) {
+	s.specInvalidationPublisher = pub
+}
+
 // SetCompressMinSize overrides the body size at which responses are
 // compressed. Pass a negative value to disable compression.
 func (s *Server) SetCompressMinSize(n int) {
@@ -276,7 +300,7 @@ func (s *Server) SetStatsTTL(ttl time.Duration) {
 // apiKey gates the watched-contracts management endpoints; pass "" to
 // fail closed (every request gets a 503 with "API_KEY not configured").
 func New(st store.Store, rpcClient rpc.Client, log *slog.Logger, apiKey string, enricher ...Enricher) *Server {
-	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New()}
+	s := &Server{store: st, rpc: rpcClient, log: log, apiKey: apiKey, recoverer: NewRecoverer(log), metrics: metrics.New(), enableMetrics: true}
 	if len(enricher) > 0 {
 		s.enricher = enricher[0]
 	}
@@ -415,7 +439,7 @@ func (s *Server) Router() http.Handler {
 // as chi.Router (not http.Handler) so tests can walk the route tree with
 // chi.Walk to verify spec coverage.
 func (s *Server) router() chi.Router {
-	r := chi.NewRouter()
+	r := newRouteMux(chi.NewRouter())
 	r.Use(middleware.RequestID)
 	r.Use(s.requestLogger)
 	// Metrics are optional: a hand-built Server (tests, embedded use)
@@ -466,7 +490,7 @@ func (s *Server) router() chi.Router {
 	// Always registered so the documented surface is stable; a nil
 	// collector (hand-built Server) answers 503 rather than 404.
 	r.Get("/metrics", func(w http.ResponseWriter, req *http.Request) {
-		if s.metrics == nil {
+		if !s.enableMetrics || s.metrics == nil {
 			writeError(w, http.StatusServiceUnavailable, errors.New("metrics not enabled"))
 			return
 		}
@@ -480,28 +504,9 @@ func (s *Server) router() chi.Router {
 	r.Get("/openapi.json", s.handleOpenAPI)
 	r.Get("/docs", s.handleDocs)
 
-	r.Get("/events", s.handleListEvents)
-	r.Get("/events/count", s.handleCountEvents)
-	r.Get("/events/aggregate", s.handleAggregateEvents)
-	r.Get("/events/{id}/raw", s.handleGetEventRaw)
-	r.Get("/events/{id}/transaction", s.handleGetEventTransaction)
-	r.Get("/events/{id}", s.handleGetEvent)
-	r.Get("/events.csv", s.handleEventsCSV)
-	r.Get("/contracts", s.handleListContracts)
-	r.Get("/contracts/{id}", s.handleGetContract)
-	r.Get("/contracts/{id}/events", s.handleContractEvents)
-	r.Get("/contracts/{id}/export", s.handleContractExport)
-	r.Get("/contracts/{id}/stats", s.handleContractStats)
-	r.Get("/stats", s.handleStats)
-
 	// Admin bulk delete: auth-gated endpoint to delete events by ledger range.
 	adminMW := apiKeyAuth(s.apiKey)
 	r.With(adminMW).Delete("/events", s.handleDeleteEvents)
-	// contributors: new read endpoints go here. Every one of them must
-	// obtain its scope from filterFromQuery (list-shaped reads) or
-	// scopeFrom (single-object reads) and pass it to the store — see
-	// docs/multi-tenancy.md. Endpoints that skip this return nothing
-	// rather than everything, but "returns nothing" is still a bug.
 	// GraphQL transport — read-only, mounts at /graphql and dev-mode
 	// /graphiql. Built by the graphql package; the API server only
 	// owns the route registration so a misconfigured GraphQL handler
@@ -536,6 +541,11 @@ func (s *Server) router() chi.Router {
 	r.With(watchedMW).Put("/contracts/{id}/spec", s.handlePutContractSpecOverride)
 	r.With(watchedMW).Get("/contracts/{id}/spec", s.handleGetContractSpecOverride)
 	r.With(watchedMW).Delete("/contracts/{id}/spec", s.handleDeleteContractSpecOverride)
+	// The override history answers "did someone change the override?", and
+	// a revert puts a previous version back. Both are management surfaces,
+	// so they sit behind the same key gate as the override itself.
+	r.With(watchedMW).Get("/contracts/{id}/spec/history", s.handleListContractSpecOverrideHistory)
+	r.With(watchedMW).Post("/contracts/{id}/spec/revert", s.handleRevertContractSpecOverride)
 
 	r.With(watchedMW).Get("/dead-letters", s.handleListDeadLetters)
 	r.With(watchedMW).Delete("/dead-letters/{id}", s.handleDeleteDeadLetter)
@@ -568,25 +578,55 @@ func (s *Server) router() chi.Router {
 		r.Delete("/subscriptions/{id}", s.handleDeleteSubscription)
 	})
 
-	// List endpoints: responses can be large (many events, many
-	// subscriptions), so compression is negotiated per request.
-	// Inside a Group so the middleware only touches routes worth
-	// compressing and a panic mid-body can't leave a truncated gzip
-	// stream as the last thing the client sees (Recoverer is above).
+	// Read endpoints. Compression is a deliberate two-way split:
+	//
+	//   - The compressed group below holds responses whose size grows with
+	//     the data: event and contract lists, aggregate buckets, transaction
+	//     siblings, single/raw events, contract stats, subscriptions,
+	//     deliveries, watched contracts and address activity.
+	//   - Bounded responses stay outside: /events/count is one integer,
+	//     /contracts/{id} is one summary row, /stats is a fixed set of
+	//     counters, and /subscriptions/{id} is one subscription. They never
+	//     reach CompressMinSize, so compressing them would only add buffering
+	//     and CPU cost.
+	//   - Streaming exports stay outside too: the CSV header is flushed before
+	//     the first row and NDJSON flushes per page, so a compression decision
+	//     would depend on the export format and page size. Keep them identity
+	//     rather than a format-dependent surprise.
+	//
+	// New read endpoints go in one of these blocks. Every one of them must
+	// obtain its scope from filterFromQuery (list-shaped reads) or scopeFrom
+	// (single-object reads) and pass it to the store — see
+	// docs/multi-tenancy.md. Endpoints that skip this return nothing rather
+	// than everything, but "returns nothing" is still a bug.
+	r.Get("/events/count", s.handleCountEvents)
+	r.Get("/contracts/{id}", s.handleGetContract)
+	r.Get("/stats", s.handleStats)
+	r.With(protect).Get("/subscriptions/{id}", s.handleGetSubscription)
+
+	// Exports stream and flush before the body grows past the threshold.
+	r.Get("/events.csv", s.handleEventsCSV)
+	r.Get("/contracts/{id}/export", s.handleContractExport)
+
+	// Large read responses: compression is negotiated per request. Inside a
+	// Group so the middleware only touches these routes and a panic mid-body
+	// can't leave a truncated gzip stream as the last thing the client sees
+	// (Recoverer is above).
 	r.Group(func(r chi.Router) {
 		if s.compressMinSize >= 0 {
 			r.Use(Compress(s.compressMinSize))
 		}
 		r.Get("/events", s.handleListEvents)
-		r.Get("/events/count", s.handleCountEvents)
+		r.Get("/events/aggregate", s.handleAggregateEvents)
 		r.Get("/events/{id}/raw", s.handleGetEventRaw)
+		r.Get("/events/{id}/transaction", s.handleGetEventTransaction)
 		r.Get("/events/{id}", s.handleGetEvent)
-		r.Get("/contracts/{id}", s.handleGetContract)
+		r.Get("/contracts", s.handleListContracts)
 		r.Get("/contracts/{id}/events", s.handleContractEvents)
-		r.Get("/contracts/{id}/export", s.handleContractExport)
-		r.Get("/events.csv", s.handleEventsCSV)
+		r.Get("/contracts/{id}/stats", s.handleContractStats)
+		r.Get("/addresses/{address}/events", s.handleAddressEvents)
+		r.Get("/addresses/{address}/summary", s.handleAddressSummary)
 		r.With(protect).Get("/subscriptions", s.handleListSubscriptions)
-		r.With(protect).Get("/subscriptions/{id}", s.handleGetSubscription)
 		r.With(protect).Get("/subscriptions/{id}/deliveries", s.handleListDeliveries)
 		r.With(watchedMW).Get("/watched-contracts", s.handleListWatchedChains)
 	})
@@ -620,11 +660,9 @@ func (s *Server) router() chi.Router {
 		r.Delete("/admin/keys/{key_id}", s.handleRevokeTenantKey)
 	})
 
-	// Address activity index (#46).
-	r.Get("/addresses/{address}/events", s.handleAddressEvents)
-	r.Get("/addresses/{address}/summary", s.handleAddressSummary)
-
-	return r
+	// Return the underlying *chi.Mux, not the registration guard: callers
+	// (including pkg/docs route-drift tests) type-assert Router() to *chi.Mux.
+	return r.Router
 }
 
 // handleOpenAPI serves the embedded OpenAPI 3.1 specification.

@@ -440,6 +440,60 @@ func TestRateLimiterRetryAfterIsCeiled(t *testing.T) {
 		"X-RateLimit-Reset must sit one refill period out")
 }
 
+// TestRateLimiterResolvedBucketsArePerKey pins the resolver seam itself.
+// Once a resolver supplies the key, two callers sharing a source address must
+// still get separate budgets — the property per-tenant limits are built on —
+// and the burst the resolver returns, not the instance-wide one, is what gets
+// enforced and advertised.
+func TestRateLimiterResolvedBucketsArePerKey(t *testing.T) {
+	// The header stands in for whatever identity the resolver keys on; the
+	// tenant path uses the principal, which authenticate installs.
+	resolve := func(r *http.Request) (string, float64, int, bool) {
+		key := r.Header.Get("X-Test-Bucket")
+		if key == "" {
+			return "", 0, 0, false
+		}
+		return key, 0.5, 2, true
+	}
+	lim := NewRateLimiter(1, 5, false, WithLimitResolver(resolve))
+
+	send := func(bucket, addr string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := mkReq(http.MethodGet, "/events")
+		req.RemoteAddr = addr
+		if bucket != "" {
+			req.Header.Set("X-Test-Bucket", bucket)
+		}
+		middlewareFor(lim).ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Both keys ride the same source address. Only the resolved key differs;
+	// a bucket chosen by address here would throttle one caller for the
+	// other's spend.
+	const sharedAddr = "203.0.113.72:6000"
+
+	for i := 0; i < 2; i++ {
+		rec := send("tenant:1", sharedAddr)
+		require.Equal(t, http.StatusOK, rec.Code,
+			"request %d within the resolved burst must be admitted", i+1)
+		assert.Equal(t, "2", rec.Header().Get("X-RateLimit-Limit"),
+			"the resolver's burst must be advertised, not the instance-wide burst")
+	}
+	rec := send("tenant:1", sharedAddr)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	assert.NotEmpty(t, rec.Header().Get("Retry-After"))
+
+	assert.Equal(t, http.StatusOK, send("tenant:2", sharedAddr).Code,
+		"a second resolved key must keep its own budget despite sharing an address")
+	assert.Equal(t, 2, lim.Size(), "each resolved key must own exactly one bucket")
+
+	// A caller the resolver declines keeps the instance-wide IP bucket, which
+	// is a third key rather than a share of either resolved one.
+	assert.Equal(t, http.StatusOK, send("", sharedAddr).Code)
+	assert.Equal(t, 3, lim.Size())
+}
+
 // TestRateLimiterDisabledIsPassthrough guards the off-by-default posture: a
 // limiter with no limits configured must not add or reject anything, even
 // though the wiring stays in place.
@@ -452,4 +506,152 @@ func TestRateLimiterDisabledIsPassthrough(t *testing.T) {
 		assert.Equal(t, http.StatusOK, rec.Code, "a disabled limiter must never reject")
 	}
 	assert.Equal(t, 0, lim.Size(), "a disabled limiter must not track buckets")
+	assert.Equal(t, 0, lim.quotaSize(), "a disabled limiter must not track quotas")
+}
+
+// limiterClock moves the limiter's clock forward without sleeping. The
+// token bucket itself still refills on the real clock, so quota tests use a
+// high RPS to keep bucket admission out of the way.
+type limiterClock struct {
+	now time.Time
+}
+
+func (c *limiterClock) Now() time.Time { return c.now }
+
+func (c *limiterClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
+
+func retryAfterSeconds(t *testing.T, rec *httptest.ResponseRecorder) int {
+	t.Helper()
+	raw := rec.Header().Get("Retry-After")
+	require.NotEmpty(t, raw, "a quota rejection must carry Retry-After")
+	secs, err := strconv.Atoi(raw)
+	require.NoError(t, err, "Retry-After must be integer delta-seconds")
+	return secs
+}
+
+// TestRateLimiterDailyQuotaSurvivesIdleBucketEviction is the regression test
+// for quotas resetting when a client pauses: after the daily budget is spent
+// and the idle sweep drops the token bucket, the next request must still be
+// refused until the 24-hour window closes. In particular the sweep itself
+// must not take the quota counters with it.
+func TestRateLimiterDailyQuotaSurvivesIdleBucketEviction(t *testing.T) {
+	const (
+		limit = int64(5)
+		addr  = "203.0.113.81:11000"
+	)
+	clock := &limiterClock{now: time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)}
+	lim := NewRateLimiter(1000, 1000, false,
+		WithDailyQuota(limit),
+		WithIdleTTL(time.Minute),
+		WithClock(clock.Now),
+	)
+
+	// Spend the whole budget, then keep hammering: the quota, not the token
+	// bucket, must be what refuses the excess.
+	for i := int64(0); i < limit; i++ {
+		rec := sendFrom(lim, addr)
+		require.Equal(t, http.StatusOK, rec.Code, "request %d must fit in the daily quota", i+1)
+	}
+	for i := 0; i < 3; i++ {
+		rec := sendFrom(lim, addr)
+		require.Equal(t, http.StatusTooManyRequests, rec.Code,
+			"usage above DAILY_QUOTA must be refused")
+		assert.Equal(t, "0", rec.Header().Get("X-RateLimit-Remaining"))
+		assert.Equal(t, int((24 * time.Hour).Seconds()), retryAfterSeconds(t, rec))
+	}
+	require.Equal(t, 1, lim.quotaSize(), "the quota counters must be tracked")
+
+	// Idle past the bucket TTL. The bucket is reclaimed, but the quota is
+	// still inside its window and has to keep binding.
+	clock.Advance(2 * time.Minute)
+	require.Equal(t, 1, lim.evictIdle(clock.Now()),
+		"the idle token bucket must still be evicted")
+	assert.Equal(t, 0, lim.Size(), "bucket eviction must reclaim the bucket")
+	assert.Equal(t, 1, lim.quotaSize(),
+		"bucket eviction must not discard a live quota window")
+
+	rec := sendFrom(lim, addr)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code,
+		"a client returning inside the same day must still be over quota")
+	assert.Equal(t, int((24*time.Hour - 2*time.Minute).Seconds()), retryAfterSeconds(t, rec),
+		"the retry hint must reflect the remaining daily window")
+	assert.Equal(t, "0", rec.Header().Get("X-RateLimit-Remaining"))
+
+	// Once both the idle bucket and the quota window have expired, the
+	// state is reclaimed and the next request starts a fresh day.
+	clock.Advance(24 * time.Hour)
+	require.Equal(t, 1, lim.evictIdle(clock.Now()),
+		"the bucket recreated by the refused request must also age out")
+	assert.Equal(t, 0, lim.Size())
+	assert.Equal(t, 0, lim.quotaSize(), "an expired quota window must be reclaimed")
+	assert.Equal(t, http.StatusOK, sendFrom(lim, addr).Code,
+		"after the daily window closes the client must be admitted again")
+}
+
+// TestRateLimiterHourlyQuotaSurvivesIdleBucketEviction covers the shorter
+// window too, and proves the retry hint is the time left in that window
+// rather than the idle TTL.
+func TestRateLimiterHourlyQuotaSurvivesIdleBucketEviction(t *testing.T) {
+	const (
+		limit = int64(2)
+		addr  = "203.0.113.82:12000"
+	)
+	clock := &limiterClock{now: time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)}
+	lim := NewRateLimiter(1000, 1000, false,
+		WithHourlyQuota(limit),
+		WithIdleTTL(time.Minute),
+		WithClock(clock.Now),
+	)
+
+	for i := int64(0); i < limit; i++ {
+		require.Equal(t, http.StatusOK, sendFrom(lim, addr).Code)
+	}
+	rec := sendFrom(lim, addr)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	assert.Equal(t, int(time.Hour.Seconds()), retryAfterSeconds(t, rec))
+
+	clock.Advance(2 * time.Minute)
+	require.Equal(t, 1, lim.evictIdle(clock.Now()))
+	assert.Equal(t, 0, lim.Size())
+	assert.Equal(t, 1, lim.quotaSize())
+
+	rec = sendFrom(lim, addr)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code,
+		"the hourly quota must survive idle-bucket eviction")
+	assert.Equal(t, int((time.Hour - 2*time.Minute).Seconds()), retryAfterSeconds(t, rec))
+
+	// Crossing the hour boundary resets the hourly counters even though the
+	// daily quota is disabled and no new state remains to retain.
+	clock.Advance(time.Hour)
+	require.Equal(t, 1, lim.evictIdle(clock.Now()))
+	assert.Equal(t, 0, lim.quotaSize())
+	assert.Equal(t, http.StatusOK, sendFrom(lim, addr).Code)
+}
+
+// TestRateLimiterQuotaCountersSurviveBucketRecreation pins the accounting
+// boundary: a denied request may recreate the client's token bucket, but it
+// must not mint fresh quota counters.
+func TestRateLimiterQuotaCountersSurviveBucketRecreation(t *testing.T) {
+	const addr = "203.0.113.83:13000"
+	clock := &limiterClock{now: time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)}
+	lim := NewRateLimiter(1000, 1000, false,
+		WithDailyQuota(1),
+		WithIdleTTL(time.Minute),
+		WithClock(clock.Now),
+	)
+
+	require.Equal(t, http.StatusOK, sendFrom(lim, addr).Code)
+	clock.Advance(2 * time.Minute)
+	require.Equal(t, 1, lim.evictIdle(clock.Now()))
+	require.Equal(t, 0, lim.Size())
+	require.Equal(t, 1, lim.quotaSize())
+
+	for i := 0; i < 3; i++ {
+		rec := sendFrom(lim, addr)
+		require.Equal(t, http.StatusTooManyRequests, rec.Code,
+			"each refused request must be refused by quota, not by a reset counter")
+	}
+	// The refusals touched the bucket (lastSeen), not the quota counters.
+	assert.Equal(t, int64(1), lim.quotas["203.0.113.83"].dayUsed,
+		"a refused request must not consume quota or reset the window")
 }

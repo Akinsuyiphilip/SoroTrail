@@ -12,98 +12,52 @@
 // (see the TestRenderGolden_* doc comments).
 //
 // The tests skip when the helm binary is unavailable, so `go test ./...`
-// stays green on machines without Helm; CI's helm job installs Helm with
-// azure/setup-helm and lints and templates the chart, but the test job
-// (go test ./...) has no Helm either, so these golden tests only run where a
-// contributor has installed it. That is why the skip has to be loud: without
-// the notice a green run looks like it verified the chart.
+// stays green on machines without Helm; CI's runner ships Helm and runs
+// them for real. The skip is never silent: it prints a notice naming what
+// did not run and how to get Helm (see internal/testskip), and the make
+// targets print the same notice before the suite starts, because Go
+// discards the output of a package that passes.
 package sorotrail_test
 
 import (
 	"flag"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
+
+	"github.com/sorotrail/sorotrail/internal/config"
+	"github.com/sorotrail/sorotrail/internal/testskip"
 )
 
 var update = flag.Bool("update", false, "regenerate golden files instead of comparing")
-
-// requireHelmEnv turns the helm-less skip into a failure. CI sets it in the job
-// that installs Helm, so the chart tests cannot quietly skip there and leave the
-// job green: a missing or shadowed binary fails instead of reporting success for
-// a suite that never rendered the chart. Locally it stays unset, because
-// failing every contributor without Helm would break the suite for them (issue
-// #1074).
-const requireHelmEnv = "REQUIRE_HELM_CHART_TESTS"
-
-// helmInstallHint names where to get the binary. It is quoted verbatim in the
-// skip message, the failure message and the notice so the three cannot drift
-// apart. The version matches the one CI's helm job pins.
-const helmInstallHint = "install Helm v3.15.0 via https://helm.sh/docs/intro/install/"
-
-// TestMain emits the skip notice on stderr. It lands in the output when the
-// package fails and under -v, so a failing run says outright that the chart went
-// unverified instead of leaving the reader to spot three SKIP lines.
-//
-// It cannot reach the default output of a clean `go test ./...`: the go command
-// prints only the final "ok" summary line for a passing package and discards the
-// test binary's output entirely (go help test), stderr included. So the notice a
-// plain run needs is emitted from outside the test binary — `make test`,
-// `make test-fast` and `make test-ci` run scripts/check_helm_chart_tests.sh for
-// exactly that reason (issue #1074).
-func TestMain(m *testing.M) {
-	if notice := helmSkipNotice(); notice != "" {
-		fmt.Fprintln(os.Stderr, notice)
-	}
-	os.Exit(m.Run())
-}
-
-// helmSkipNotice reports, as a single line, that this package's chart tests
-// cannot run because helm is not on PATH. It returns "" when helm is available
-// or when the tests are required, so the caller prints nothing in those cases.
-func helmSkipNotice() string {
-	if _, err := exec.LookPath("helm"); err == nil {
-		return ""
-	}
-	if os.Getenv(requireHelmEnv) != "" {
-		// helmPath fails the tests in this case; the notice would be noise
-		// on top of the failure it already reports.
-		return ""
-	}
-	return fmt.Sprintf("NOTICE: helm is not on PATH, so every test in deploy/helm/sorotrail was SKIPPED and the chart goldens were NOT verified (the same is true of the CI test job, which does not install Helm). To run them, %s. Set %s=1 to turn the skip into a failure.",
-		helmInstallHint, requireHelmEnv)
-}
-
-// helmPath returns the helm binary. Without helm the tests skip, because
-// failing would break the suite for every contributor who does not have it;
-// with requireHelmEnv set the skip becomes a failure so a job that installs
-// Helm can assert the chart tests really ran.
-func helmPath(t *testing.T) string {
-	t.Helper()
-	p, err := exec.LookPath("helm")
-	if err != nil {
-		if os.Getenv(requireHelmEnv) != "" {
-			t.Fatalf("%s is set but helm is not on PATH; %s, or unset %s to skip the chart tests",
-				requireHelmEnv, helmInstallHint, requireHelmEnv)
-		}
-		t.Skipf("helm not installed; %s, or set %s=1 to fail instead of skipping (see CONTRIBUTING.md)",
-			helmInstallHint, requireHelmEnv)
-	}
-	return p
-}
 
 // chartDir resolves the chart directory relative to this test file, so
 // the tests run from any working directory.
 func chartDir() string {
 	_, file, _, _ := runtime.Caller(0)
 	return filepath.Dir(file)
+}
+
+// helmPath returns the helm binary, skipping the test when it is not
+// installed. The skip is reported through the shared convention, so the
+// notice a contributor reads here is the same one the make targets print.
+func helmPath(t *testing.T) string {
+	t.Helper()
+	testskip.Skip(t, testskip.Helm)
+	p, err := exec.LookPath("helm")
+	if err != nil {
+		t.Fatalf("helm was found by the presence check but not by LookPath: %v", err)
+	}
+	return p
 }
 
 // renderChart runs `helm template` with the given extra args and returns
@@ -243,6 +197,100 @@ func TestRender_ManifestInvariants(t *testing.T) {
 
 }
 
+// TestRender_ConfigValuesReachThePod is the config-variable guard, and the
+// test contributors trip over: a value under the chart's `config:` block
+// that never reaches the pod is a setting an operator can change without
+// any effect.
+//
+// Helm does not catch this on its own. An unused value is accepted by the
+// schema, rendered into nothing, and the chart's own golden files only
+// change if the template changed — so the value can sit there unwired
+// while every test stays green.
+//
+// The check runs in both directions:
+//
+//   - every `config.*` value in values.yaml is referenced by the ConfigMap
+//     template, so a value that is added but not wired fails here;
+//   - every environment variable the template renders is one the
+//     application actually reads, so a value wired to the wrong variable
+//     name fails here too.
+//
+// The template is read rather than the rendered manifest because several
+// values are rendered only when they are set: the default render omits
+// them, so a check against the default output would never see them.
+func TestRender_ConfigValuesReachThePod(t *testing.T) {
+	helmPath(t) // the guard needs the chart's own schema to be renderable
+
+	template := readChartFile(t, "templates", "configmap.yaml")
+	values := readChartFile(t, "values.yaml")
+
+	var valuesDoc struct {
+		Config map[string]any `yaml:"config"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(values), &valuesDoc),
+		"values.yaml must be readable so the config block can be checked")
+	require.NotEmpty(t, valuesDoc.Config, "values.yaml must declare a config block")
+
+	t.Run("every config value is wired into the ConfigMap", func(t *testing.T) {
+		for key := range valuesDoc.Config {
+			assert.Contains(t, template, ".Values.config."+key,
+				"the chart's config.%s value is never wired into the ConfigMap, so setting it does nothing", key)
+		}
+	})
+
+	t.Run("every rendered variable is one the application reads", func(t *testing.T) {
+		known := applicationEnvVars(t)
+		for _, name := range configMapEnvVars(template) {
+			assert.Contains(t, known, name,
+				"the ConfigMap renders %s, which the application does not read", name)
+		}
+	})
+}
+
+// applicationEnvVars returns the environment variables the application
+// reads, taken from the struct tags of internal/config — the single place
+// the application's configuration is declared.
+func applicationEnvVars(t *testing.T) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	typ := reflect.TypeOf(config.Config{})
+	for i := 0; i < typ.NumField(); i++ {
+		if name := typ.Field(i).Tag.Get("env"); name != "" {
+			out[name] = true
+		}
+	}
+	require.NotEmpty(t, out, "the application's configuration must declare environment variables")
+	return out
+}
+
+// configMapEnvVars returns the environment variable names the ConfigMap
+// template renders, in the order they appear.
+func configMapEnvVars(template string) []string {
+	var names []string
+	for _, line := range strings.Split(template, "\n") {
+		match := configMapEnvLine.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+		names = append(names, match[1])
+	}
+	return names
+}
+
+// configMapEnvLine matches the environment variable lines of the ConfigMap
+// template: an indented NAME: value pair whose name is the screaming-snake
+// form the application reads.
+var configMapEnvLine = regexp.MustCompile(`^\s+([A-Z][A-Z0-9_]+):`)
+
+// readChartFile reads a file from the chart directory.
+func readChartFile(t *testing.T, parts ...string) string {
+	t.Helper()
+	path := filepath.Join(append([]string{chartDir()}, parts...)...)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err, "reading %s", path)
+	return string(data)
+}
+
 // manifest extracts the first block for the given Kind from a rendered
 // chart output (manifests are separated by "---" lines).
 func manifest(t *testing.T, rendered, kind string) string {
@@ -254,31 +302,4 @@ func manifest(t *testing.T, rendered, kind string) string {
 	}
 	t.Fatalf("rendered output contains no %s manifest", kind)
 	return ""
-}
-
-// TestHelmSkipNotice pins the wording that makes the helm-less skip visible
-// (issue #1074). It guards the copy in three places at once: the skip message,
-// the REQUIRE_HELM_CHART_TESTS failure message, and the notice
-// scripts/check_helm_chart_tests.sh repeats to make the gap visible in the
-// default make output, where the test binary's own output does not survive. A
-// regression here silently restores the "green run looks like chart coverage"
-// problem the notice exists to prevent.
-func TestHelmSkipNotice(t *testing.T) {
-	if _, err := exec.LookPath("helm"); err == nil {
-		t.Skip("helm is installed, so there is no skip notice to assert")
-	}
-
-	// The notice is what the plain, non-verbose run prints, so it must hold
-	// up with the escape hatch unset. t.Setenv also fails the test if it
-	// leaks into the suite's real environment.
-	t.Setenv(requireHelmEnv, "")
-
-	notice := helmSkipNotice()
-	require.NotEmpty(t, notice, "helm is missing, so the package must announce the skip")
-	assert.Contains(t, notice, requireHelmEnv,
-		"the notice must name the variable that turns the skip into a failure")
-	assert.Contains(t, notice, helmInstallHint,
-		"the notice must quote the install hint, so it stays in step with the skip message")
-	assert.NotContains(t, strings.TrimSpace(notice), "\n",
-		"the notice is printed once per run and has to stay a single line")
 }

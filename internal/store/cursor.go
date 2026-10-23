@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/base64"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -79,4 +80,27 @@ func DecodeContractsCursor(cursor string) (sortValue, contractID string, err err
 		err = fmt.Errorf("%w: contracts cursor", ErrInvalidContractsCursor)
 	}
 	return
+}
+
+// EncodeSpecOverrideHistoryCursor keys keyset pagination for the spec-override
+// history over its monotonic version id. The history is walked newest first,
+// so the cursor carries the last id seen and the next page is the rows with
+// a smaller id.
+func EncodeSpecOverrideHistoryCursor(id int64) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(id, 10)))
+}
+
+// DecodeSpecOverrideHistoryCursor is the inverse of
+// EncodeSpecOverrideHistoryCursor. A malformed cursor is client input, so it
+// surfaces as ErrInvalidCursor for the handler to map to 400.
+func DecodeSpecOverrideHistoryCursor(cursor string) (int64, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return 0, fmt.Errorf("%w: spec override history cursor is not valid base64url", ErrInvalidCursor)
+	}
+	id, err := strconv.ParseInt(string(raw), 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("%w: spec override history cursor is not a version id", ErrInvalidCursor)
+	}
+	return id, nil
 }

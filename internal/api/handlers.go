@@ -40,39 +40,86 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
-// maxJSONBodyBytes caps a JSON request body decoded by decodeJSONBody.
-// Every body it serves is a small control-plane object, so anything larger
-// is a client error, not something to buffer.
-const maxJSONBodyBytes = 4 << 10
+// errBodyTooLarge marks an oversized request body so handlers can report
+// 413 instead of 400. readJSONBody wraps it when the body exceeds the
+// configured limit, and decodeJSONBody reports it as 413.
+var errBodyTooLarge = errors.New("request body exceeds the configured limit")
 
-// decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
-// unknown fields so a typo like {"contractID": "..."} doesn't fall
-// through with an empty contract_id and a confusing 400 from a later
-// check. On success dst is overwritten with the decoded value; on any
-// error it is left untouched. Error text never quotes the body's values.
-func decodeJSONBody(r *http.Request, dst any) error {
-	rv := reflect.ValueOf(dst)
-	if rv.Kind() != reflect.Pointer || rv.IsNil() {
-		return fmt.Errorf("decodeJSONBody: dst must be a non-nil pointer, got %T", dst)
+// decodeJSONBody reads a single JSON request body into dst, enforcing the
+// server's configured request-body limit (s.httpRequestBodyLimit). On
+// success dst holds the decoded value and the method returns false. On
+// failure it writes 413 for an oversized body or 400 for malformed JSON,
+// unknown fields, trailing data, or an empty body — using the shared error
+// envelope — and returns true so the handler stops. dst is never left
+// half-populated: a failed decode publishes nothing, and error text never
+// quotes the body's values.
+//
+// Every handler that reads a JSON body goes through this method, so a
+// malformed request gets the same status and message no matter which route
+// serves it.
+func (s *Server) decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	body, err := readJSONBody(r, s.httpRequestBodyLimit)
+	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, err)
+		} else {
+			writeError(w, http.StatusBadRequest, err)
+		}
+		return true
 	}
+	if err := decodeJSONBytes(body, dst); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return true
+	}
+	return false
+}
+
+// readJSONBody reads the request body once, bounded by limit. Handlers that
+// must inspect the body more than once (the spec-override PUT tries a wrapped
+// and a bare shape) read it here and decode from the returned bytes: r.Body
+// is a stream, so every reread would see an empty request.
+func readJSONBody(r *http.Request, limit int64) ([]byte, error) {
 	// Server requests always carry a non-nil Body, so an absent body shows
 	// up as zero bytes below; the nil check covers hand-built requests.
 	if r.Body == nil {
-		return errors.New("request body is empty")
+		return nil, errors.New("request body is empty")
 	}
 
-	// Read one byte past the cap so an oversized body is reported as too
-	// large instead of being truncated into a misleading "unexpected EOF".
-	// At most maxJSONBodyBytes+1 bytes are ever buffered.
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes+1))
-	if err != nil {
-		return fmt.Errorf("reading request body: %w", err)
+	var body []byte
+	var err error
+	if limit > 0 {
+		// Read one byte past the cap so an oversized body is reported as too
+		// large instead of being truncated into a misleading "unexpected EOF".
+		// At most limit+1 bytes are ever buffered. The body-limit middleware
+		// wraps r.Body in http.MaxBytesReader with the same limit, so its own
+		// "request body too large" error is normalized here too.
+		body, err = io.ReadAll(io.LimitReader(r.Body, limit+1))
+	} else {
+		body, err = io.ReadAll(r.Body)
 	}
-	if len(body) > maxJSONBodyBytes {
-		return fmt.Errorf("request body exceeds %d bytes", maxJSONBodyBytes)
+	if err != nil {
+		tooLarge := errors.Is(err, errBodyTooLarge) || strings.Contains(err.Error(), "request body too large")
+		if tooLarge {
+			return nil, fmt.Errorf("request body exceeds %d bytes: %w", limit, errBodyTooLarge)
+		}
+		return nil, fmt.Errorf("reading request body: %w", err)
+	}
+	if limit > 0 && int64(len(body)) > limit {
+		return nil, fmt.Errorf("request body exceeds %d bytes: %w", limit, errBodyTooLarge)
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
-		return errors.New("request body is empty")
+		return nil, errors.New("request body is empty")
+	}
+	return body, nil
+}
+
+// decodeJSONBytes decodes one already-read body into dst with the same
+// guarantees decodeJSONBody has always given: unknown fields rejected,
+// exactly one JSON value, and a half-populated dst never published.
+func decodeJSONBytes(body []byte, dst any) error {
+	rv := reflect.ValueOf(dst)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return fmt.Errorf("decodeJSONBytes: dst must be a non-nil pointer, got %T", dst)
 	}
 
 	// Decode into a scratch value and publish it only on success:
@@ -1417,6 +1464,7 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 		SortKey:          r.URL.Query().Get("sort"),
 		Order:            r.URL.Query().Get("order"),
 		Cursor:           r.URL.Query().Get("cursor"),
+		Scope:            scopeFrom(r.Context()),
 	}
 	if !store.ValidContractsSortKey(f.SortKey) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf(
@@ -1777,12 +1825,8 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	var req addWatchedRequest
 
-	if err := decodeJSONBody(r, &req); err != nil {
-
-		writeError(w, http.StatusBadRequest, err)
-
+	if s.decodeJSONBody(w, r, &req) {
 		return
-
 	}
 
 	if !config.ValidContractID(req.ContractID) {
@@ -1814,14 +1858,17 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	// network gains its first entry. Entries on other networks keep
 	// their own deployments' modes and are irrelevant here.
 	targetNetwork := s.effectiveNetwork(req.Network)
+	targetLabel := defaultNetworkLabel(targetNetwork)
+	instanceLabel := defaultNetworkLabel(s.defaultNetwork)
 	onTargetNetwork := 0
+	alreadyWatchedOnTarget := false
 	for _, wc := range current {
-		wcNetwork := wc.Network
-		if wcNetwork == "" {
-			wcNetwork = "default"
-		}
-		if wcNetwork == defaultNetworkLabel(targetNetwork) {
+		wcNetwork := defaultNetworkLabel(wc.Network)
+		if wcNetwork == targetLabel {
 			onTargetNetwork++
+			if wc.ContractID == req.ContractID {
+				alreadyWatchedOnTarget = true
+			}
 		}
 	}
 	if onTargetNetwork == 0 {
@@ -1840,10 +1887,10 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	state, err := s.store.GetIngestionState(r.Context())
+	state, err := s.getIngestionStateForNetwork(r.Context(), targetNetwork)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 
-		loggerFromContext(r.Context()).Error("loading ingestion state for add", "error", err)
+		loggerFromContext(r.Context()).Error("loading ingestion state for add", "network", targetLabel, "error", err)
 
 		writeError(w, http.StatusInternalServerError, errors.New("loading ingestion state failed"))
 
@@ -1851,7 +1898,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	wanted := store.WatchedContract{ContractID: req.ContractID, Network: s.effectiveNetwork(req.Network)}
+	wanted := store.WatchedContract{ContractID: req.ContractID, Network: targetNetwork}
 	if err := s.store.AddWatchedContract(r.Context(), wanted); err != nil {
 
 		loggerFromContext(r.Context()).Error("adding watched contract", "contract_id", req.ContractID, "error", err)
@@ -1867,19 +1914,25 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	// a contract resumes, never re-backfills); otherwise the cold-start
 	// retention window - latest minus RETENTION_LEDGERS, clamped to what
 	// the RPC still retains - is where the automatic backfill starts.
+	//
+	// contract_cursors and s.rpc are bound to this instance's configured
+	// network, so they only apply when targetNetwork matches the instance
+	// network (or when the contract was already watched on targetNetwork).
 	historyFrom := state.LastIngestedLedger
-	if cc, cerr := s.store.GetContractCursor(r.Context(), req.ContractID); cerr == nil {
-		historyFrom = cc.LastIngestedLedger
-	} else if errors.Is(cerr, store.ErrNotFound) {
-		if health, herr := s.rpc.GetHealth(r.Context()); herr == nil {
-			start := int64(health.LatestLedger) - int64(s.retentionWindow())
-			if oldest := int64(health.OldestLedger); start < oldest {
-				start = oldest
+	if targetLabel == instanceLabel || alreadyWatchedOnTarget {
+		if cc, cerr := s.store.GetContractCursor(r.Context(), req.ContractID); cerr == nil {
+			historyFrom = cc.LastIngestedLedger
+		} else if errors.Is(cerr, store.ErrNotFound) && targetLabel == instanceLabel {
+			if health, herr := s.rpc.GetHealth(r.Context()); herr == nil {
+				start := int64(health.LatestLedger) - int64(s.retentionWindow())
+				if oldest := int64(health.OldestLedger); start < oldest {
+					start = oldest
+				}
+				if start < 2 {
+					start = 2
+				}
+				historyFrom = start
 			}
-			if start < 2 {
-				start = 2
-			}
-			historyFrom = start
 		}
 	}
 
@@ -1890,7 +1943,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, addWatchedResponse{
 
 		ContractID: req.ContractID,
-		Network:    defaultNetworkLabel(wanted.Network),
+		Network:    targetLabel,
 
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
 
@@ -1899,6 +1952,18 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 		ModeTransition: modeTransition,
 	})
 
+}
+
+func (s *Server) getIngestionStateForNetwork(ctx context.Context, network string) (store.IngestionState, error) {
+	if r, ok := s.store.(interface {
+		GetIngestionStateForNetwork(context.Context, string) (store.IngestionState, error)
+	}); ok {
+		return r.GetIngestionStateForNetwork(ctx, network)
+	}
+	if defaultNetworkLabel(network) == defaultNetworkLabel(s.defaultNetwork) {
+		return s.store.GetIngestionState(ctx)
+	}
+	return store.IngestionState{}, store.ErrNotFound
 }
 
 func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {

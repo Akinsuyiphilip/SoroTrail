@@ -3,6 +3,9 @@
 Thanks for helping! SoroTrail aims to stay small, idiomatic Go with clear
 seams — most features should slot in behind an existing interface.
 
+Before contributing, please read our [Code of Conduct](CODE_OF_CONDUCT.md).
+For security issues, see [SECURITY.md](SECURITY.md).
+
 ## Start here
 
 - **New contributor?** Read [`docs/local-setup.md`](docs/local-setup.md) to
@@ -15,6 +18,26 @@ seams — most features should slot in behind an existing interface.
 
 1. Go 1.25+ (any Go ≥ 1.21 works too — the go toolchain auto-downloads the
    version pinned in go.mod) and Docker.
+2. `docker compose up -d postgres` for a local database.
+3. `make test` for the unit suite; `make test-db` runs everything including
+   the Postgres integration tests (they use `TEST_DATABASE_URL` and skip
+   themselves when it's unset).
+4. `make cover` runs the test suite with coverage and prints a per-package
+   summary; `make cover-html` opens the HTML report in your browser.
+5. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
+6. `make check-monitoring` validates the Prometheus rules and the Grafana
+   dashboard the way CI does (needs [promtool](https://prometheus.io/download/)
+   and python3; no running Prometheus required) — run it when you touch
+   anything under `deploy/`.
+7. [Helm](https://helm.sh) for the chart's golden tests. Without it those
+   tests skip, and the suite says so — see "Tests that skip, and how to
+   notice" below.
+
+The integration tests truncate the tables they use — point
+`TEST_DATABASE_URL` at a throwaway database, not one with data you care
+about. `internal/store` and `internal/replay` share those tables, so the
+database suite runs with `go test -p 1` (already the case in `make test-db`
+and CI); don't drop that flag.
 2. Run `make help` to see every available target.
 3. `make docker-up` is the quickest route to a local Postgres (starts
    Postgres and the indexer via `docker compose up -d --build`). Alternatively,
@@ -40,44 +63,10 @@ seams — most features should slot in behind an existing interface.
    compatibility with the previous workflow.
 7. `make cover` / `make cover-html` for coverage.
 8. `make lint` (install [golangci-lint](https://golangci-lint.run/) locally).
+9. `make lint-fix` runs golangci-lint run --fix and applies the fixes in place.
 
 The full, copy-pasteable setup and testing walkthrough lives in
 [`docs/local-setup.md`](docs/local-setup.md).
-
-### Helm chart tests
-
-A green `make test` does **not** cover the Helm chart. The chart tests in
-`deploy/helm/sorotrail/render_test.go` shell out to `helm template`, so every
-one of them skips when `helm` is not on PATH, and CI's test job
-(`go test ./...`) does not install Helm either — only the separate `helm` job
-does, and that job lints and templates the chart rather than running these
-tests. Missing that is how a PR that adds a configuration variable, or renames
-a template key, passes every local check and still fails review with a chart
-that cannot set the new variable.
-
-Two things close the gap:
-
-- Without `helm` on PATH, `go test ./...` prints a `NOTICE:` line saying the
-  chart tests were skipped. That is the signal, and it means a green run with
-  the notice is not chart coverage. Install Helm v3.15.0 (the version CI pins)
-  to make it go away and run the tests for real — see
-  <https://helm.sh/docs/intro/install/>.
-- Set `REQUIRE_HELM_CHART_TESTS=1` to turn the skip into a failure, so the job
-  that installs Helm can assert the chart tests really ran instead of trusting
-  the job configuration.
-
-The guard tests a chart change trips over are `TestRenderGolden_DefaultValues`
-and `TestRenderGolden_RepresentativeOverrides`: both render the chart and
-compare the output byte for byte, so adding or renaming a value fails the
-comparison until the golden files are regenerated. Regenerate them with:
-
-```sh
-go test ./deploy/helm/sorotrail -run TestRenderGolden -update
-```
-
-`TestRender_ManifestInvariants` checks the same render structurally. Anything
-that adds a chart value must also cover it in `testdata/overrides.yaml` and
-regenerate the goldens in the same pull request.
 
 ### How the integration test layer works (issue #9)
 
@@ -244,9 +233,7 @@ locally (build, `go vet` with and without the `integration` tag, the OpenAPI
 drift check, the migration numbering gate, the tagged and untagged test suites,
 the benchmark smoke run, and `golangci-lint`) and
 stops at the first failing step, just like CI. The database-backed tests skip
-gracefully when `TEST_DATABASE_URL` (or Docker) is unavailable — and, as noted
-under [Helm chart tests](#helm-chart-tests), so do the chart tests when Helm is
-missing, which is why that run prints a notice — so `make ci`
+gracefully when `TEST_DATABASE_URL` (or Docker) is unavailable, so `make ci`
 passes without Postgres and runs the full gate once one is available. Every
 target is documented; run `make help` to list them all.
 
@@ -267,6 +254,55 @@ make bench-ci         # benchmark smoke run
 make lint             # golangci-lint run, guarded against toolchain drift
 make migrations-check # migration numbering is loadable; needs no database
 ```
+
+### Tests that skip, and how to notice
+
+Some tests need an external dependency the contributor may not have: the Helm
+chart's golden tests need the `helm` binary, and the store's conformance suite
+needs a Postgres. Those tests **skip** rather than fail — failing would break
+every contributor without the dependency — but a skip that prints nothing is
+worse than no test at all, because a green run then says nothing about the
+coverage it did not exercise.
+
+So the skip is loud. Every test target (`make test`, `make test-fast`,
+`make test-ci`, `make test-db`, `make test-integration`, `make cover*`, and
+therefore `make ci`) first runs `make test-prereqs`, which prints a banner
+naming what was skipped, why, what the skip cost, and how to get the
+dependency. The same convention applies to the store's database-backed tests,
+so there is one wording for the whole suite.
+
+A raw `go test ./...` still only shows the banner under `-v`: Go discards the
+output of a package that passes, so nothing a test prints can reach a
+non-verbose run. Use the make targets, or `go test -v`, when you want to see
+it.
+
+**A green local run does not cover the Helm chart unless `helm` is
+installed.** The chart's golden tests compare the rendered manifests byte for
+byte against the committed goldens, and `TestRender_ConfigValuesReachThePod`
+checks that every chart config value reaches the pod. Neither runs without
+`helm`.
+
+**Adding a configuration variable requires the chart to be updated in the same
+pull request.** The guard that catches a chart value which never reaches the
+pod is `TestRender_ConfigValuesReachThePod` in
+[`deploy/helm/sorotrail/render_test.go`](deploy/helm/sorotrail/render_test.go):
+it fails when a value under the chart's `config:` block is not wired into the
+ConfigMap, and when the ConfigMap renders a variable the application does not
+read. A new variable therefore needs, in the same pull request:
+
+- an entry in `internal/config/config.go` (the application reads it),
+- an entry in `deploy/helm/sorotrail/values.yaml` and
+  `deploy/helm/sorotrail/values.schema.json` (the operator can set it),
+- a line in `deploy/helm/sorotrail/templates/configmap.yaml` (the pod gets it),
+- a row in the chart's `README.md` values table, and
+- the regenerated goldens:
+  `go test ./deploy/helm/sorotrail -run TestRenderGolden -update`.
+
+CI runs the chart's golden tests in the `helm` job with
+`SOROTRAIL_REQUIRE_HELM=1`, which turns the skip into a failure: a runner
+that lost `helm` fails the job instead of skipping the coverage and
+reporting success. Set the same variable locally to make a missing
+dependency fail rather than skip.
 
 ### Lint toolchain drift
 

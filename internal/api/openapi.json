@@ -888,6 +888,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -1027,6 +1030,9 @@
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -1295,6 +1301,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -1512,6 +1521,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -1620,6 +1632,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           }
         }
       },
@@ -1685,6 +1700,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -1693,6 +1711,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           }
         }
       }
@@ -1742,6 +1763,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           }
         }
       }
@@ -1840,6 +1864,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           }
         }
       }
@@ -2620,6 +2647,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           }
         }
       }
@@ -2702,22 +2732,40 @@
                     }
                   }
                 },
-                "example": {
-                  "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-                  "name": "Soroban Token",
-                  "symbol": "STOK",
-                  "decimals": 7,
-                  "event_count": 42,
-                  "type_breakdown": [
-                    {
-                      "type": "contract",
-                      "count": 38
-                    },
-                    {
-                      "type": "diagnostic",
-                      "count": 4
+                "examples": {
+                  "token_contract": {
+                    "summary": "Contract with cached token metadata",
+                    "value": {
+                      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+                      "name": "Soroban Token",
+                      "symbol": "STOK",
+                      "decimals": 7,
+                      "event_count": 42,
+                      "type_breakdown": [
+                        {
+                          "type": "contract",
+                          "count": 38
+                        },
+                        {
+                          "type": "diagnostic",
+                          "count": 4
+                        }
+                      ]
                     }
-                  ]
+                  },
+                  "plain_contract": {
+                    "summary": "Contract without cached token metadata",
+                    "value": {
+                      "contract_id": "CAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSBFLM",
+                      "event_count": 19,
+                      "type_breakdown": [
+                        {
+                          "type": "contract",
+                          "count": 19
+                        }
+                      ]
+                    }
+                  }
                 }
               }
             }
@@ -2736,6 +2784,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           }
         }
       }
@@ -2920,6 +2971,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -2928,6 +2982,12 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       },
@@ -2993,6 +3053,9 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       },
@@ -3055,6 +3118,180 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/contracts/{id}/spec/history": {
+      "get": {
+        "operationId": "listContractSpecOverrideHistory",
+        "summary": "List a contract's spec override history",
+        "description": "Lists every recorded change to a contract's spec override, newest first. Each entry records the spec that was in force, the API key prefix that made the change, and when — so \"did someone change the override?\" has an answer.\nAn entry with no `spec` is a tombstone: the override was deleted at that point rather than replaced. The history is append-only and is retained in full; it is never consulted when decoding an event.\nPaginated with an opaque cursor over the version id.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract whose override history is being read.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of override history, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "versions",
+                    "count"
+                  ],
+                  "properties": {
+                    "versions": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ContractSpecOverrideVersion"
+                      }
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "cursor": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/contracts/{id}/spec/revert": {
+      "post": {
+        "operationId": "revertContractSpecOverride",
+        "summary": "Restore a previous contract spec override",
+        "description": "Restores a previous version of a contract's spec override, named by the `version` in the request body — the id of an entry in the override history.\nThe revert is itself a change, so it is recorded as a new history entry: the history stays append-only and keeps the whole sequence, including the way back.",
+        "tags": [
+          "Operations"
+        ],
+        "security": [
+          {
+            "ManagementKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The contract whose spec override is being restored.",
+            "schema": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            },
+            "example": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContractSpecOverrideRevertRequest"
+              },
+              "example": {
+                "version": 3
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The restored override",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "contract_id",
+                    "spec"
+                  ],
+                  "properties": {
+                    "contract_id": {
+                      "type": "string"
+                    },
+                    "spec": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       }
@@ -3268,6 +3505,9 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -3290,7 +3530,7 @@
       "delete": {
         "operationId": "removeTenantWatch",
         "summary": "Remove a contract from the tenant's watch list",
-        "description": "Removes a contract from the calling tenant's watch list.",
+        "description": "Removes a contract from the calling tenant's watch list. Removing a well-formed contract the tenant does not hold is a no-op that still answers 200 with the unchanged list, so retries stay idempotent; only a malformed contract_id is rejected with a 400.",
         "tags": [
           "Operations"
         ],
@@ -3322,6 +3562,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -3455,6 +3698,9 @@
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -3753,7 +3999,7 @@
       "get": {
         "operationId": "eventStreamWS",
         "summary": "WebSocket live event stream",
-        "description": "Upgrades to a WebSocket connection that pushes ingested events as they\nare stored. The stream starts at \"now\" — no replay of historical events.\nThe live broadcaster applies contract, event type, topic, ledger/time\nrange and has-value filters; pagination and historical-only query\nparameters do not create a replay stream.\n",
+        "description": "Upgrades to a WebSocket connection that pushes ingested events as they\nare stored. The stream starts at \"now\" — no replay of historical events.\nThe live broadcaster applies contract, event type, topic, ledger/time\nrange and has-value filters; pagination and historical-only query\nparameters do not create a replay stream.\n\nA handshake the websocket library refuses before the upgrade answers\nwith plain text rather than the JSON envelope: 426 when the request is\nnot an upgrade attempt at all (missing Connection/Upgrade headers, or\nHTTP/1.0), 400 when it is an upgrade attempt with a malformed handshake\n(unsupported protocol version, or a missing/invalid Sec-WebSocket-Key).\n",
         "tags": [
           "Events"
         ],
@@ -3795,6 +4041,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "426": {
+            "$ref": "#/components/responses/UpgradeRequired"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -3861,8 +4110,14 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -4048,8 +4303,14 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "413": {
+            "$ref": "#/components/responses/RequestEntityTooLarge"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -4308,14 +4569,15 @@
       "Limit": {
         "name": "limit",
         "in": "query",
-        "description": "Page size. Out-of-range values are rejected rather than clamped, so\na caller asking for more than it may have finds out instead of\nsilently receiving a short page and assuming it reached the end.\n\nThe ceiling is 500. An operator can lower it with the API_MAX_LIMIT\nenvironment variable, so a deployment may reject a value this schema\npermits; the store never returns more than 500 rows in one page\nregardless.\n",
+        "description": "Page size. Out-of-range values are rejected rather than clamped, so\na caller asking for more than it may have finds out instead of\nsilently receiving a short page and assuming it reached the end.\n\nThe maximum is configurable at deploy time: API_MAX_LIMIT lowers the\nceiling to whatever the operator sets, and the store never returns\nmore than 500 rows in one page regardless.\n",
         "schema": {
           "type": "integer",
           "minimum": 1,
           "maximum": 500,
           "default": 50
         },
-        "example": 100
+        "example": 100,
+        "default": 50
       },
       "ContractsLimit": {
         "name": "limit",
@@ -4623,6 +4885,57 @@
           "spec": {
             "type": "object",
             "description": "SEP-0041 contract specification JSON."
+          }
+        }
+      },
+      "ContractSpecOverrideRevertRequest": {
+        "type": "object",
+        "description": "Names the override-history entry to restore. The id is the one listed by GET /contracts/{id}/spec/history.",
+        "required": [
+          "version"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "The id of the history entry to restore.",
+            "example": 3
+          }
+        }
+      },
+      "ContractSpecOverrideVersion": {
+        "type": "object",
+        "description": "One recorded change to a contract's spec override. The spec is absent for a tombstone entry, which means the override was deleted at that point rather than replaced.",
+        "required": [
+          "id",
+          "contract_id",
+          "api_key_prefix",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The version number. It is also the pagination cursor."
+          },
+          "contract_id": {
+            "type": "string",
+            "description": "The contract whose override changed."
+          },
+          "spec": {
+            "type": "object",
+            "description": "The override document that was in force. Absent for a tombstone entry."
+          },
+          "api_key_prefix": {
+            "type": "string",
+            "description": "The public prefix of the API key that made the change. The secret half of the key is never stored."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the change was recorded."
           }
         }
       },
@@ -6174,6 +6487,19 @@
           }
         }
       },
+      "UpgradeRequired": {
+        "description": "The websocket handshake was refused before the upgrade because the request is not a valid upgrade attempt: HTTP/1.0, or the Connection and Upgrade headers are missing or do not name `websocket`. Only `/events/ws` can answer this, and — unlike every other error here — the body is plain text written by the websocket library, not the JSON envelope.",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string",
+              "examples": [
+                "WebSocket protocol violation: Connection header \"\" does not contain Upgrade"
+              ]
+            }
+          }
+        }
+      },
       "TooManyRequests": {
         "description": "The caller exceeded its request quota, or asked to watch more\ncontracts than its quota allows.\n\nRate limiting is per client — keyed on the authenticated tenant where\none exists and on the client IP otherwise — and is only active when\nthe operator configured RATE_LIMIT_RPS or a per-tenant override. The\nprobe and scrape endpoints (/health, /livez, /readyz, /metrics) are\nnever rate limited, so throttling cannot blind an operator to the\nthrottling itself.\n",
         "headers": {
@@ -6186,8 +6512,48 @@
                 1
               ]
             }
+          },
+          "X-RateLimit-Limit": {
+            "description": "The caller's configured burst capacity.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "examples": [
+                20
+              ]
+            }
+          },
+          "X-RateLimit-Remaining": {
+            "description": "The caller's remaining request budget; always 0 on a 429.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "examples": [
+                0
+              ]
+            }
+          },
+          "X-RateLimit-Reset": {
+            "description": "Unix timestamp in seconds when the next request token is expected to become available, or the quota window resets.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "examples": [
+                1792512000
+              ]
+            }
           }
         },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "RequestEntityTooLarge": {
+        "description": "The request body exceeds the instance's configured limit (HTTP_REQUEST_BODY_LIMIT). Reduce the body size and retry.",
         "content": {
           "application/json": {
             "schema": {

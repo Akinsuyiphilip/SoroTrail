@@ -482,15 +482,25 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
+	var sortValue, cursorContractID string
+	if f.Cursor != "" {
+		var err error
+		sortValue, cursorContractID, err = DecodeContractsCursor(f.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	if f.Scope.DeniesAll() {
+		return []ContractSummary{}, "", nil
+	}
 	where := []string{}
+	if !f.Scope.IsWildcard() {
+		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
 	if f.ContractIDPrefix != "" {
 		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}
 	if f.Cursor != "" {
-		sortValue, contractID, err := DecodeContractsCursor(f.Cursor)
-		if err != nil {
-			return nil, "", err
-		}
 		typed := arg(sortValue)
 		switch sortType {
 		case "bigint":
@@ -500,7 +510,7 @@ func (p *Postgres) ListContracts(ctx context.Context, f ContractsFilter) ([]Cont
 		}
 		where = append(where,
 			fmt.Sprintf("(%s, contract_id) %s (%s, %s)",
-				sortCol, cursorOp, typed, arg(contractID)))
+				sortCol, cursorOp, typed, arg(cursorContractID)))
 	}
 	query := fmt.Sprintf(`
 		SELECT contract_id, count(*) AS event_count,
@@ -600,12 +610,18 @@ func (p *Postgres) ContractEventTypeCounts(ctx context.Context, contractID strin
 }
 
 func (p *Postgres) CountContracts(ctx context.Context, f ContractsFilter) (int64, error) {
+	if f.Scope.DeniesAll() {
+		return 0, nil
+	}
 	args := []any{}
 	arg := func(v any) string {
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
 	where := []string{}
+	if !f.Scope.IsWildcard() {
+		where = append(where, "contract_id = ANY("+arg(f.Scope.Contracts())+")")
+	}
 	if f.ContractIDPrefix != "" {
 		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}
@@ -1235,8 +1251,23 @@ const watchedContractsUnion = `
 	) w GROUP BY network, contract_id`
 
 func (p *Postgres) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
-	rows, err := p.pool.Query(ctx,
-		watchedContractsUnion+` ORDER BY network, contract_id`)
+	return p.ListWatchedContractsScoped(ctx, WildcardScope())
+}
+
+// ListWatchedContractsScoped returns watched contracts filtered by sc in SQL.
+func (p *Postgres) ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error) {
+	if sc.DeniesAll() {
+		return []WatchedContract{}, nil
+	}
+	var (
+		query = watchedContractsUnion + ` ORDER BY network, contract_id`
+		args  []any
+	)
+	if !sc.IsWildcard() {
+		query = `SELECT network, contract_id, added_at FROM (` + watchedContractsUnion + `) s WHERE contract_id = ANY($1) ORDER BY network, contract_id`
+		args = []any{sc.Contracts()}
+	}
+	rows, err := p.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
@@ -1651,6 +1682,129 @@ func (p *Postgres) DeleteContractSpecOverride(ctx context.Context, contractID st
 	return nil
 }
 
+// SetContractSpecOverrideWithHistory upserts the override and appends the
+// history row in one transaction. The two writes share a transaction so the
+// recorded history can never disagree with the stored override: a crash
+// between them would otherwise leave a history entry for a change that never
+// landed, or a change with no history entry at all.
+func (p *Postgres) SetContractSpecOverrideWithHistory(ctx context.Context, contractID string, specJSON []byte, apiKeyPrefix string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("starting contract spec override transaction: %w", err)
+	}
+	// Rollback after a successful Commit is a no-op, so this is the only
+	// cleanup path needed.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO contract_spec_overrides (contract_id, spec_json, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (contract_id) DO UPDATE SET
+			spec_json  = EXCLUDED.spec_json,
+			updated_at = now()`,
+		contractID, specJSON,
+	); err != nil {
+		return fmt.Errorf("saving contract spec override for %s: %w", contractID, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO contract_spec_override_history (contract_id, spec_json, api_key_prefix)
+		VALUES ($1, $2, $3)`,
+		contractID, specJSON, apiKeyPrefix,
+	); err != nil {
+		return fmt.Errorf("recording contract spec override history for %s: %w", contractID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+// DeleteContractSpecOverrideWithHistory removes the override and appends a
+// tombstone history row in one transaction. The tombstone records that the
+// override was deleted, so "the override disappeared" is answerable.
+func (p *Postgres) DeleteContractSpecOverrideWithHistory(ctx context.Context, contractID string, apiKeyPrefix string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("starting contract spec override transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM contract_spec_overrides WHERE contract_id = $1`, contractID,
+	); err != nil {
+		return fmt.Errorf("deleting contract spec override for %s: %w", contractID, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO contract_spec_override_history (contract_id, spec_json, api_key_prefix)
+		VALUES ($1, NULL, $2)`,
+		contractID, apiKeyPrefix,
+	); err != nil {
+		return fmt.Errorf("recording contract spec override history for %s: %w", contractID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing contract spec override delete for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+// ListContractSpecOverrideHistory returns a contract's override history
+// newest first. The cursor is the last version id of the previous page, and
+// the next page is the rows with a smaller id, so a change made while a
+// client is paging cannot make an entry be skipped or repeated.
+func (p *Postgres) ListContractSpecOverrideHistory(ctx context.Context, contractID string, limit int, cursor string) ([]ContractSpecOverrideVersion, string, error) {
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+
+	// The cursor is the last id of the previous page; the next page is
+	// everything older than it.
+	var afterID int64 = 0
+	if cursor != "" {
+		id, err := DecodeSpecOverrideHistoryCursor(cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		afterID = id
+	}
+
+	rows, err := p.pool.Query(ctx, `
+		SELECT id, contract_id, spec_json, api_key_prefix, created_at
+		FROM contract_spec_override_history
+		WHERE contract_id = $1 AND ($2 = 0 OR id < $2)
+		ORDER BY id DESC
+		LIMIT $3`,
+		contractID, afterID, limit,
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("listing contract spec override history for %s: %w", contractID, err)
+	}
+	defer rows.Close()
+
+	var out []ContractSpecOverrideVersion
+	for rows.Next() {
+		var v ContractSpecOverrideVersion
+		var specJSON []byte
+		if err := rows.Scan(&v.ID, &v.ContractID, &specJSON, &v.APIKeyPrefix, &v.CreatedAt); err != nil {
+			return nil, "", fmt.Errorf("scanning contract spec override history for %s: %w", contractID, err)
+		}
+		// A tombstone row has no spec; the empty JSON document stands in
+		// for the SQL NULL so the column scans as bytes.
+		if len(specJSON) > 0 {
+			v.Spec = specJSON
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("listing contract spec override history for %s: %w", contractID, err)
+	}
+
+	next := ""
+	if len(out) == limit {
+		next = EncodeSpecOverrideHistoryCursor(out[len(out)-1].ID)
+	}
+	return out, next, nil
+}
+
 func (p *Postgres) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditFinding, error) {
 	err := p.pool.QueryRow(ctx, `
 		INSERT INTO audit_findings
@@ -1708,8 +1862,15 @@ func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, network string, 
 	)
 	var f AuditFinding
 	var lastAttempted *time.Time
+	// last_error is NULL by design, not by accident: RecordAuditFinding
+	// leaves it unset until a repair attempt fails, and nullableString
+	// writes NULL back for an emptied message. Scanning it into a plain
+	// string would abort every read of a fresh finding with "cannot scan
+	// NULL into *string" — the SQLite backend's shared scanAuditFinding
+	// already reads it through a pointer for the same reason.
+	var lastError *string
 	err := row.Scan(&f.ID, &f.Network, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
-		&f.MissingIDs, &f.Status, &f.Attempts, &lastAttempted, &f.LastError, &f.CreatedAt)
+		&f.MissingIDs, &f.Status, &f.Attempts, &lastAttempted, &lastError, &f.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuditFinding{}, ErrNotFound
 	}
@@ -1718,6 +1879,9 @@ func (p *Postgres) ListOpenFindingsByRange(ctx context.Context, network string, 
 	}
 	if lastAttempted != nil {
 		f.LastAttemptedAt = *lastAttempted
+	}
+	if lastError != nil {
+		f.LastError = *lastError
 	}
 	return f, nil
 }

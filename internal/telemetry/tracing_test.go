@@ -1,10 +1,13 @@
 package telemetry
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 func TestSamplerFromEnv(t *testing.T) {
@@ -23,6 +26,9 @@ func TestSamplerFromEnv(t *testing.T) {
 		{name: "unset sampler uses baseline", wantParts: []string{"ParentBased", "{1}"}},
 		{name: "unknown sampler uses baseline", samplerName: "not-a-sampler", wantParts: []string{"ParentBased", "{1}"}},
 		{name: "out of range ratio is clamped", samplerName: "traceidratio", argument: "2.5", wantParts: []string{"ParentBased", "{1}"}},
+		{name: "negative ratio is clamped", samplerName: "traceidratio", argument: "-0.5", wantParts: []string{"ParentBased", "{1}"}},
+		{name: "zero ratio is clamped", samplerName: "traceidratio", argument: "0", wantParts: []string{"ParentBased", "{1}"}},
+		{name: "invalid ratio argument falls back to default", samplerName: "traceidratio", argument: "not-a-number", wantParts: []string{"ParentBased", "{1}"}},
 	}
 
 	for _, tt := range tests {
@@ -36,4 +42,20 @@ func TestSamplerFromEnv(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfigure_Disabled(t *testing.T) {
+	// When no OTLP endpoint is set, Configure should return a no-op provider
+	ctx := context.Background()
+	provider, shutdown, err := Configure(ctx, nil)
+	require.NoError(t, err)
+	require.NotNil(t, provider)
+	require.NotNil(t, shutdown)
+
+	// Should be a no-op provider
+	assert.IsType(t, noop.TracerProvider{}, provider)
+
+	// Shutdown should not error
+	err = shutdown(ctx)
+	assert.NoError(t, err)
 }
