@@ -669,21 +669,33 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: |
           set -euo pipefail
-          binary=$(find dist -name 'sorotrail*' -type f | grep -E '(linux_amd64|linux_arm64)' | head -1)
+          # goreleaser puts the archives at dist/*.tar.gz and the executables in
+          # per-target directories as dist/<id>_<goos>_<goarch>*/sorotrail. Match
+          # the binary by its exact name: a glob like 'sorotrail*' also matches
+          # the tarball, and executing that fails with "Exec format error".
+          binary=$(find dist -type f -name sorotrail -path '*linux_amd64*' | head -1)
           if [ -z "$binary" ]; then
-            echo "No linux binary found in dist/"
+            echo "::error::no linux_amd64 sorotrail binary found under dist/"
+            find dist -maxdepth 2 -type f | sed 's/^/  /'
             exit 1
           fi
+          echo "Verifying $binary"
           chmod +x "$binary"
           output=$("$binary" version)
-          echo "Binary output: $output"
-          # The snapshot build stamps "unknown" for version/commit/date; we assert
-          # those placeholders are present rather than empty, which would indicate
-          # the ldflags never reached the artefact.
+          printf 'version output:\n%s\n' "$output"
+          # buildinfo defaults every field to "unknown". A snapshot build stamps
+          # real values through ldflags, so "unknown" here means the ldflags
+          # never reached the artefact — which is exactly what this guards.
+          status=0
           for field in version commit build-date; do
-            if ! echo "$output" | grep -q "unknown"; then
-              echo "Build info $field not stamped (got: $output)"
-              exit 1
+            value=$(printf '%s\n' "$output" | awk -F'\t' -v f="$field" '$1==f {print $2; found=1} END {exit !found}') || {
+              echo "::error::build info field '$field' missing from version output"
+              status=1
+              continue
+            }
+            if [ -z "$value" ] || [ "$value" = unknown ]; then
+              echo "::error::build info field '$field' not stamped (got '${value:-<empty>}')"
+              status=1
             fi
           done
-          echo "All build info fields correctly stamped with 'unknown' placeholders"
+          exit "$status"
