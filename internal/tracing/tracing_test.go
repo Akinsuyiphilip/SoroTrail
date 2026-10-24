@@ -10,8 +10,6 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"go.opentelemetry.io/otel"
-	"log/slog"
-	"go.opentelemetry.io/otel"
 
 	"github.com/sorotrail/sorotrail/internal/tracing/tracingtest"
 )
